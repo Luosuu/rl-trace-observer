@@ -1,0 +1,47 @@
+import os
+import re
+from pathlib import Path
+
+from rl_trace_observer.observer import ObserverContext
+
+
+def _safe_component(value: object) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_") or "unknown"
+
+
+class VizTracerObserver:
+    """Run VizTracer around VERL's existing profiler window."""
+
+    def __init__(self):
+        self._tracer = None
+
+    def on_start(self, context: ObserverContext) -> None:
+        role = context.metadata.get("role") or context.save_file_prefix or "unknown"
+        allowed_roles = {item.strip() for item in os.getenv("RL_TRACE_VIZTRACER_ROLES", "").split(",") if item.strip()}
+        if allowed_roles and str(role) not in allowed_roles:
+            return
+
+        from viztracer import VizTracer
+
+        output_dir = Path(os.getenv("RL_TRACE_OUTPUT_DIR", "rl_trace_outputs")).expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        profile_step = context.metadata.get("profile_step", "unknown")
+        output_file = output_dir / (
+            f"step-{_safe_component(profile_step)}-role-{_safe_component(role)}-"
+            f"rank-{context.rank}-pid-{os.getpid()}.viztracer.json"
+        )
+        self._tracer = VizTracer(
+            output_file=str(output_file),
+            min_duration=int(os.getenv("RL_TRACE_VIZTRACER_MIN_DURATION_US", "100")),
+            log_async=True,
+        )
+        self._tracer.start()
+
+    def on_stop(self, context: ObserverContext) -> None:
+        if self._tracer is None:
+            return
+        try:
+            self._tracer.stop()
+            self._tracer.save()
+        finally:
+            self._tracer = None

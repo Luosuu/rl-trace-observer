@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-trace-observer"
+version = "0.1.0"
+description = "External profiling lifecycle observers for RL frameworks"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+verl = ["verl"]
+tokenspeed = ["tokenspeed"]
+rl-insight = ["rl-insight>=0.2.1"]
+viztracer = ["viztracer>=0.16"]
+test = ["pytest>=8"]
+
+[project.entry-points."verl.plugins"]
+rl-trace-observer = "rl_trace_observer.integrations.verl.register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "G"]
