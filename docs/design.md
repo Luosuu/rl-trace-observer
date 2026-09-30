@@ -288,11 +288,13 @@ manifest
 
 ### P0：修复真实 worker 采集链路
 
-- [ ] 实现默认 `ray` backend 的 local+delegate tee factory；
-- [ ] 保存并调用 RL-Insight 原始 Ray factory，避免递归；
-- [ ] 验证 driver、actor、rollout 进程均加载插件；
-- [ ] 增加真实 RL-Insight lazy-init 测试；
-- [ ] 增加单机多 Ray actor smoke test。
+- [x] 实现默认 `ray` backend 的 local+delegate tee factory；
+- [x] 保存并调用 RL-Insight 原始 Ray factory，避免递归；
+- [ ] 验证 driver、actor、rollout 进程均加载插件（需真实 VERL 运行）；
+- [x] 增加真实 RL-Insight lazy-init 测试；
+- [x] 增加单机多 Ray actor smoke test。
+
+已验证版本：`rl-insight==0.2.1`。其 `load_monitor_config` 只允许环境变量覆盖 `server.url`，无法覆盖 `server.backend`；长期可向上游提议增加 backend 环境变量，从而不再替换默认 factory。
 
 完成标准：至少两个 Ray worker 的 `trace_state` 都产生本地 semantic artifact。
 

@@ -50,6 +50,12 @@ python -m verl.trainer.main_ppo \
   ...
 ```
 
+VERL workers initialize RL-Insight lazily without the trainer config, so they
+always select RL-Insight's default `ray` backend. Loading the external module
+therefore also replaces the default `ray` factory with the same local JSONL
+client, so driver and worker spans are both captured. Set
+`RL_TRACE_CAPTURE_DEFAULT_BACKEND=0` to leave the default backend untouched.
+
 Each process incrementally writes:
 
 ```text
@@ -70,8 +76,9 @@ export RL_TRACE_FORWARD_TO_RL_INSIGHT=1
 export RL_INSIGHT_SERVER_URL=http://<rl-insight-server>:18080
 ```
 
-The configured backend remains `rl_trace_observer`; it creates the normal Ray
-client internally as its delegate.
+The configured backend remains `rl_trace_observer`; it creates RL-Insight's
+original Ray client internally as its delegate. Forwarding failures are logged
+and never interrupt training.
 
 ## Optional actor VizTracer
 

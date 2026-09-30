@@ -4,14 +4,17 @@ import os
 import re
 import socket
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 BACKEND_NAME = "rl_trace_observer"
+DEFAULT_BACKEND = "ray"
 _TRACE_EVENT_KIND = "trace"
+_FORWARD_ENV = "RL_TRACE_FORWARD_TO_RL_INSIGHT"
+_CAPTURE_DEFAULT_ENV = "RL_TRACE_CAPTURE_DEFAULT_BACKEND"
 
 
 def _enabled(name: str) -> bool:
@@ -51,7 +54,10 @@ class ChromeTraceJsonlClient:
             logger.exception("Failed to persist an RL-Insight trace event")
 
         if self._delegate is not None:
-            self._delegate.apply_event(event)
+            try:
+                self._delegate.apply_event(event)
+            except Exception:
+                logger.exception("Failed to forward an RL-Insight event to the original backend")
 
     @staticmethod
     def to_chrome_event(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -75,31 +81,77 @@ class ChromeTraceJsonlClient:
         }
 
 
-def create_rl_trace_observer_client(config: object) -> ChromeTraceJsonlClient:
-    """RL-Insight monitor client factory registered by the external module."""
-    delegate = None
-    if _enabled("RL_TRACE_FORWARD_TO_RL_INSIGHT"):
-        from rl_insight.client.ray_monitor_client import create_ray_monitor_client
+def create_rl_trace_observer_client(
+    config: object, original_factory: Callable[[object], object] | None = None
+) -> ChromeTraceJsonlClient:
+    """Create a local JSONL client that optionally tees into the original backend.
 
-        delegate = create_ray_monitor_client(config)
+    Args:
+        config: Merged RL-Insight monitor config passed by ``create_monitor_client``.
+        original_factory: RL-Insight's own client factory, used as the forwarding
+            delegate. When omitted, the built-in Ray monitor client is imported.
+    """
+    delegate = None
+    if _enabled(_FORWARD_ENV):
+        if original_factory is None:
+            from rl_insight.client.ray_monitor_client import create_ray_monitor_client
+
+            original_factory = create_ray_monitor_client
+        delegate = original_factory(config)
 
     output_dir = os.getenv("RL_TRACE_OUTPUT_DIR", "rl_trace_outputs")
     return ChromeTraceJsonlClient(output_dir=output_dir, delegate=delegate)
 
 
-def register_rl_insight_client(register: Callable[[str, Callable], None] | None = None) -> bool:
-    """Register the custom backend without importing RL-Insight at package import.
+class _TeeFactory:
+    """Registry entry that remembers the RL-Insight factory it replaced."""
 
-    Returns ``False`` when RL-Insight is unavailable, allowing the optional
-    actor VizTracer integration to remain usable on its own.
+    def __init__(self, original_factory: Callable[[object], object] | None):
+        self.original_factory = original_factory
+
+    def __call__(self, config: object) -> ChromeTraceJsonlClient:
+        return create_rl_trace_observer_client(config, original_factory=self.original_factory)
+
+
+def _default_registry() -> MutableMapping[str, Callable] | None:
+    try:
+        # Importing ``base`` runs ``rl_insight.client.__init__`` first, which
+        # registers the built-in Ray factory that is captured below.
+        from rl_insight.client.base import MONITOR_CLIENT_REGISTRY
+    except ImportError:
+        return None
+    return MONITOR_CLIENT_REGISTRY
+
+
+def register_rl_insight_client(registry: MutableMapping[str, Callable] | None = None) -> bool:
+    """Register the custom backend and capture RL-Insight's default backend.
+
+    VERL workers lazily call ``rl_insight.init()`` without the trainer config,
+    so they always select the default ``ray`` backend. The default factory is
+    therefore replaced by a tee that writes local JSONL and, when
+    ``RL_TRACE_FORWARD_TO_RL_INSIGHT`` is set, forwards to the original Ray
+    factory. Set ``RL_TRACE_CAPTURE_DEFAULT_BACKEND=0`` to leave it untouched.
+
+    Registration is idempotent: an already installed tee is never wrapped again.
+
+    Returns:
+        ``False`` when RL-Insight is unavailable, allowing the optional actor
+        VizTracer integration to remain usable on its own.
     """
-    if register is None:
-        try:
-            from rl_insight.client.base import register_monitor_client
-        except ImportError:
+    if registry is None:
+        registry = _default_registry()
+        if registry is None:
             logger.warning("RL-Insight is unavailable; semantic state collection is disabled")
             return False
-        register = register_monitor_client
 
-    register(BACKEND_NAME, create_rl_trace_observer_client)
+    current_default = registry.get(DEFAULT_BACKEND)
+    if isinstance(current_default, _TeeFactory):
+        tee_factory = current_default
+    else:
+        if current_default is None:
+            logger.warning("RL-Insight has no %r backend registered; capturing it locally only", DEFAULT_BACKEND)
+        tee_factory = _TeeFactory(current_default)
+        if os.getenv(_CAPTURE_DEFAULT_ENV, "1").lower() not in {"0", "false", "no", "off"}:
+            registry[DEFAULT_BACKEND] = tee_factory
+    registry[BACKEND_NAME] = tee_factory
     return True

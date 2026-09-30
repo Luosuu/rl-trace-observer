@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 from rl_trace_observer.integrations.rl_insight.client import (
     BACKEND_NAME,
+    DEFAULT_BACKEND,
     ChromeTraceJsonlClient,
     create_rl_trace_observer_client,
     register_rl_insight_client,
@@ -73,14 +74,75 @@ def test_trace_event_is_also_forwarded(tmp_path):
 
 
 def test_registration_uses_rl_trace_backend_name():
-    register = Mock()
+    registry = {}
 
-    assert register_rl_insight_client(register)
+    assert register_rl_insight_client(registry)
 
-    register.assert_called_once()
-    backend_name, factory = register.call_args.args
-    assert backend_name == BACKEND_NAME
-    assert callable(factory)
+    assert callable(registry[BACKEND_NAME])
+
+
+def test_registration_captures_default_backend(tmp_path, monkeypatch):
+    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("RL_TRACE_FORWARD_TO_RL_INSIGHT", "1")
+    original_client = Mock()
+    original_factory = Mock(return_value=original_client)
+    registry = {DEFAULT_BACKEND: original_factory}
+
+    register_rl_insight_client(registry)
+    client = registry[DEFAULT_BACKEND]("config")
+    client.apply_event(_trace_event())
+
+    original_factory.assert_called_once_with("config")
+    original_client.apply_event.assert_called_once()
+    assert client.output_path.exists()
+
+
+def test_registration_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("RL_TRACE_FORWARD_TO_RL_INSIGHT", "1")
+    original_factory = Mock(return_value=Mock())
+    registry = {DEFAULT_BACKEND: original_factory}
+
+    register_rl_insight_client(registry)
+    first_tee = registry[DEFAULT_BACKEND]
+    register_rl_insight_client(registry)
+
+    assert registry[DEFAULT_BACKEND] is first_tee
+    registry[BACKEND_NAME]("config")
+    original_factory.assert_called_once_with("config")
+
+
+def test_default_backend_capture_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("RL_TRACE_CAPTURE_DEFAULT_BACKEND", "0")
+    original_factory = Mock()
+    registry = {DEFAULT_BACKEND: original_factory}
+
+    register_rl_insight_client(registry)
+
+    assert registry[DEFAULT_BACKEND] is original_factory
+    assert BACKEND_NAME in registry
+
+
+def test_forwarding_is_disabled_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.delenv("RL_TRACE_FORWARD_TO_RL_INSIGHT", raising=False)
+    original_factory = Mock()
+    registry = {DEFAULT_BACKEND: original_factory}
+
+    register_rl_insight_client(registry)
+    registry[DEFAULT_BACKEND]("config")
+
+    original_factory.assert_not_called()
+
+
+def test_delegate_failure_does_not_propagate(tmp_path):
+    delegate = Mock()
+    delegate.apply_event.side_effect = RuntimeError("hub unavailable")
+    client = ChromeTraceJsonlClient(tmp_path, delegate=delegate)
+
+    client.apply_event(_trace_event())
+
+    assert client.output_path.exists()
 
 
 def test_factory_uses_configured_output_directory(tmp_path, monkeypatch):
