@@ -39,3 +39,25 @@ def _restore_rl_insight_state():
         os.environ.pop(_BACKEND_ENV, None)
     else:
         os.environ[_BACKEND_ENV] = backend_env
+
+
+@pytest.fixture
+def load_in_perfetto():
+    """Load a trace with Perfetto's trace_processor.
+
+    Uses the binary at ``PERFETTO_TRACE_PROCESSOR`` when set (CI pins a release);
+    otherwise the perfetto package downloads its default one.
+    """
+    from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
+
+    processors = []
+
+    def load(path: Path) -> TraceProcessor:
+        config = TraceProcessorConfig(bin_path=os.environ.get("PERFETTO_TRACE_PROCESSOR"))
+        processor = TraceProcessor(trace=str(path), config=config)
+        processors.append(processor)
+        return processor
+
+    yield load
+    for processor in processors:
+        processor.close()

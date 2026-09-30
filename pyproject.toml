@@ -18,7 +18,10 @@ dependencies = [
 tokenspeed = ["tokenspeed"]
 
 [dependency-groups]
-dev = ["pytest>=8", "pyyaml", "ruff>=0.12"]
+dev = ["perfetto", "pytest>=8", "pyyaml", "ruff>=0.12"]
+
+[project.scripts]
+rl-trace-merge = "rl_trace_observer.merger.cli:main"
 
 [project.entry-points."verl.plugins"]
 rl-trace-observer = "rl_trace_observer.integrations.verl.register"

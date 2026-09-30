@@ -322,16 +322,18 @@ manifest
 
 ### P3：Session-level global merger
 
-- [ ] 实现 RL-Insight JSONL reader；
-- [ ] 实现 actor Torch trace reader；
-- [ ] 接入 TokenSpeed multi-rank merge；
-- [ ] 实现 global base time；
-- [ ] 实现 synthetic PID/TID allocator；
-- [ ] 实现全局 flow-ID namespace；
-- [ ] 输出 process/thread metadata；
-- [ ] 生成单个 Chrome Trace JSON。
+- [x] 实现 RL-Insight JSONL reader；
+- [x] 实现 actor Torch trace reader（VERL `build_trace_basename` 命名，`baseTimeNanoseconds` 锚点）；
+- [x] 实现 actor VizTracer reader（`viztracer_metadata.baseTimeNanoseconds` 锚点）；
+- [ ] 接入 TokenSpeed multi-rank merge（`tokenspeed.cli.trace_merge.merge_all_ranks`）；
+- [x] 实现 global base time（整数纳秒锚点，避免 epoch 纳秒超出 float64 精度）；
+- [x] 实现 synthetic PID/TID allocator（TID 全局唯一：Perfetto JSON importer 仅按 tid 识别线程）；
+- [x] 实现全局 flow-ID namespace（按 source 重新编号）；
+- [x] 输出 process/thread metadata；
+- [x] 生成单个 Chrome Trace JSON（`rl-trace-merge`），并用 Perfetto trace_processor 验证；
+- [ ] 同一进程的 RL-Insight lane 与 Torch trace 归并到同一 process（Torch trace 不含 hostname，需 manifest）。
 
-完成标准：Perfetto 中同时显示 actor Torch、semantic lanes、rollout Python 和 Proton kernel。
+完成标准：Perfetto 中同时显示 actor Torch、semantic lanes、rollout Python 和 Proton kernel。当前已覆盖 actor Torch、semantic lanes 与 actor VizTracer；CPU 测试中三者对同一操作的时间嵌套一致，误差在亚毫秒级。
 
 ### P4：时钟诊断
 
