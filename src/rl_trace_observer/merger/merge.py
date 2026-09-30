@@ -28,6 +28,10 @@ _KIND_LABEL = {RL_INSIGHT: "RL-Insight", TORCH: "Torch", VIZTRACER: "VizTracer"}
 _ID_PHASES = frozenset("stfbneSTF")
 
 
+class EmptyTraceError(ValueError):
+    """No source has a timed event, e.g. every process ran without writing spans."""
+
+
 @dataclass
 class MergeResult:
     trace: dict[str, Any]
@@ -143,7 +147,7 @@ def merge_sources(sources: Iterable[TraceSource], processes: Mapping[str, Proces
     starts = [_event_start_ns(source, event) for source in ordered for event in source.events]
     starts = [start for start in starts if start is not None]
     if not starts:
-        raise ValueError("No timed events in any source")
+        raise EmptyTraceError("No timed events in any source")
     global_base_ns = min(starts)
 
     warnings: list[str] = []

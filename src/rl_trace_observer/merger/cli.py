@@ -8,7 +8,7 @@ from collections import Counter
 from pathlib import Path
 
 from .manifest import build_manifest
-from .merge import merge_sources
+from .merge import EmptyTraceError, merge_sources
 
 logger = logging.getLogger("rl_trace_observer.merger")
 
@@ -37,26 +37,46 @@ def main(argv: list[str] | None = None) -> int:
     manifest, sources = build_manifest(args.inputs)
     for problem in manifest.problems:
         logger.warning("%s: %s (%s)", problem.kind, problem.path, problem.detail)
+
+    result = None
     if not sources:
         logger.error("No readable trace artifacts found in %s", ", ".join(map(str, args.inputs)))
-        return 1
+    else:
+        try:
+            result = merge_sources(sources, manifest.processes)
+        except EmptyTraceError as error:
+            logger.error("%s in %s", error, ", ".join(map(str, args.inputs)))
+    if result is not None:
+        for warning in result.warnings:
+            logger.warning(warning)
+        if args.strict and (manifest.problems or result.warnings):
+            logger.error(
+                "Strict mode: %d manifest problems, %d merge warnings", len(manifest.problems), len(result.warnings)
+            )
+            result = None
 
-    result = merge_sources(sources, manifest.processes)
-    for warning in result.warnings:
-        logger.warning(warning)
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    # The manifest is written even when merging fails: its problems explain why.
+    # A trace left from an earlier run must not sit next to it.
+    if result is None and args.output.exists():
+        logger.warning("Removing %s from an earlier run", args.output)
+        args.output.unlink()
     manifest_path = args.manifest or _default_manifest_path(args.output)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(
-        json.dumps(manifest.to_json(global_base_time_ns=result.global_base_ns, output=str(args.output)), indent=2),
+        json.dumps(
+            manifest.to_json(
+                global_base_time_ns=result.global_base_ns if result else None,
+                output=str(args.output) if result else None,
+            ),
+            indent=2,
+        ),
         encoding="utf-8",
     )
-    if args.strict and (manifest.problems or result.warnings):
-        logger.error(
-            "Strict mode: %d manifest problems, %d merge warnings", len(manifest.problems), len(result.warnings)
-        )
+    if result is None:
+        logger.error("No trace written; manifest: %s", manifest_path)
         return 1
 
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as file:
         json.dump(result.trace, file, separators=(",", ":"))
     counts = Counter(source.kind for source in sources)

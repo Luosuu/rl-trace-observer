@@ -12,7 +12,7 @@ artifacts. The manifest links every artifact to a process:
 Problems are reported instead of raised, so a partial run still merges:
 
 * ``incomplete``: an artifact cut short or unreadable.
-* ``duplicate``: an artifact whose content matches one already seen.
+* ``duplicate``: a copy of an artifact already seen (same file name and content).
 * ``missing``: an artifact a process registered but that is not in the inputs.
 * ``unlinked`` / ``ambiguous``: no process record, or several, match an artifact.
 """
@@ -101,23 +101,23 @@ def _sha256(path: Path) -> str:
 def _read_record(path: Path) -> Process:
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
-        host, os_pid = record["host"], int(record["os_pid"])
-    except (OSError, ValueError, KeyError) as error:
-        raise ArtifactError(f"Cannot read process record {path}: {error}") from error
-    distributed = record.get("torch_distributed") or {}
-    ray = record.get("ray")
-    return Process(
-        key=f"{host}:{os_pid}",
-        host=host,
-        hostname=record.get("hostname", host),
-        os_pid=os_pid,
-        rank=distributed.get("rank"),
-        actor_name=(ray or {}).get("actor_name"),
-        ray=ray,
-        clock=record.get("clock"),
-        record=str(path),
-        artifacts=[str(path.parent / entry["file"]) for entry in record.get("artifacts", [])],
-    )
+        host, os_pid = str(record["host"]), int(record["os_pid"])
+        distributed = record.get("torch_distributed") or {}
+        ray = record.get("ray")
+        return Process(
+            key=f"{host}:{os_pid}",
+            host=host,
+            hostname=record.get("hostname", host),
+            os_pid=os_pid,
+            rank=distributed.get("rank"),
+            actor_name=(ray or {}).get("actor_name"),
+            ray=ray,
+            clock=record.get("clock"),
+            record=str(path),
+            artifacts=[str(path.parent / entry["file"]) for entry in record.get("artifacts", [])],
+        )
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise ArtifactError(f"Cannot read process record {path}: {error!r}") from error
 
 
 def _link(source: TraceSource, processes: dict[str, Process]) -> tuple[str | None, Problem | None]:
@@ -155,18 +155,27 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
         manifest.processes[process.key] = process
 
     sources: list[TraceSource] = []
-    seen: dict[str, str] = {}
+    # Artifact names carry the writer's identity (host and pid, or pid and a
+    # timestamp), so only a file with both the same name and content is a copy;
+    # e.g. every process without spans writes an identical empty JSONL.
+    seen: dict[tuple[str, str], str] = {}
     for kind, path in found:
         if kind == PROCESS_RECORD:
             continue
-        digest = _sha256(path)
-        artifact = Artifact(kind=kind, path=str(path), size_bytes=path.stat().st_size, sha256=digest)
+        artifact = Artifact(kind=kind, path=str(path), size_bytes=0, sha256="")
         manifest.artifacts.append(artifact)
-        if digest in seen:
+        try:
+            artifact.size_bytes, artifact.sha256 = path.stat().st_size, _sha256(path)
+        except OSError as error:
             artifact.complete = False
-            manifest.problems.append(Problem("duplicate", str(path), f"same content as {seen[digest]}"))
+            manifest.problems.append(Problem("incomplete", str(path), f"cannot read: {error}"))
             continue
-        seen[digest] = str(path)
+        identity = (path.name, artifact.sha256)
+        if identity in seen:
+            artifact.complete = False
+            manifest.problems.append(Problem("duplicate", str(path), f"copy of {seen[identity]}"))
+            continue
+        seen[identity] = str(path)
         try:
             source = read_source(kind, path)
         except ArtifactError as error:

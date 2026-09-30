@@ -186,7 +186,60 @@ def test_cli_writes_manifest_and_strict_fails_on_problems(tmp_path):
 
     _torch(artifacts, 4321, rank=1)
     assert main([str(artifacts), "-o", str(output), "--strict"]) == 1
+    # A failed run leaves its manifest but no trace from the earlier run.
+    assert not output.exists()
+    assert json.loads((tmp_path / "out" / "merged.manifest.json").read_text())["output"] is None
     assert main([str(artifacts), "-o", str(output)]) == 0
+    assert output.exists()
+
+
+def test_cli_creates_the_directory_of_an_explicit_manifest(tmp_path):
+    _jsonl(tmp_path, "node-1", 1234)
+    manifest = tmp_path / "elsewhere" / "session.json"
+
+    assert main([str(tmp_path), "-o", str(tmp_path / "merged.json"), "--manifest", str(manifest)]) == 0
+    assert json.loads(manifest.read_text())["problems"] == []
+
+
+def test_processes_without_spans_are_not_duplicates_and_fail_cleanly(tmp_path):
+    # Every client creates its JSONL up front, so idle processes leave identical empty files.
+    for pid in (1, 2):
+        _record(tmp_path, "node-1", pid, artifacts=[f"rl-insight-node-1-pid-{pid}.chrome.jsonl"])
+        (tmp_path / f"rl-insight-node-1-pid-{pid}.chrome.jsonl").touch()
+    output = tmp_path / "out" / "merged.json"
+
+    manifest, sources = build_manifest([tmp_path])
+    assert manifest.problems == []
+    assert len(sources) == 2
+
+    assert main([str(tmp_path), "-o", str(output)]) == 1
+    assert not output.exists()
+    assert json.loads((tmp_path / "out" / "merged.manifest.json").read_text())["problems"] == []
+
+
+def test_manifest_is_written_when_no_artifact_is_readable(tmp_path):
+    _record(tmp_path, "node-1", 1234, artifacts=["rl-insight-node-1-pid-1234.chrome.jsonl"])
+    output = tmp_path / "merged.json"
+
+    assert main([str(tmp_path), "-o", str(output)]) == 1
+    problems = json.loads((tmp_path / "merged.manifest.json").read_text())["problems"]
+    assert [problem["kind"] for problem in problems] == ["missing"]
+
+
+def test_artifact_that_cannot_be_hashed_is_incomplete(tmp_path, monkeypatch):
+    from rl_trace_observer.merger import manifest as manifest_module
+
+    _jsonl(tmp_path, "node-1", 1234)
+
+    def fail(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(manifest_module, "_sha256", fail)
+    manifest, sources = build_manifest([tmp_path])
+
+    assert [problem.kind for problem in manifest.problems] == ["incomplete"]
+    assert manifest.artifacts[0].complete is False
+    assert sources == []
 
 
 def test_register_artifact_writes_this_process_record(tmp_path):
@@ -209,9 +262,17 @@ def test_register_artifact_writes_this_process_record(tmp_path):
     assert not list(tmp_path.glob(".*.tmp"))
 
 
-@pytest.mark.parametrize("name", ["rl-trace-process-node-1-pid-1234.json"])
-def test_corrupt_record_is_incomplete(tmp_path, name):
-    (tmp_path / name).write_text("{")
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{",
+        '{"host": "node-1"}',
+        '{"host": "node-1", "os_pid": 1234, "artifacts": [{"kind": "viztracer"}]}',
+        '{"host": "node-1", "os_pid": 1234, "ray": "not-a-dict"}',
+    ],
+)
+def test_corrupt_record_is_incomplete(tmp_path, content):
+    (tmp_path / "rl-trace-process-node-1-pid-1234.json").write_text(content)
 
     manifest, _ = build_manifest([tmp_path])
 

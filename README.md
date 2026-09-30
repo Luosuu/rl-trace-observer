@@ -136,13 +136,15 @@ with its size, sha256, process and completeness, and the problems found:
 | Problem | Meaning |
 |---|---|
 | `incomplete` | an artifact was cut short (truncated JSONL line) or cannot be read |
-| `duplicate` | an artifact has the same content as another input, and is merged once |
+| `duplicate` | an artifact is a copy of another input (same file name and content), and is merged once |
 | `missing` | a process registered an artifact that is not in the inputs |
 | `unlinked` | no process record matches a Torch or VizTracer trace's pid |
 | `ambiguous` | several process records match and the rank cannot tell them apart |
 
 Problems and dropped events (negative durations) are warnings; `--strict` turns
-them into a failure. A session is the set of artifacts under the inputs, so give
+them into a failure. The manifest is written even when no trace is (nothing
+readable, no timed events, or a `--strict` failure), and a trace left at the
+output path by an earlier run is then removed. A session is the set of artifacts under the inputs, so give
 each run its own `RL_TRACE_OUTPUT_DIR`.
 
 Timestamps are each host's wall clock, so cross-node ordering is only as good
