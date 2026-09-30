@@ -36,6 +36,11 @@ _VIZTRACER_FILE = re.compile(
     r"^step-(?P<step>.+)-role-(?P<role>.+)-rank-(?P<rank>\d+)-pid-(?P<pid>\d+)\.viztracer\.json$"
 )
 
+# Kineto's own bookkeeping pseudo-processes: the profiling window ("Spans"),
+# iteration markers ("Traces") and window-end instants (empty pid). GPU devices
+# use integer pids and are kept.
+_KINETO_BOOKKEEPING_PIDS = frozenset({"Spans", "Traces", ""})
+
 
 @dataclass
 class TraceSource:
@@ -142,12 +147,13 @@ def read_torch_trace(path: Path) -> TraceSource:
 
     data = _load_json(path)
     label, pid = match["label"], match["pid"]
+    events = [event for event in data.get("traceEvents", []) if event.get("pid") not in _KINETO_BOOKKEEPING_PIDS]
     return TraceSource(
         kind=TORCH,
         path=path,
         title=f"Torch {label} pid {pid}",
         base_ns=_anchor(data.get("baseTimeNanoseconds"), path, "baseTimeNanoseconds"),
-        events=list(data.get("traceEvents", [])),
+        events=events,
         labels={"label": label, "pid": pid},
     )
 

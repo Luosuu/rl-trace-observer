@@ -6,8 +6,9 @@ with ``VERL_PLATFORM=cpu``. It only uses VERL's extension points:
 * ``PlatformRegistry``: a ``cpu`` platform with the ``gloo`` backend.
 * ``EngineRegistry``: the FSDP engines, registered for ``device="cpu"``.
 * ``_ROLLOUT_REGISTRY`` / ``RolloutReplicaRegistry``: a ``mock`` rollout whose
-  server returns short token sequences and records a ``mock_generate`` span
-  like VERL's vLLM and SGLang servers do.
+  server returns random token sequences at a fixed pace and records one
+  ``mock_generate`` span per request, like VERL's vLLM and SGLang servers do
+  per replica.
 
 VERL 0.9.1 gaps for a cpu platform, worked around here or in the test config:
 
@@ -223,34 +224,53 @@ class MockServerAdapter(BaseRollout):
 
 @ray.remote(num_cpus=0)
 class MockLLMServer:
-    """Token-in, token-out server returning short random completions."""
+    """Token-in, token-out server returning random completions at a fixed pace.
+
+    Each request occupies a batch slot for its whole generation, like a request
+    in an inference engine's running batch. The ``mock_generate`` span is
+    recorded on the slot's lane (``replica_<r>/slot_<k>``) with the request id,
+    so concurrent requests show up as separate, non-overlapping spans.
+    """
+
+    PREFILL_SECONDS = 0.05
+    SECONDS_PER_TOKEN = 0.03
 
     def __init__(self, replica_rank: int, vocab_size: int, eos_token_id: int | None):
         self._replica_rank = replica_rank
         self._vocab_size = vocab_size
         self._eos_token_id = eos_token_id
         self._global_steps = None
+        self._busy_slots: set[int] = set()
 
     async def set_global_steps(self, global_steps: int):
         self._global_steps = global_steps
 
     async def generate(self, request_id: str, prompt_ids: list[int], sampling_params: dict, **kwargs) -> TokenOutput:
-        with RLInsightLogger.trace_state("mock_generate", state_lane_id=f"replica_{self._replica_rank}"):
-            max_tokens = int(sampling_params.get("max_tokens") or sampling_params.get("max_new_tokens") or 8)
-            rng = random.Random(f"{request_id}:{len(prompt_ids)}")
-            length = rng.randint(1, max_tokens)
-            token_ids = [rng.randrange(8, self._vocab_size) for _ in range(length)]
-            if self._eos_token_id is not None and length < max_tokens:
-                token_ids.append(self._eos_token_id)
-            await asyncio.sleep(0.002 * len(token_ids))
-            # Uniform sampling: every token has probability 1 / vocab_size.
-            log_probs = [-math.log(self._vocab_size)] * len(token_ids)
-            return TokenOutput(
-                token_ids=token_ids,
-                log_probs=log_probs,
-                stop_reason="completed",
-                extra_fields={"global_steps": self._global_steps},
-            )
+        slot = next(index for index in range(len(self._busy_slots) + 1) if index not in self._busy_slots)
+        self._busy_slots.add(slot)
+        try:
+            lane = f"replica_{self._replica_rank}/slot_{slot}"
+            with RLInsightLogger.trace_state("mock_generate", state_lane_id=lane, request_id=request_id):
+                return await self._generate(request_id, prompt_ids, sampling_params)
+        finally:
+            self._busy_slots.discard(slot)
+
+    async def _generate(self, request_id: str, prompt_ids: list[int], sampling_params: dict) -> TokenOutput:
+        max_tokens = int(sampling_params.get("max_tokens") or sampling_params.get("max_new_tokens") or 8)
+        rng = random.Random(f"{request_id}:{len(prompt_ids)}")
+        length = rng.randint(1, max_tokens)
+        token_ids = [rng.randrange(8, self._vocab_size) for _ in range(length)]
+        if self._eos_token_id is not None and length < max_tokens:
+            token_ids.append(self._eos_token_id)
+        await asyncio.sleep(self.PREFILL_SECONDS + self.SECONDS_PER_TOKEN * len(token_ids))
+        # Uniform sampling: every token has probability 1 / vocab_size.
+        log_probs = [-math.log(self._vocab_size)] * len(token_ids)
+        return TokenOutput(
+            token_ids=token_ids,
+            log_probs=log_probs,
+            stop_reason="completed",
+            extra_fields={"global_steps": self._global_steps},
+        )
 
     async def wake_up(self):
         pass

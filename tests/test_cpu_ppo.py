@@ -21,6 +21,10 @@ from rl_trace_observer.output import safe_component
 
 TESTS_DIR = Path(__file__).resolve().parent
 WORLD_SIZE = 2
+TRAIN_BATCH_SIZE = 4
+ROLLOUT_N = 2
+# MockLLMServer.PREFILL_SECONDS: every mock request lasts at least this long.
+MIN_GENERATE_US = 50_000
 TOLERANCE_NS = 5_000_000
 
 
@@ -40,7 +44,7 @@ def _run_main_ppo(assets: dict[str, Path], output_dir: Path, log: Path) -> subpr
         "algorithm.use_kl_in_reward=False",
         f"data.train_files={assets['train']}",
         f"data.val_files={assets['val']}",
-        "data.train_batch_size=4",
+        f"data.train_batch_size={TRAIN_BATCH_SIZE}",
         "data.max_prompt_length=32",
         "data.max_response_length=16",
         "data.dataloader_num_workers=0",
@@ -53,7 +57,7 @@ def _run_main_ppo(assets: dict[str, Path], output_dir: Path, log: Path) -> subpr
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.actor.use_kl_loss=False",
         "actor_rollout_ref.rollout.name=mock",
-        "actor_rollout_ref.rollout.n=2",
+        f"actor_rollout_ref.rollout.n={ROLLOUT_N}",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
         # RL-Insight rollout metrics require log stats.
@@ -97,12 +101,12 @@ def _run_main_ppo(assets: dict[str, Path], output_dir: Path, log: Path) -> subpr
         )
 
 
-def _spans_by_lane(output_dir: Path) -> dict[str, set[str]]:
-    lanes = defaultdict(set)
-    for path in output_dir.glob("rl-insight-*.chrome.jsonl"):
-        for event in map(json.loads, path.read_text().splitlines()):
-            lanes[event["tid"]].add(event["name"])
-    return lanes
+def _rl_insight_spans(output_dir: Path) -> list[dict]:
+    return [
+        event
+        for path in output_dir.glob("rl-insight-*.chrome.jsonl")
+        for event in map(json.loads, path.read_text().splitlines())
+    ]
 
 
 def test_one_ppo_step_on_cpu_produces_aligned_traces(tmp_path, load_in_perfetto):
@@ -113,17 +117,35 @@ def test_one_ppo_step_on_cpu_produces_aligned_traces(tmp_path, load_in_perfetto)
     result = _run_main_ppo(assets, output_dir, log)
     assert result.returncode == 0, log.read_text()[-5000:]
 
-    # Every actor rank and rollout replica wrote its own semantic lane.
-    lanes = _spans_by_lane(output_dir)
+    spans = _rl_insight_spans(output_dir)
+    lanes = defaultdict(set)
+    for span in spans:
+        lanes[span["tid"]].add(span["name"])
+    # Every actor rank wrote its own semantic lane.
     for rank in range(WORLD_SIZE):
         assert {"actor_compute_log_prob", "actor_update"} <= lanes[f"rank_{rank}"]
-        assert lanes[f"replica_{rank}"] == {"mock_generate"}
+    # Every rollout request is one span on a batch-slot lane of its replica.
+    generates = [span for span in spans if span["name"] == "mock_generate"]
+    assert len(generates) == TRAIN_BATCH_SIZE * ROLLOUT_N
+    assert len({span["args"]["request_id"] for span in generates}) == len(generates)
+    assert {span["tid"].split("/")[0] for span in generates} == {f"replica_{rank}" for rank in range(WORLD_SIZE)}
+    assert all(span["dur"] >= MIN_GENERATE_US for span in generates)
     assert len(list((output_dir / "torch").glob("*.json.gz"))) == WORLD_SIZE
 
     merged = tmp_path / "merged.json"
     assert merge([str(output_dir), "-o", str(merged), "--strict"]) == 0
 
     processor = load_in_perfetto(merged)
+    empty_processes = processor.query(
+        """
+        select p.name from process p
+        where p.pid > 0 and not exists (
+            select 1 from thread t join thread_track tt using (utid) join slice s on s.track_id = tt.id
+            where t.upid = p.upid
+        )
+        """
+    ).as_pandas_dataframe()
+    assert empty_processes.empty, empty_processes.name.tolist()
     slices = processor.query(
         """
         select s.ts, s.dur, p.name as process
