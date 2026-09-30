@@ -294,7 +294,7 @@ manifest
 - [x] 增加真实 RL-Insight lazy-init 测试；
 - [x] 增加单机多 Ray actor smoke test。
 
-已验证版本：`verl==0.9.1`、`rl-insight==0.2.1`。VERL 0.9 通过 `verl.plugins` entry point 在每个导入 verl 的进程中自动加载插件，并通过 `get_ppo_ray_runtime_env` 将 `VERL_RL_INSIGHT_ENABLE` 转发给所有 worker。其 `load_monitor_config` 只允许环境变量覆盖 `server.url`，无法覆盖 `server.backend`；长期可向上游提议增加 backend 环境变量，从而不再替换默认 factory。
+已验证版本：`verl==0.9.1`、`rl-insight==0.2.1` 与 `0.3.0`。VERL 0.9 通过 `verl.plugins` entry point 在每个导入 verl 的进程中自动加载插件，并通过 `get_ppo_ray_runtime_env` 将 `VERL_RL_INSIGHT_ENABLE` 转发给所有 worker。两个版本的 `load_monitor_config` 都只允许环境变量覆盖 `server.url`，无法覆盖 `server.backend`；长期可向上游提议增加 backend 环境变量，从而不再替换默认 factory。
 
 完成标准：至少两个 Ray worker 的 `trace_state` 都产生本地 semantic artifact。
 
