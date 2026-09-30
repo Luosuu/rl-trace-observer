@@ -15,6 +15,7 @@ DEFAULT_BACKEND = "ray"
 _TRACE_EVENT_KIND = "trace"
 _FORWARD_ENV = "RL_TRACE_FORWARD_TO_RL_INSIGHT"
 _CAPTURE_DEFAULT_ENV = "RL_TRACE_CAPTURE_DEFAULT_BACKEND"
+_RL_INSIGHT_BACKEND_ENV = "RL_INSIGHT_SERVER_BACKEND"
 
 
 def _enabled(name: str) -> bool:
@@ -123,16 +124,38 @@ def _default_registry() -> MutableMapping[str, Callable] | None:
     return MONITOR_CLIENT_REGISTRY
 
 
-def register_rl_insight_client(registry: MutableMapping[str, Callable] | None = None) -> bool:
-    """Register the custom backend and capture RL-Insight's default backend.
+def _supports_backend_env() -> bool:
+    try:
+        from rl_insight.utils.constants import MonitorEnv
+    except ImportError:
+        return False
+    return getattr(MonitorEnv, "SERVER_BACKEND", None) == _RL_INSIGHT_BACKEND_ENV
+
+
+def _capture_default_enabled() -> bool:
+    return os.getenv(_CAPTURE_DEFAULT_ENV, "1").lower() not in {"0", "false", "no", "off"}
+
+
+def register_rl_insight_client(
+    registry: MutableMapping[str, Callable] | None = None, backend_env: bool | None = None
+) -> bool:
+    """Register the custom backend and route default RL-Insight clients to it.
 
     VERL workers lazily call ``rl_insight.init()`` without the trainer config,
-    so they always select the default ``ray`` backend. The default factory is
-    therefore replaced by a tee that writes local JSONL and, when
-    ``RL_TRACE_FORWARD_TO_RL_INSIGHT`` is set, forwards to the original Ray
-    factory. Set ``RL_TRACE_CAPTURE_DEFAULT_BACKEND=0`` to leave it untouched.
+    so without intervention they select RL-Insight's default ``ray`` backend.
+    When RL-Insight supports ``RL_INSIGHT_SERVER_BACKEND``, it defaults to this
+    backend in the current process. Older RL-Insight versions instead get their
+    default factory replaced by a tee that writes local JSONL. In both cases
+    ``RL_TRACE_FORWARD_TO_RL_INSIGHT`` forwards events to the original Ray
+    factory, and ``RL_TRACE_CAPTURE_DEFAULT_BACKEND=0`` leaves the default
+    backend untouched.
 
     Registration is idempotent: an already installed tee is never wrapped again.
+
+    Args:
+        registry: RL-Insight's client registry; injected by tests.
+        backend_env: Whether RL-Insight honors ``RL_INSIGHT_SERVER_BACKEND``.
+            Detected from the installed RL-Insight when omitted.
 
     Returns:
         ``False`` when RL-Insight is unavailable, allowing the optional actor
@@ -143,15 +166,20 @@ def register_rl_insight_client(registry: MutableMapping[str, Callable] | None = 
         if registry is None:
             logger.warning("RL-Insight is unavailable; semantic state collection is disabled")
             return False
+    if backend_env is None:
+        backend_env = _supports_backend_env()
 
     current_default = registry.get(DEFAULT_BACKEND)
     if isinstance(current_default, _TeeFactory):
         tee_factory = current_default
     else:
         if current_default is None:
-            logger.warning("RL-Insight has no %r backend registered; capturing it locally only", DEFAULT_BACKEND)
+            logger.warning("RL-Insight has no %r backend registered; forwarding is unavailable", DEFAULT_BACKEND)
         tee_factory = _TeeFactory(current_default)
-        if os.getenv(_CAPTURE_DEFAULT_ENV, "1").lower() not in {"0", "false", "no", "off"}:
+        if _capture_default_enabled() and not backend_env:
             registry[DEFAULT_BACKEND] = tee_factory
     registry[BACKEND_NAME] = tee_factory
+    if _capture_default_enabled() and backend_env:
+        # An explicit user choice of backend wins over this default.
+        os.environ.setdefault(_RL_INSIGHT_BACKEND_ENV, BACKEND_NAME)
     return True

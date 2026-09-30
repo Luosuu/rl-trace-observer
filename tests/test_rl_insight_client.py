@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from unittest.mock import Mock
 
@@ -76,7 +77,7 @@ def test_trace_event_is_also_forwarded(tmp_path):
 def test_registration_uses_rl_trace_backend_name():
     registry = {}
 
-    assert register_rl_insight_client(registry)
+    assert register_rl_insight_client(registry, backend_env=False)
 
     assert callable(registry[BACKEND_NAME])
 
@@ -88,7 +89,7 @@ def test_registration_captures_default_backend(tmp_path, monkeypatch):
     original_factory = Mock(return_value=original_client)
     registry = {DEFAULT_BACKEND: original_factory}
 
-    register_rl_insight_client(registry)
+    register_rl_insight_client(registry, backend_env=False)
     client = registry[DEFAULT_BACKEND]("config")
     client.apply_event(_trace_event())
 
@@ -103,9 +104,9 @@ def test_registration_is_idempotent(tmp_path, monkeypatch):
     original_factory = Mock(return_value=Mock())
     registry = {DEFAULT_BACKEND: original_factory}
 
-    register_rl_insight_client(registry)
+    register_rl_insight_client(registry, backend_env=False)
     first_tee = registry[DEFAULT_BACKEND]
-    register_rl_insight_client(registry)
+    register_rl_insight_client(registry, backend_env=False)
 
     assert registry[DEFAULT_BACKEND] is first_tee
     registry[BACKEND_NAME]("config")
@@ -117,7 +118,7 @@ def test_default_backend_capture_can_be_disabled(monkeypatch):
     original_factory = Mock()
     registry = {DEFAULT_BACKEND: original_factory}
 
-    register_rl_insight_client(registry)
+    register_rl_insight_client(registry, backend_env=False)
 
     assert registry[DEFAULT_BACKEND] is original_factory
     assert BACKEND_NAME in registry
@@ -129,10 +130,39 @@ def test_forwarding_is_disabled_by_default(tmp_path, monkeypatch):
     original_factory = Mock()
     registry = {DEFAULT_BACKEND: original_factory}
 
-    register_rl_insight_client(registry)
+    register_rl_insight_client(registry, backend_env=False)
     registry[DEFAULT_BACKEND]("config")
 
     original_factory.assert_not_called()
+
+
+def test_backend_env_is_preferred_over_replacing_default(monkeypatch):
+    monkeypatch.delenv("RL_INSIGHT_SERVER_BACKEND", raising=False)
+    original_factory = Mock()
+    registry = {DEFAULT_BACKEND: original_factory}
+
+    register_rl_insight_client(registry, backend_env=True)
+
+    assert registry[DEFAULT_BACKEND] is original_factory
+    assert registry[BACKEND_NAME].original_factory is original_factory
+    assert os.environ["RL_INSIGHT_SERVER_BACKEND"] == BACKEND_NAME
+
+
+def test_backend_env_keeps_explicit_user_choice(monkeypatch):
+    monkeypatch.setenv("RL_INSIGHT_SERVER_BACKEND", "ray")
+
+    register_rl_insight_client({}, backend_env=True)
+
+    assert os.environ["RL_INSIGHT_SERVER_BACKEND"] == "ray"
+
+
+def test_backend_env_capture_can_be_disabled(monkeypatch):
+    monkeypatch.delenv("RL_INSIGHT_SERVER_BACKEND", raising=False)
+    monkeypatch.setenv("RL_TRACE_CAPTURE_DEFAULT_BACKEND", "0")
+
+    register_rl_insight_client({}, backend_env=True)
+
+    assert "RL_INSIGHT_SERVER_BACKEND" not in os.environ
 
 
 def test_delegate_failure_does_not_propagate(tmp_path):

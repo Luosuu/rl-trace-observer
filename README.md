@@ -59,10 +59,15 @@ python -m verl.trainer.main_ppo \
 ```
 
 VERL workers initialize RL-Insight lazily without the trainer config, so they
-always select RL-Insight's default `ray` backend. Loading the external module
-therefore also replaces the default `ray` factory with the same local JSONL
-client, so driver and worker spans are both captured. Set
-`RL_TRACE_CAPTURE_DEFAULT_BACKEND=0` to leave the default backend untouched.
+would otherwise select RL-Insight's default `ray` backend. Loading the external
+module routes them to the local JSONL client as well, so driver and worker spans
+are both captured:
+
+- If RL-Insight supports `RL_INSIGHT_SERVER_BACKEND`, the module sets it to
+  `rl_trace_observer` in each process unless it is already set.
+- Otherwise it replaces RL-Insight's default `ray` factory with the same client.
+
+Set `RL_TRACE_CAPTURE_DEFAULT_BACKEND=0` to leave the default backend untouched.
 
 Each process incrementally writes:
 
