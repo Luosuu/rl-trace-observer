@@ -24,6 +24,9 @@ jobs:
             extras: test
           - python: "3.12"
             extras: test,viztracer,rl-insight
+          # CPU-only multi-process tests against VERL's real single controller.
+          - python: "3.12"
+            extras: test,viztracer,rl-insight,verl
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6

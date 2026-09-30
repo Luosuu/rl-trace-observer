@@ -290,11 +290,11 @@ manifest
 
 - [x] 实现默认 `ray` backend 的 local+delegate tee factory；
 - [x] 保存并调用 RL-Insight 原始 Ray factory，避免递归；
-- [ ] 验证 driver、actor、rollout 进程均加载插件（需真实 VERL 运行）；
+- [x] 验证 driver、actor、rollout 进程均加载插件（CPU 上使用 VERL 真实 `RayWorkerGroup`；rollout 以调用同一 `RLInsightLogger.trace_state` 的 Ray actor 代替 vLLM/SGLang server）；
 - [x] 增加真实 RL-Insight lazy-init 测试；
 - [x] 增加单机多 Ray actor smoke test。
 
-已验证版本：`rl-insight==0.2.1`。其 `load_monitor_config` 只允许环境变量覆盖 `server.url`，无法覆盖 `server.backend`；长期可向上游提议增加 backend 环境变量，从而不再替换默认 factory。
+已验证版本：`verl==0.9.1`、`rl-insight==0.2.1`。VERL 0.9 通过 `verl.plugins` entry point 在每个导入 verl 的进程中自动加载插件，并通过 `get_ppo_ray_runtime_env` 将 `VERL_RL_INSIGHT_ENABLE` 转发给所有 worker。其 `load_monitor_config` 只允许环境变量覆盖 `server.url`，无法覆盖 `server.backend`；长期可向上游提议增加 backend 环境变量，从而不再替换默认 factory。
 
 完成标准：至少两个 Ray worker 的 `trace_state` 都产生本地 semantic artifact。
 

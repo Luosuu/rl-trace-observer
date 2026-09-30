@@ -26,6 +26,11 @@ uv pip install -e '.[test,viztracer]'
 uv run --no-sync pytest -q
 ```
 
+Installing the `rl-insight` and `verl` extras enables CPU-only multi-process
+tests that run VERL's real Ray single controller: a driver, two actor workers
+and a stand-in rollout server each load the plugin through VERL's plugin
+discovery and write their own semantic artifact. No GPU is required.
+
 ## Zero-patch VERL integration
 
 Install this package and `rl-insight` in the VERL driver and worker runtime:
@@ -33,7 +38,10 @@ Install this package and `rl-insight` in the VERL driver and worker runtime:
 ```bash
 uv pip install -e '.[rl-insight]'
 
-export VERL_USE_EXTERNAL_MODULES=rl_trace_observer.integrations.verl.register
+# VERL >= 0.9 loads the package's `verl.plugins` entry point automatically in
+# every process that imports verl. With VERL_USE_EXTERNAL_PLUGINS=none, or on
+# VERL versions without plugin discovery, load it explicitly:
+# export VERL_USE_EXTERNAL_MODULES=rl_trace_observer.integrations.verl.register
 export RL_TRACE_OUTPUT_DIR=/path/to/profile-artifacts
 
 # RL-Insight currently requires a non-empty URL during initialization. The

@@ -29,8 +29,8 @@ class FakeDistProfiler:
         self.calls.append(("backend_start", kwargs))
         return "start-result"
 
-    def stop(self):
-        self.calls.append(("backend_stop", None))
+    def stop(self, run_command=True):
+        self.calls.append(("backend_stop", run_command))
         return "stop-result"
 
 
@@ -43,6 +43,17 @@ def clean_patch_and_registry():
     if is_installed():
         uninstall()
     ObserverRegistry._factories.clear()
+
+
+def test_stop_forwards_verl_arguments():
+    ObserverRegistry.register("test", Mock)
+    install(FakeDistProfiler)
+    profiler = FakeDistProfiler()
+
+    profiler.start()
+    profiler.stop(run_command=False)
+
+    assert profiler.calls[-1] == ("backend_stop", False)
 
 
 def test_observer_wraps_backend_and_receives_verl_context():
