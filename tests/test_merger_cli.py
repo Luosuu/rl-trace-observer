@@ -21,7 +21,7 @@ def test_cli_writes_the_manifest_and_strict_fails_on_problems(tmp_path):
 
     assert main([str(artifacts), "-o", str(output), "--strict"]) == 0
     manifest = _manifest(tmp_path / "out" / "merged.manifest.json")
-    assert (manifest["schema_version"], manifest["global_base_time_ns"]) == (1, BASE_NS)
+    assert (manifest["schema_version"], manifest["global_base_time_ns"]) == (2, BASE_NS)
     assert [process["key"] for process in manifest["processes"]] == [worker.key]
     assert [artifact["process"] for artifact in manifest["artifacts"]] == [worker.key]
     assert manifest["problems"] == []

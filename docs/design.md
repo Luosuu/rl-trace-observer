@@ -200,7 +200,7 @@ manifest 还需要记录 profiler 版本、文件大小、checksum、写入完�
 
 节点本地目录不能假设对 driver 可见。collector 必须支持共享文件系统路径或显式上传/回传。
 
-**当前实现（schema_version 1）**：
+**当前实现（进程记录 schema_version 1，session manifest schema_version 2）**：
 
 - 每个写 artifact 的进程在 `RL_TRACE_OUTPUT_DIR` 写 `rl-trace-process-<host>-pid-<pid>.json`（原子替换），记录 hostname、pid、Ray job/node/worker/actor id 与 actor 名、`torch.distributed` rank/world_size、首次写入时的 wall/monotonic clock snapshot，以及它登记的 artifact。RL-Insight client 创建时与 VizTracer 启动时写入；此时 VERL worker 的 process group 已初始化。RL-Insight JSONL 在 client 创建时即创建，空文件表示该进程没有 span。
 - `rl-trace-merge` 在合并前构建 session manifest，并输出 `<output>.manifest.json`：进程列表、每个 artifact 的 size/sha256/所属进程/rank/完整性，以及 `incomplete`、`duplicate`、`missing`、`unlinked` 问题（`duplicate` 指文件名与内容都相同的非空副本）。`--strict` 下任一问题都会失败；合并失败时仍写出 manifest，并删除输出路径上旧的 trace。
@@ -319,7 +319,7 @@ manifest
 ### P1：TraceContext 与 artifact manifest
 
 - [x] 定义 versioned TraceContext schema（`run_id` 由 Ray session + job 确定性重建，可用 `RL_TRACE_RUN_ID` 覆盖；P6 request-level 前置）；
-- [x] 定义 versioned manifest schema（进程记录与 session manifest，schema_version 1）；
+- [x] 定义 versioned manifest schema（进程记录 schema_version 1；session manifest schema_version 2）；
 - [x] 为 artifact 增加 hostname、rank、Ray actor、checksum；
 - [x] 为 artifact 增加 role、run_id/profile_session_id、profiler 版本；manifest 按 run 与 profile session 分组，`rl-trace-merge --run/--step` 选择；
 - [x] 支持共享目录；

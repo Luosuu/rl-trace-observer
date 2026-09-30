@@ -41,7 +41,8 @@ from rl_trace_observer.process_record import SCHEMA_VERSION as RECORD_SCHEMA_VER
 
 from .sources import PROCESS_RECORD, RL_INSIGHT, ArtifactError, TraceSource, discover, read_source
 
-SCHEMA_VERSION = 1
+# 2: processes[].artifacts maps paths to record entries; artifacts[] carry no os_pid or rank.
+SCHEMA_VERSION = 2
 
 
 @dataclass
