@@ -14,12 +14,24 @@ import socket
 import sys
 import threading
 import time
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
+from rl_trace_observer.context import current_run_id
 from rl_trace_observer.output import safe_component
 
 SCHEMA_VERSION = 1
+# Distributions whose version is recorded once their module is imported.
+_VERSIONED_MODULES = {
+    "rl_trace_observer": "rl-trace-observer",
+    "rl_insight": "rl-insight",
+    "verl": "verl",
+    "torch": "torch",
+    "viztracer": "viztracer",
+    "tokenspeed": "tokenspeed",
+    "ray": "ray",
+}
 RECORD_PREFIX = "rl-trace-process-"
 
 _lock = threading.Lock()
@@ -59,11 +71,35 @@ def _torch_distributed() -> dict[str, int] | None:
     return {"rank": distributed.get_rank(), "world_size": distributed.get_world_size()}
 
 
-def register_artifact(output_dir: Path, kind: str, path: Path) -> Path:
+def _versions() -> dict[str, str]:
+    versions = {}
+    for module, distribution in _VERSIONED_MODULES.items():
+        if module in sys.modules:
+            try:
+                versions[distribution] = metadata.version(distribution)
+            except metadata.PackageNotFoundError:
+                pass
+    return versions
+
+
+def register_artifact(
+    output_dir: Path,
+    kind: str | None,
+    path: Path | None,
+    *,
+    global_step: int | None = None,
+    role: str | None = None,
+) -> Path:
     """Add ``path`` to this process's record and rewrite the record atomically.
 
-    The process identity is re-read on every call, so a record first written
-    before ``torch.distributed`` or Ray was initialized picks them up later.
+    The process identity (run id, Ray, ``torch.distributed``, versions) is
+    re-read on every call, so a record first written before Ray or the process
+    group was initialized picks them up later. With ``path=None`` only the
+    identity, and ``role`` when given, are updated.
+
+    Args:
+        global_step: The training step the artifact covers, when it covers one.
+        role: The process's role, e.g. ``"trainer"``; the first role set is kept.
     """
     # The same directory can be reached through a symlink or "..": key the
     # cache, and the relative artifact paths, by the resolved directory.
@@ -81,11 +117,19 @@ def register_artifact(output_dir: Path, kind: str, path: Path) -> Path:
                 "artifacts": [],
             },
         )
+        record["run_id"] = current_run_id()
+        if role is not None and record.get("role") is None:
+            record["role"] = role
+        record.setdefault("role", None)
         record["ray"] = _ray_identity()
         record["torch_distributed"] = _torch_distributed()
-        entry = {"kind": kind, "file": os.path.relpath(Path(path).resolve(), output_dir)}
-        if entry not in record["artifacts"]:
-            record["artifacts"].append(entry)
+        record["versions"] = _versions()
+        if path is not None:
+            entry = {"kind": kind, "file": os.path.relpath(Path(path).resolve(), output_dir)}
+            if global_step is not None:
+                entry["global_step"] = global_step
+            if entry not in record["artifacts"]:
+                record["artifacts"].append(entry)
         record["updated_wall_time_ns"] = time.time_ns()
 
         temporary = target.with_name(f".{target.name}.tmp")

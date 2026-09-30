@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .manifest import build_manifest
+from .manifest import build_manifest, select
 from .merge import EmptyTraceError, merge_sources
 from .sources import discover
 
@@ -42,6 +42,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--manifest", type=Path, help="session manifest to write (default: <output stem>.manifest.json)"
     )
+    parser.add_argument("--run", help="merge only this run id (see the manifest's runs)")
+    parser.add_argument(
+        "--step",
+        type=int,
+        action="append",
+        dest="steps",
+        help="merge only this global step; repeat for several (default: every step)",
+    )
     parser.add_argument(
         "--strict", action="store_true", help="fail on any manifest problem or dropped event instead of warning"
     )
@@ -60,6 +68,9 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"{name} {path} is one of the input artifacts")
 
     manifest, sources = build_manifest(args.inputs)
+    sources = select(manifest, sources, run=args.run, steps=args.steps)
+    if args.run is not None and args.run not in manifest.runs:
+        logger.error("Run %s is not in the inputs; runs found: %s", args.run, ", ".join(manifest.runs) or "none")
     for problem in manifest.problems:
         logger.warning("%s: %s (%s)", problem.kind, problem.path, problem.detail)
 
@@ -97,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as error:
             logger.error("Cannot remove %s: %s", args.output, error)
     document = manifest.to_json(
+        selection={"run": args.run, "steps": args.steps},
         global_base_time_ns=result.global_base_ns if result else None,
         output=str(args.output) if result else None,
     )
