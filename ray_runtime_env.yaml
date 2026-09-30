@@ -20,5 +20,6 @@ excludes:
 env_vars:
   # RL-Insight requires a non-empty URL; the local backend never contacts it.
   RL_INSIGHT_SERVER_URL: local://rl-trace-observer
-  # Set to a directory shared by all nodes (worker cwd is the unpacked working_dir):
+  # Required: an absolute directory shared by all nodes. Relative paths are
+  # rejected because worker cwd is the temporary unpacked working_dir.
   # RL_TRACE_OUTPUT_DIR: /shared/profile-artifacts

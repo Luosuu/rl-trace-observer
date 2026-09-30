@@ -1,12 +1,13 @@
 import json
 import logging
 import os
-import re
 import socket
 import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+from rl_trace_observer.output import safe_component, trace_output_dir
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +21,6 @@ def _enabled(name: str) -> bool:
     return os.getenv(name, "").lower() in {"1", "true", "yes", "on"}
 
 
-def _safe_component(value: object) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_") or "unknown"
-
-
 class ChromeTraceJsonlClient:
     """Convert RL-Insight trace events into append-only Chrome events.
 
@@ -35,7 +32,7 @@ class ChromeTraceJsonlClient:
     def __init__(self, output_dir: str | Path, delegate: object | None = None):
         output_dir = Path(output_dir).expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
-        hostname = _safe_component(socket.gethostname())
+        hostname = safe_component(socket.gethostname())
         self.output_path = output_dir / f"rl-insight-{hostname}-pid-{os.getpid()}.chrome.jsonl"
         self._delegate = delegate
         self._write_lock = threading.Lock()
@@ -92,8 +89,7 @@ def create_rl_trace_observer_client(config: object) -> ChromeTraceJsonlClient:
 
         delegate = create_ray_monitor_client(config)
 
-    output_dir = os.getenv("RL_TRACE_OUTPUT_DIR", "rl_trace_outputs")
-    return ChromeTraceJsonlClient(output_dir=output_dir, delegate=delegate)
+    return ChromeTraceJsonlClient(output_dir=trace_output_dir(), delegate=delegate)
 
 
 def _supports_backend_env() -> bool:

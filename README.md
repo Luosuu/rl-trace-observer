@@ -52,8 +52,9 @@ Run on Ray with [`ray_runtime_env.yaml`](ray_runtime_env.yaml), following Ray's
 uv integration: the project directory is uploaded as `working_dir` and every
 worker starts through `uv run --locked --extra tokenspeed python`, so all
 processes use the environment pinned by `uv.lock`. Set `RL_TRACE_OUTPUT_DIR` in
-the yaml to a directory shared by all nodes, then submit with the same extras on
-the driver:
+the yaml to an absolute directory shared by all nodes; it is required, and a
+relative path is rejected because each worker runs inside a temporary copy of
+the working_dir. Then submit with the same extras on the driver:
 
 ```bash
 ray job submit --runtime-env ray_runtime_env.yaml -- \
