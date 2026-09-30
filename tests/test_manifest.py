@@ -289,6 +289,8 @@ def test_register_artifact_writes_this_process_record(tmp_path):
         # Missing or unsupported versions are not read with version 1 semantics.
         '{"host": "node-1", "os_pid": 1234}',
         '{"schema_version": 2, "host": "node-1", "os_pid": 1234}',
+        '{"schema_version": 1, "host": "node-1", "os_pid": 1234, "run_id": ["a"]}',
+        '{"schema_version": 1, "host": "node-1", "os_pid": 1234, "role": 7}',
     ],
 )
 def test_corrupt_record_is_incomplete(tmp_path, content):

@@ -154,7 +154,10 @@ def _read_record(path: Path) -> Process:
         host, os_pid = str(record["host"]), int(record["os_pid"])
         distributed = record.get("torch_distributed") or {}
         ray = record.get("ray")
-        run_id = record.get("run_id")
+        run_id, role = record.get("run_id"), record.get("role")
+        for name, value in (("run_id", run_id), ("role", role)):
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"{name} must be a string, got {value!r}")
         return Process(
             key=f"{host}:{os_pid}" if run_id is None else f"{host}:{os_pid}@{run_id}",
             host=host,
@@ -167,7 +170,7 @@ def _read_record(path: Path) -> Process:
             record=str(path),
             artifacts=[str((path.parent / entry["file"]).resolve()) for entry in record.get("artifacts", [])],
             run_id=run_id,
-            role=record.get("role"),
+            role=role,
             updated_wall_time_ns=record.get("updated_wall_time_ns"),
             artifact_steps={
                 str((path.parent / entry["file"]).resolve()): int(entry["global_step"])
@@ -379,7 +382,10 @@ def _step_windows(
             try:
                 start = source.base_ns + round(float(event["ts"]) * 1000)
                 end = start + round(float(event.get("dur", 0)) * 1000)
-                key = (args.get("run_id") or _run_of(source, processes), int(args["global_step"]))
+                marker_run = args.get("run_id")
+                if marker_run is not None and not isinstance(marker_run, str):
+                    raise TypeError(f"run_id must be a string, got {marker_run!r}")
+                key = (marker_run or _run_of(source, processes), int(args["global_step"]))
             except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
                 malformed += 1
                 continue
