@@ -1,7 +1,7 @@
 # Ray runtime environment for VERL runs with RL Trace Observer.
 #
 #   ray job submit --runtime-env ray_runtime_env.yaml -- \
-#     uv run --locked --extra verl --extra tokenspeed --extra rl-insight --extra viztracer \
+#     uv run --locked --extra tokenspeed \
 #     python -m verl.trainer.main_ppo trainer.logger='["console","rl_insight"]' ...
 #
 # Every Ray worker starts through `uv run` inside the uploaded working_dir, so
@@ -12,7 +12,7 @@
 # default_worker.py, and `uv run <script.py>` discovers the project from the
 # script's location instead of the working_dir.
 working_dir: .
-py_executable: uv run --locked --extra verl --extra tokenspeed --extra rl-insight --extra viztracer python
+py_executable: uv run --locked --extra tokenspeed python
 excludes:
   - .git/
   - .venv/

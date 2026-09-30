@@ -20,32 +20,26 @@ actor-side VizTracer call stacks are needed.
 
 ## Setup
 
-The project is managed with [uv](https://docs.astral.sh/uv/). `uv.lock` pins
-every dependency, including RL-Insight from the
+The project is managed with [uv](https://docs.astral.sh/uv/) on Python 3.12.
+`uv.lock` pins every dependency: VERL (>= 0.9.1), VizTracer, and RL-Insight
+from the
 [Luosuu/rl-insight](https://github.com/Luosuu/rl-insight/tree/tianle/server-backend-env)
-fork that adds `RL_INSIGHT_SERVER_BACKEND` until it lands upstream.
+fork that adds `RL_INSIGHT_SERVER_BACKEND` until it lands upstream. TokenSpeed
+is the only extra.
 
 ```bash
-uv sync --all-extras      # everything: verl, tokenspeed, rl-insight, viztracer
-uv sync --extra rl-insight --extra viztracer   # or pick extras
+uv sync --extra tokenspeed
 uv run pytest -q
 ```
-
-| Extra | Installs |
-|---|---|
-| `rl-insight` | RL-Insight (fork, pinned by commit) |
-| `verl` | VERL >= 0.9.1 |
-| `tokenspeed` | TokenSpeed |
-| `viztracer` | VizTracer for the optional actor call stacks |
 
 `pytest` and `ruff` come from the default `dev` group. tokenspeed 0.1.0 pins
 `transformers==5.12.0` while verl 0.9.1 declares `transformers<5.11`; uv
 overrides the latter so both install together.
 
-With the `rl-insight` and `verl` extras, CPU-only multi-process tests run
-VERL's real Ray single controller: a driver, two actor workers and a stand-in
-rollout server each load the plugin through VERL's plugin discovery and write
-their own semantic artifact. No GPU is required.
+The tests run on CPU, including multi-process tests on VERL's real Ray single
+controller: a driver, two actor workers and a stand-in rollout server each load
+the plugin through VERL's plugin discovery and write their own semantic
+artifact. No GPU is required.
 
 ## Zero-patch VERL integration
 
@@ -56,14 +50,14 @@ explicitly with
 
 Run on Ray with [`ray_runtime_env.yaml`](ray_runtime_env.yaml), following Ray's
 uv integration: the project directory is uploaded as `working_dir` and every
-worker starts through `uv run --locked --extra ... python`, so all processes use
-the environment pinned by `uv.lock`. Set `RL_TRACE_OUTPUT_DIR` in the yaml to a
-directory shared by all nodes, then submit with the same extras on the driver:
+worker starts through `uv run --locked --extra tokenspeed python`, so all
+processes use the environment pinned by `uv.lock`. Set `RL_TRACE_OUTPUT_DIR` in
+the yaml to a directory shared by all nodes, then submit with the same extras on
+the driver:
 
 ```bash
 ray job submit --runtime-env ray_runtime_env.yaml -- \
-  uv run --locked --extra verl --extra tokenspeed --extra rl-insight --extra viztracer \
-  python -m verl.trainer.main_ppo \
+  uv run --locked --extra tokenspeed python -m verl.trainer.main_ppo \
   trainer.logger='["console","rl_insight"]' \
   ...
 ```

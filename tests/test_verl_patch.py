@@ -150,7 +150,6 @@ def test_install_is_idempotent_and_uninstall_restores_methods():
 
 
 def test_viztracer_observer_writes_actor_trace(tmp_path, monkeypatch):
-    pytest.importorskip("viztracer")
     from rl_trace_observer.integrations.verl.viztracer import VizTracerObserver
 
     monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path))

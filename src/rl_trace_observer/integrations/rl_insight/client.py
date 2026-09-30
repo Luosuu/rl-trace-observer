@@ -102,7 +102,7 @@ def _supports_backend_env() -> bool:
     return getattr(MonitorEnv, "SERVER_BACKEND", None) == RL_INSIGHT_BACKEND_ENV
 
 
-def register_rl_insight_client(register: Callable[[str, Callable], None] | None = None) -> bool:
+def register_rl_insight_client(register: Callable[[str, Callable], None] | None = None) -> None:
     """Register the backend and make it RL-Insight's default in this process.
 
     VERL workers lazily call ``rl_insight.init()`` without the trainer config,
@@ -112,27 +112,19 @@ def register_rl_insight_client(register: Callable[[str, Callable], None] | None 
     Args:
         register: RL-Insight's ``register_monitor_client``; injected by tests.
 
-    Returns:
-        ``False`` when RL-Insight is unavailable, allowing the optional actor
-        VizTracer integration to remain usable on its own.
-
     Raises:
         RuntimeError: The installed RL-Insight does not support
             ``RL_INSIGHT_SERVER_BACKEND``.
     """
     if register is None:
-        try:
-            from rl_insight.client.base import register_monitor_client
-        except ImportError:
-            logger.warning("RL-Insight is unavailable; semantic state collection is disabled")
-            return False
+        from rl_insight.client.base import register_monitor_client
+
         if not _supports_backend_env():
             raise RuntimeError(
                 f"The installed RL-Insight does not support {RL_INSIGHT_BACKEND_ENV}; install the "
-                "pinned fork with `uv sync --extra rl-insight`"
+                "pinned fork with `uv sync`"
             )
         register = register_monitor_client
 
     register(BACKEND_NAME, create_rl_trace_observer_client)
     os.environ.setdefault(RL_INSIGHT_BACKEND_ENV, BACKEND_NAME)
-    return True

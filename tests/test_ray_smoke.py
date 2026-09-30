@@ -4,11 +4,8 @@ import json
 from pathlib import Path
 
 import pytest
-
-ray = pytest.importorskip("ray")
-pytest.importorskip("rl_insight.client.base")
-
-from conftest import load_ray_runtime_env  # noqa: E402
+import ray
+from conftest import load_ray_runtime_env
 
 
 @ray.remote

@@ -78,7 +78,7 @@ def test_registration_selects_backend_through_env(monkeypatch):
     monkeypatch.delenv("RL_INSIGHT_SERVER_BACKEND", raising=False)
     register = Mock()
 
-    assert register_rl_insight_client(register)
+    register_rl_insight_client(register)
 
     register.assert_called_once_with(BACKEND_NAME, create_rl_trace_observer_client)
     assert os.environ["RL_INSIGHT_SERVER_BACKEND"] == BACKEND_NAME

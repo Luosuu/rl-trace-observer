@@ -3,11 +3,9 @@
 import json
 
 import pytest
+import rl_insight
 
-rl_insight = pytest.importorskip("rl_insight")
-pytest.importorskip("rl_insight.client.base")
-
-from rl_trace_observer.integrations.rl_insight import register_rl_insight_client  # noqa: E402
+from rl_trace_observer.integrations.rl_insight import register_rl_insight_client
 
 
 @pytest.fixture
@@ -26,7 +24,7 @@ def _read_events(output_dir):
 
 def test_lazy_init_without_config_is_captured(monitor_env):
     """VERL workers call ``rl_insight.init()`` without the trainer config."""
-    assert register_rl_insight_client()
+    register_rl_insight_client()
 
     rl_insight.init()
     with rl_insight.trace_state("actor_update", state_lane_id="rank_0"):
@@ -38,7 +36,7 @@ def test_lazy_init_without_config_is_captured(monitor_env):
 
 
 def test_explicit_backend_is_captured(monitor_env):
-    assert register_rl_insight_client()
+    register_rl_insight_client()
 
     rl_insight.init(config={"server": {"backend": "rl_trace_observer"}})
     with rl_insight.trace_state("train_batch"):

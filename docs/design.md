@@ -117,7 +117,7 @@ MVP 方案：
 5. RL-Insight 不支持该变量时 fail fast，不提供替换默认 `ray` factory 的回退；
 6. 通过真实 Ray actor 与 VERL `RayWorkerGroup` 测试验证 backend 选择。
 
-项目由 uv 管理，`uv.lock` 固定 fork 的 commit。Ray 运行遵循 Ray + uv 范式：`ray_runtime_env.yaml` 上传项目为 `working_dir`，并以 `uv run --locked --extra ... python` 作为 `py_executable`，每个 worker 使用同一锁定环境。末尾的 `python` 不可省略：否则 `uv run <default_worker.py>` 会从 Ray 安装位置而不是 `working_dir` 发现项目。
+项目由 uv 管理并固定 Python 3.12；verl、RL-Insight fork（按 commit 固定）与 VizTracer 为根依赖，TokenSpeed 为唯一 extra。Ray 运行遵循 Ray + uv 范式：`ray_runtime_env.yaml` 上传项目为 `working_dir`，并以 `uv run --locked --extra tokenspeed python` 作为 `py_executable`，每个 worker 使用同一锁定环境。末尾的 `python` 不可省略：否则 `uv run <default_worker.py>` 会从 Ray 安装位置而不是 `working_dir` 发现项目。
 
 ### 6.2 Actor profiler
 

@@ -8,18 +8,14 @@ import json
 import os
 
 import pytest
-
-ray = pytest.importorskip("ray")
-pytest.importorskip("rl_insight.client.base")
-pytest.importorskip("verl")
-
-from conftest import load_ray_runtime_env  # noqa: E402
-from verl.single_controller.base.decorator import Dispatch, register  # noqa: E402
-from verl.single_controller.base.worker import Worker  # noqa: E402
-from verl.single_controller.ray.base import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup  # noqa: E402
-from verl.trainer.constants_ppo import get_ppo_ray_runtime_env  # noqa: E402
-from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig  # noqa: E402
-from verl.utils.tracking import RLInsightLogger  # noqa: E402
+import ray
+from conftest import load_ray_runtime_env
+from verl.single_controller.base.decorator import Dispatch, register
+from verl.single_controller.base.worker import Worker
+from verl.single_controller.ray.base import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
+from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig
+from verl.utils.tracking import RLInsightLogger
 
 WORLD_SIZE = 2
 
@@ -107,7 +103,6 @@ def test_driver_actor_and_rollout_processes_write_semantic_spans(verl_env):
 
 
 def test_optional_viztracer_follows_verl_profile_window(verl_env):
-    pytest.importorskip("viztracer")
     _start_ray(verl_env, RL_TRACE_VIZTRACER="1", RL_TRACE_VIZTRACER_MIN_DURATION_US="0")
 
     group = _actor_group()
