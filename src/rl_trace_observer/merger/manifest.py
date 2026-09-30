@@ -62,6 +62,8 @@ class Process:
     versions: dict[str, str] = field(default_factory=dict)
     # Last time the process updated its record (epoch ns).
     updated_wall_time_ns: int | None = None
+    # Registered artifact path -> the global step the process said it covers.
+    artifact_steps: dict[str, int] = field(default_factory=dict)
 
     @property
     def title(self) -> str:
@@ -167,6 +169,11 @@ def _read_record(path: Path) -> Process:
             run_id=run_id,
             role=record.get("role"),
             updated_wall_time_ns=record.get("updated_wall_time_ns"),
+            artifact_steps={
+                str((path.parent / entry["file"]).resolve()): int(entry["global_step"])
+                for entry in record.get("artifacts", [])
+                if entry.get("global_step") is not None
+            },
             versions=dict(record.get("versions") or {}),
         )
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
@@ -326,9 +333,15 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
         sources.append(source)
 
     manifest.processes.update(fallback)
+    readable = {str(source.path): source for source in sources}
     for artifact in manifest.artifacts:
         if (process := manifest.processes.get(artifact.process)) is not None:
             artifact.run_id = process.run_id
+            # The filename's role and step win; the record fills in what it lacks.
+            artifact.role = artifact.role or process.role
+            if artifact.global_step is None and artifact.path in process.artifact_steps:
+                artifact.global_step = process.artifact_steps[artifact.path]
+                readable[artifact.path].global_step = artifact.global_step
         artifact.profile_session_id = profile_session_id(artifact.run_id, artifact.global_step)
     manifest.runs = sorted({process.run_id for process in manifest.processes.values() if process.run_id})
     found_paths = {str(path) for _, path in found}
@@ -367,7 +380,7 @@ def _step_windows(
                 start = source.base_ns + round(float(event["ts"]) * 1000)
                 end = start + round(float(event.get("dur", 0)) * 1000)
                 key = (args.get("run_id") or _run_of(source, processes), int(args["global_step"]))
-            except (KeyError, TypeError, ValueError, AttributeError):
+            except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
                 malformed += 1
                 continue
             if key[0] is not None:
@@ -406,6 +419,22 @@ def select(
     marker_runs: dict[str, set[str]] = {}
     windows = _step_windows(sources, processes, problems, marker_runs)
 
+    # A source without a process record takes the one run its step markers name.
+    artifacts = {artifact.path: artifact for artifact in manifest.artifacts}
+    source_runs = {}
+    for source in sources:
+        run_id = _run_of(source, processes)
+        if run_id is None and len(named := marker_runs.get(str(source.path), set())) == 1:
+            [run_id] = named
+        source_runs[str(source.path)] = run_id
+        artifact = artifacts[str(source.path)]
+        artifact.run_id = run_id
+        artifact.profile_session_id = profile_session_id(run_id, artifact.global_step)
+    manifest.runs = sorted(
+        {process.run_id for process in processes.values() if process.run_id}
+        | {artifact.run_id for artifact in manifest.artifacts if artifact.run_id}
+    )
+
     sessions: dict[tuple, ProfileSession] = {}
     for (run_id, step), (start, end) in windows.items():
         sessions[(run_id, step)] = ProfileSession(
@@ -434,16 +463,12 @@ def select(
     if run is None and len(manifest.runs) > 1:
         problems.append(Problem("mixed_runs", inputs, f"artifacts of runs {', '.join(manifest.runs)}"))
 
-    artifacts = {artifact.path: artifact for artifact in manifest.artifacts}
     for artifact in manifest.artifacts:
         # Unreadable artifacts are never merged; readable ones are re-marked below.
         artifact.selected = False
     kept = []
     for source in sources:
-        run_id = _run_of(source, processes)
-        if run_id is None and len(named := marker_runs.get(str(source.path), set())) == 1:
-            # No process record, but the source's own step markers name its run.
-            [run_id] = named
+        run_id = source_runs[str(source.path)]
         keep = run is None or run_id == run
         if keep and steps is not None:
             if source.kind == RL_INSIGHT:
@@ -461,7 +486,7 @@ def select(
                     try:
                         if _overlaps(source, event, chosen):
                             events.append(event)
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         malformed += 1
                 if malformed:
                     problems.append(

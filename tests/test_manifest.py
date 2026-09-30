@@ -698,3 +698,54 @@ def test_step_markers_name_the_run_of_a_source_without_a_record(tmp_path):
 
     assert [source.os_pid for source in kept] == [10]
     assert [session.id for session in manifest.sessions] == ["run-a-step-1"]
+
+
+def test_runs_named_only_by_step_markers_are_listed_and_selectable(tmp_path):
+    for pid, run_id in ((10, "run-a"), (11, "run-b")):
+        _jsonl(
+            tmp_path,
+            "node-1",
+            pid,
+            lines=[
+                _span_line("global_step", BASE_NS / 1000, 10, pid, "trainer", **MARKER, global_step=1, run_id=run_id)
+            ],
+        )
+
+    manifest, sources = build_manifest([tmp_path])
+    select(manifest, sources)
+    assert manifest.runs == ["run-a", "run-b"]
+    assert [problem.kind for problem in manifest.problems] == ["mixed_runs"]
+
+    assert main([str(tmp_path), "-o", str(tmp_path / "out" / "a.json"), "--strict", "--run", "run-a"]) == 0
+    written = json.loads((tmp_path / "out" / "a.manifest.json").read_text())
+    assert [a["run_id"] for a in written["artifacts"] if a["selected"]] == ["run-a"]
+
+
+def test_an_overflowing_marker_time_is_incomplete(tmp_path):
+    marker = _span_line("global_step", BASE_NS / 1000, 10, 10, "trainer", **MARKER, global_step=1)
+    _jsonl(tmp_path, "node-1", 10, lines=[marker.replace('"dur": 10', '"dur": 1e309')])
+
+    manifest, sources = build_manifest([tmp_path])
+    select(manifest, sources, steps=[1])
+
+    # The span is neither a window nor a mergeable event; nothing raises.
+    assert {problem.kind for problem in manifest.problems} == {"incomplete", "no_step_window"}
+
+
+def test_artifacts_take_role_and_step_from_their_process_record(tmp_path):
+    _two_step_run(tmp_path)
+    # A registered trace whose filename carries no step.
+    torch = _torch(tmp_path, 20, rank=0, step=1)
+    unstepped = torch.with_name(torch.name.replace("_step1", ""))
+    torch.rename(unstepped)
+    record = tmp_path / "rl-trace-process-node-1-pid-20.json"
+    data = json.loads(record.read_text())
+    data["artifacts"].append({"kind": "torch", "file": unstepped.name, "global_step": 1})
+    record.write_text(json.dumps(data))
+
+    manifest, sources = build_manifest([tmp_path])
+    kept = select(manifest, sources, steps=[1])
+
+    roles = {artifact.path: artifact.role for artifact in manifest.artifacts}
+    assert roles[str(tmp_path / "rl-insight-node-1-pid-10.chrome.jsonl")] == "trainer"
+    assert str(unstepped) in {str(source.path) for source in kept}
