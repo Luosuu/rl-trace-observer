@@ -2,6 +2,11 @@ import os
 
 import pytest
 
+# Under `uv run`, Ray otherwise rebuilds a separate uv environment for every
+# worker from the bare project, without the extras synced for this run. Test
+# workers must use the same environment as the driver. Ray reads this on import.
+os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
+
 _BACKEND_ENV = "RL_INSIGHT_SERVER_BACKEND"
 
 

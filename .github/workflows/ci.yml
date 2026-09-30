@@ -11,8 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: uvx ruff check .
-      - run: uvx ruff format --check .
+      - run: uv sync --locked
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check .
 
   test:
     runs-on: ubuntu-latest
@@ -20,18 +21,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Core package only, on the oldest supported Python.
           - python: "3.10"
-            extras: test
+            sync: ""
+          # Everything together, including CPU-only multi-process VERL tests.
           - python: "3.12"
-            extras: test,viztracer,rl-insight
-          # CPU-only multi-process tests against VERL's real single controller.
-          - python: "3.12"
-            extras: test,viztracer,rl-insight,verl
+            sync: "--all-extras"
+    env:
+      UV_PYTHON: ${{ matrix.python }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: ${{ matrix.python }}
-      - run: uv venv
-      - run: uv pip install -e '.[${{ matrix.extras }}]'
+      - run: uv sync --locked ${{ matrix.sync }}
       - run: uv run --no-sync pytest -q -rs

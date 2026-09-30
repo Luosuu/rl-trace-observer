@@ -10,16 +10,28 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-verl = ["verl"]
+# 0.9 adds verl.plugins entry point discovery and the RL-Insight hooks used here.
+verl = ["verl>=0.9.1"]
 tokenspeed = ["tokenspeed"]
-# Pinned to the fork until RL_INSIGHT_SERVER_BACKEND lands upstream; older
-# rl-insight releases (>=0.2.1) still work through the default-backend tee.
-rl-insight = ["rl-insight @ git+https://github.com/Luosuu/rl-insight@tianle/server-backend-env"]
+rl-insight = ["rl-insight>=0.2.1"]
 viztracer = ["viztracer>=0.16"]
-test = ["pytest>=8"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.12"]
 
 [project.entry-points."verl.plugins"]
 rl-trace-observer = "rl_trace_observer.integrations.verl.register"
+
+[tool.uv.sources]
+# uv installs the fork that adds RL_INSIGHT_SERVER_BACKEND until it lands
+# upstream (branch tianle/server-backend-env). pip users get the PyPI release,
+# which still works through the default-backend tee.
+rl-insight = { git = "https://github.com/Luosuu/rl-insight", rev = "72763beecf2c9652ad182ba83ce9104417a70d1e" }
+
+[tool.uv]
+# tokenspeed 0.1.0 pins transformers==5.12.0 while verl 0.9.1 declares
+# transformers<5.11. Both must share one environment, so force tokenspeed's pin.
+override-dependencies = ["transformers==5.12.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

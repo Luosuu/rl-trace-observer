@@ -18,25 +18,41 @@ Trace JSONL files.
 An optional, reversible `DistProfiler.start/stop` patch is retained only when
 actor-side VizTracer call stacks are needed.
 
-## Local validation
+## Setup
+
+The project is managed with [uv](https://docs.astral.sh/uv/). `uv.lock` pins
+every dependency, including RL-Insight from the
+[Luosuu/rl-insight](https://github.com/Luosuu/rl-insight/tree/tianle/server-backend-env)
+fork that adds `RL_INSIGHT_SERVER_BACKEND` until it lands upstream.
 
 ```bash
-uv venv --python 3.12
-uv pip install -e '.[test,viztracer]'
-uv run --no-sync pytest -q
+uv sync --all-extras      # everything: verl, tokenspeed, rl-insight, viztracer
+uv sync --extra rl-insight --extra viztracer   # or pick extras
+uv run pytest -q
 ```
 
-Installing the `rl-insight` and `verl` extras enables CPU-only multi-process
-tests that run VERL's real Ray single controller: a driver, two actor workers
-and a stand-in rollout server each load the plugin through VERL's plugin
-discovery and write their own semantic artifact. No GPU is required.
+| Extra | Installs |
+|---|---|
+| `rl-insight` | RL-Insight (fork, pinned by commit) |
+| `verl` | VERL >= 0.9.1 |
+| `tokenspeed` | TokenSpeed |
+| `viztracer` | VizTracer for the optional actor call stacks |
+
+`pytest` and `ruff` come from the default `dev` group. tokenspeed 0.1.0 pins
+`transformers==5.12.0` while verl 0.9.1 declares `transformers<5.11`; uv
+overrides the latter so both install together.
+
+With the `rl-insight` and `verl` extras, CPU-only multi-process tests run
+VERL's real Ray single controller: a driver, two actor workers and a stand-in
+rollout server each load the plugin through VERL's plugin discovery and write
+their own semantic artifact. No GPU is required.
 
 ## Zero-patch VERL integration
 
 Install this package and `rl-insight` in the VERL driver and worker runtime:
 
 ```bash
-uv pip install -e '.[rl-insight]'
+uv sync --extra verl --extra rl-insight
 
 # VERL >= 0.9 loads the package's `verl.plugins` entry point automatically in
 # every process that imports verl. With VERL_USE_EXTERNAL_PLUGINS=none, or on
@@ -49,10 +65,12 @@ export RL_TRACE_OUTPUT_DIR=/path/to/profile-artifacts
 export RL_INSIGHT_SERVER_URL=local://rl-trace-observer
 ```
 
-Select the custom monitor backend and enable the existing VERL logger:
+Select the custom monitor backend and enable the existing VERL logger. When
+launching through `uv run`, Ray starts every worker with the same `uv run`
+flags, so pass the extras there too:
 
 ```bash
-python -m verl.trainer.main_ppo \
+uv run --extra verl --extra rl-insight python -m verl.trainer.main_ppo \
   trainer.logger='["console","rl_insight"]' \
   +trainer.rl_insight.server.backend=rl_trace_observer \
   ...
