@@ -5,7 +5,7 @@ import socket
 
 import pytest
 
-from rl_trace_observer.merger import build_manifest, merge_sources
+from rl_trace_observer.merger import build_manifest, merge_sources, select
 from rl_trace_observer.merger.cli import main
 from rl_trace_observer.output import safe_component
 from rl_trace_observer.process_record import SCHEMA_VERSION, record_path, register_artifact
@@ -13,7 +13,7 @@ from rl_trace_observer.process_record import SCHEMA_VERSION, record_path, regist
 BASE_NS = 1_790_000_000_000_000_000
 
 
-def _record(root, host, pid, *, rank=None, actor=None, artifacts=()):
+def _record(root, host, pid, *, rank=None, actor=None, artifacts=(), run_id=None, role=None):
     path = root / f"rl-trace-process-{host}-pid-{pid}.json"
     path.write_text(
         json.dumps(
@@ -25,6 +25,8 @@ def _record(root, host, pid, *, rank=None, actor=None, artifacts=()):
                 "ray": {"actor_name": actor} if actor else None,
                 "torch_distributed": {"rank": rank, "world_size": 2} if rank is not None else None,
                 "artifacts": [{"kind": "rl_insight_jsonl", "file": name} for name in artifacts],
+                "run_id": run_id,
+                "role": role,
             }
         )
     )
@@ -38,10 +40,10 @@ def _jsonl(root, host, pid, lines=None):
     return path
 
 
-def _torch(root, pid, rank, *, distributed=True):
-    path = root / f"actor_train_step1_rank{rank}-of-2_pid{pid}_20260930151150960.json.gz"
+def _torch(root, pid, rank, *, distributed=True, step=1, base_ns=BASE_NS):
+    path = root / f"actor_train_step{step}_rank{rank}-of-2_pid{pid}_20260930151150960.json.gz"
     data = {
-        "baseTimeNanoseconds": BASE_NS,
+        "baseTimeNanoseconds": base_ns,
         "traceEvents": [
             {"ph": "M", "name": "process_name", "pid": pid, "tid": 0, "args": {"name": "ray::WorkerDict"}},
             {"ph": "X", "name": "actor_update", "pid": pid, "tid": pid, "ts": 1.0, "dur": 3.0},
@@ -247,8 +249,10 @@ def test_register_artifact_writes_this_process_record(tmp_path):
     second = tmp_path / "step-1-role-e2e-rank-0-pid-1.viztracer.json"
 
     path = register_artifact(tmp_path, "rl_insight_jsonl", first)
-    register_artifact(tmp_path, "viztracer", second)
-    register_artifact(tmp_path, "viztracer", second)
+    register_artifact(tmp_path, "viztracer", second, global_step=1)
+    register_artifact(tmp_path, "viztracer", second, global_step=1)
+    register_artifact(tmp_path, None, None, role="trainer")
+    register_artifact(tmp_path, None, None, role="actor")
 
     record = json.loads(path.read_text())
     assert path == record_path(tmp_path)
@@ -257,8 +261,12 @@ def test_register_artifact_writes_this_process_record(tmp_path):
     assert set(record["clock"]) == {"wall_time_ns", "monotonic_ns"}
     assert record["artifacts"] == [
         {"kind": "rl_insight_jsonl", "file": first.name},
-        {"kind": "viztracer", "file": second.name},
+        {"kind": "viztracer", "file": second.name, "global_step": 1},
     ]
+    # The first role is kept; versions of the loaded frameworks are recorded.
+    assert record["role"] == "trainer"
+    assert "rl-trace-observer" in record["versions"]
+    assert "run_id" in record
     assert not list(tmp_path.glob(".*.tmp"))
 
 
@@ -424,3 +432,124 @@ def test_register_artifact_through_a_symlinked_directory_updates_one_record(tmp_
         "rl-insight-a.chrome.jsonl",
         "step-1-role-e2e-rank-0-pid-1.viztracer.json",
     ]
+
+
+def _span_line(name, start_us, dur_us, pid, lane, **args):
+    return json.dumps(
+        {"name": name, "ph": "X", "ts": start_us, "dur": dur_us, "pid": str(pid), "tid": lane, "args": args}
+    )
+
+
+def _two_step_run(root, run_id="run-a"):
+    """A trainer marking steps 1 and 2, an actor with spans and a Torch trace in each."""
+    base_us = BASE_NS // 1000
+    _record(root, "node-1", 10, run_id=run_id, role="trainer")
+    _jsonl(
+        root,
+        "node-1",
+        10,
+        lines=[
+            _span_line("global_step", base_us, 1000, 10, "trainer", global_step=1, run_id=run_id),
+            _span_line("global_step", base_us + 2000, 1000, 10, "trainer", global_step=2, run_id=run_id),
+        ],
+    )
+    _record(root, "node-1", 20, rank=0, run_id=run_id)
+    _jsonl(
+        root,
+        "node-1",
+        20,
+        lines=[
+            _span_line("actor_update", base_us + 100, 10, 20, "rank_0"),
+            _span_line("actor_update", base_us + 2100, 10, 20, "rank_0"),
+        ],
+    )
+    _torch(root, 20, rank=0, step=1)
+    _torch(root, 20, rank=0, step=2, base_ns=BASE_NS + 2_000_000)
+
+
+def test_sessions_are_the_steps_of_a_run(tmp_path):
+    _two_step_run(tmp_path)
+
+    manifest, sources = build_manifest([tmp_path])
+    kept = select(manifest, sources)
+
+    assert manifest.runs == ["run-a"]
+    assert manifest.problems == []
+    assert len(kept) == len(sources) == 4
+    assert [(session.id, session.start_time_ns, session.end_time_ns) for session in manifest.sessions] == [
+        ("run-a-step-1", BASE_NS, BASE_NS + 1_000_000),
+        ("run-a-step-2", BASE_NS + 2_000_000, BASE_NS + 3_000_000),
+    ]
+    assert [len(session.artifacts) for session in manifest.sessions] == [1, 1]
+    torch = [artifact for artifact in manifest.artifacts if artifact.kind == "torch"]
+    assert [(artifact.global_step, artifact.role, artifact.profile_session_id) for artifact in torch] == [
+        (1, "actor_train", "run-a-step-1"),
+        (2, "actor_train", "run-a-step-2"),
+    ]
+    assert manifest.processes["node-1:10"].role == "trainer"
+
+
+def test_one_step_keeps_its_traces_and_the_spans_in_its_window(tmp_path):
+    _two_step_run(tmp_path)
+
+    manifest, sources = build_manifest([tmp_path])
+    kept = select(manifest, sources, steps=[2])
+
+    assert manifest.problems == []
+    assert sorted(source.kind for source in kept) == ["rl_insight", "rl_insight", "torch"]
+    assert [source.global_step for source in kept if source.kind == "torch"] == [2]
+    timed = [(source.os_pid, event["name"]) for source in kept for event in source.events if "ts" in event]
+    # Step 2's marker, the actor's step-2 span, and the step-2 Torch trace.
+    assert sorted(timed) == [(10, "global_step"), (20, "actor_update"), (20, "actor_update"), (20, "gemm")]
+    assert [
+        event["args"]["global_step"] for source in kept for event in source.events if event["name"] == "global_step"
+    ] == [2]
+    result = merge_sources(kept, manifest.processes)
+    assert result.global_base_ns == BASE_NS + 2_000_000
+    assert [artifact.selected for artifact in manifest.artifacts if artifact.kind == "torch"] == [False, True]
+
+
+def test_several_runs_must_be_chosen_between(tmp_path):
+    first, second = tmp_path / "a", tmp_path / "b"
+    first.mkdir()
+    second.mkdir()
+    _two_step_run(first, run_id="run-a")
+    _record(second, "node-2", 30, rank=0, run_id="run-b")
+    _jsonl(second, "node-2", 30)
+
+    manifest, sources = build_manifest([tmp_path])
+    select(manifest, sources)
+    assert [problem.kind for problem in manifest.problems] == ["mixed_runs"]
+
+    manifest, sources = build_manifest([tmp_path])
+    kept = select(manifest, sources, run="run-b")
+    assert manifest.problems == []
+    assert [source.process for source in kept] == ["node-2:30"]
+
+
+def test_a_step_without_a_window_leaves_rl_insight_spans_out(tmp_path):
+    _record(tmp_path, "node-1", 20, rank=0, run_id="run-a")
+    _jsonl(tmp_path, "node-1", 20)
+    _torch(tmp_path, 20, rank=0, step=1)
+
+    manifest, sources = build_manifest([tmp_path])
+    kept = select(manifest, sources, steps=[1])
+
+    assert [problem.kind for problem in manifest.problems] == ["no_step_window"]
+    assert [source.kind for source in kept] == ["torch"]
+
+
+def test_cli_merges_one_step_and_records_the_selection(tmp_path):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    _two_step_run(artifacts)
+    output = tmp_path / "step2.json"
+
+    assert main([str(artifacts), "-o", str(output), "--strict", "--step", "2"]) == 0
+    manifest = json.loads((tmp_path / "step2.manifest.json").read_text())
+    assert manifest["selection"] == {"run": None, "steps": [2]}
+    assert [session["global_step"] for session in manifest["sessions"]] == [1, 2]
+    names = [event["name"] for event in json.loads(output.read_text())["traceEvents"] if event["ph"] == "X"]
+    assert names.count("global_step") == 1
+
+    assert main([str(artifacts), "-o", str(output), "--run", "run-z"]) == 1

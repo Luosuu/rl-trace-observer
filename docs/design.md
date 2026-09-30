@@ -165,6 +165,13 @@ clock_snapshot_id
 
 首版 `profile_session_id` 可以由 `run_id + global_step` 生成。不能只使用 OS PID、rank 或文件名推断 session。
 
+**当前实现（`rl_trace_observer.context`，schema_version 1）**：
+
+- `TraceContext` 是可 JSON 序列化的 frozen dataclass，包含上述字段（`clock_snapshot_id` 暂由进程记录的 clock snapshot 代替）；`from_json` 拒绝其他 schema 版本。
+- `run_id`：优先取 `RL_TRACE_RUN_ID`；否则取 Ray `get_session_name()` 与 `get_job_id()`，即 `<session_name>-job-<job_id>`。同一训练 job 的所有 Ray 进程天然一致，无需额外传播；只有 job id 时不同集群会重复（都从 `01000000` 开始），所以带上 session 名。非 Ray 进程（如 P2 的 TokenSpeed server）需显式传入。
+- `global_step`：Torch/VizTracer 从文件名得到（VERL `profile_step`）；RL-Insight span 不带 step，因此 driver 在 VERL v1 trainer 的 `PPOTrainer.step` 外包一层（模块导入时通过 post-import hook 打补丁，不在插件加载时导入重量级模块），每个 step 在 `trainer` lane 上记录一个 `global_step` span（args 含 `global_step`、`run_id`），作为该 profile session 的时间窗口。异步 trainer 中下一步的 generation 可能与当前 step 重叠，精确归属留给 P6 request-level。
+- `role`：进程级 role 目前只有 trainer（记录 `global_step` 的进程）；artifact 级 role 来自 Torch 文件名前缀和 VizTracer 的 role。
+
 ### 6.5 Artifact manifest
 
 每个进程写入 artifact record，driver/collector 汇总为 session manifest：
@@ -198,6 +205,7 @@ manifest 还需要记录 profiler 版本、文件大小、checksum、写入完�
 - 每个写 artifact 的进程在 `RL_TRACE_OUTPUT_DIR` 写 `rl-trace-process-<host>-pid-<pid>.json`（原子替换），记录 hostname、pid、Ray job/node/worker/actor id 与 actor 名、`torch.distributed` rank/world_size、首次写入时的 wall/monotonic clock snapshot，以及它登记的 artifact。RL-Insight client 创建时与 VizTracer 启动时写入；此时 VERL worker 的 process group 已初始化。RL-Insight JSONL 在 client 创建时即创建，空文件表示该进程没有 span。
 - `rl-trace-merge` 在合并前构建 session manifest，并输出 `<output>.manifest.json`：进程列表、每个 artifact 的 size/sha256/所属进程/rank/完整性，以及 `incomplete`、`duplicate`、`missing`、`unlinked`、`ambiguous` 问题（`duplicate` 指文件名与内容都相同的副本）。`--strict` 下任一问题都会失败；合并失败时仍写出 manifest，并删除输出路径上旧的 trace。
 - Torch/VizTracer 文件名只含 pid，按 pid 关联进程记录；多个 host 复用同一 pid 时用 rank（Kineto `distributedInfo` 或文件名）区分。
+- 进程记录还包含 `run_id`、`role` 和已加载框架/profiler 的版本（`versions`）；artifact 条目可带 `global_step`。manifest 增加 `runs` 与 `sessions`（每个 profile session 的时间窗口与 step 专属 artifact），以及 `mixed_runs`（多个 run 且未用 `--run` 选择）、`no_step_window`（所选 step 没有 `global_step` span）问题。
 - session 暂定为输入目录下的全部 artifact（每次运行使用独立的 `RL_TRACE_OUTPUT_DIR`）；`run_id` / `profile_session_id` / `global_step` 与 profiler 版本尚未记录。显式 artifact 回传尚未实现，目前依赖共享文件系统。
 
 ### 6.6 全局 identity
@@ -310,10 +318,10 @@ manifest
 
 ### P1：TraceContext 与 artifact manifest
 
-- [ ] 定义 versioned TraceContext schema（跨进程传播，P6 request-level 前置）；
+- [x] 定义 versioned TraceContext schema（`run_id` 由 Ray session + job 确定性重建，可用 `RL_TRACE_RUN_ID` 覆盖；P6 request-level 前置）；
 - [x] 定义 versioned manifest schema（进程记录与 session manifest，schema_version 1）；
-- [x] 为 artifact 增加 hostname、rank、Ray actor、checksum；session 暂为输入目录；
-- [ ] 为 artifact 增加 role、run_id/profile_session_id、profiler 版本；
+- [x] 为 artifact 增加 hostname、rank、Ray actor、checksum；
+- [x] 为 artifact 增加 role、run_id/profile_session_id、profiler 版本；manifest 按 run 与 profile session 分组，`rl-trace-merge --run/--step` 选择；
 - [x] 支持共享目录；
 - [ ] 支持显式 artifact 回传（节点本地目录）；
 - [x] 检测缺失、重复和未完成 artifact，并关联 Torch/VizTracer trace 到所属进程。

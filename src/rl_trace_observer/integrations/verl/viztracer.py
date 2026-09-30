@@ -29,7 +29,8 @@ class VizTracerObserver:
             f"rank-{context.rank}-pid-{os.getpid()}.viztracer.json"
         )
         try:
-            register_artifact(output_dir, "viztracer", output_file)
+            step = int(profile_step) if str(profile_step).isdigit() else None
+            register_artifact(output_dir, "viztracer", output_file, global_step=step)
         except Exception:
             logger.exception("Failed to write the process record for %s", output_file)
         self._tracer = VizTracer(

@@ -1,4 +1,4 @@
-from .manifest import SessionManifest, build_manifest
+from .manifest import SessionManifest, build_manifest, select
 from .merge import MergeResult, merge_sources
 from .sources import TraceSource, discover, read_source
 
@@ -10,4 +10,5 @@ __all__ = [
     "discover",
     "merge_sources",
     "read_source",
+    "select",
 ]

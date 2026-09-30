@@ -44,6 +44,9 @@ _VIZTRACER_FILE = re.compile(
 # use integer pids and are kept.
 _KINETO_BOOKKEEPING_PIDS = frozenset({"Spans", "Traces", ""})
 _TORCH_RANK = re.compile(r"_rank(?P<rank>\d+)(?:-of-\d+)?(?:_|$)")
+# build_trace_basename: [<save_file_prefix>_][<role>_][step<n>_]rank<r>...
+_TORCH_STEP = re.compile(r"(?:^|_)step(?P<step>\d+)(?:_|$)")
+_TORCH_ROLE = re.compile(r"^(?P<role>.+?)_(?:step\d+_)?rank\d+")
 
 
 class ArtifactError(ValueError):
@@ -67,6 +70,9 @@ class TraceSource:
     complete: bool = True
     # Key of the OS process this artifact belongs to ("<host>:<pid>"), once known.
     process: str | None = None
+    # The training step a profiler window covers; RL-Insight sources span steps.
+    global_step: int | None = None
+    role: str | None = None
 
 
 def classify(path: Path) -> str | None:
@@ -186,6 +192,8 @@ def read_torch_trace(path: Path) -> TraceSource:
         os_pid=pid,
         rank=rank,
         labels={"label": label},
+        global_step=int(step_match["step"]) if (step_match := _TORCH_STEP.search(label)) else None,
+        role=role_match["role"] if (role_match := _TORCH_ROLE.match(label)) else None,
     )
 
 
@@ -206,4 +214,6 @@ def read_viztracer_trace(path: Path) -> TraceSource:
         os_pid=pid,
         rank=rank,
         labels={"step": step, "role": role},
+        global_step=int(step) if step.isdigit() else None,
+        role=role,
     )

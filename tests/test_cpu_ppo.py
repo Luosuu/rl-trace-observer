@@ -20,6 +20,7 @@ from rl_trace_observer.merger.cli import main as merge
 TESTS_DIR = Path(__file__).resolve().parent
 WORLD_SIZE = 2
 TRAIN_BATCH_SIZE = 4
+STEPS = 2
 ROLLOUT_N = 2
 # MockLLMServer.PREFILL_SECONDS: every mock request lasts at least this long.
 MIN_GENERATE_US = 50_000
@@ -65,14 +66,14 @@ def _run_main_ppo(assets: dict[str, Path], output_dir: Path, log: Path) -> subpr
         "reward.num_workers=1",
         f"reward.custom_reward_function.path={TESTS_DIR / 'cpu_ppo' / 'reward.py'}",
         "global_profiler.tool=torch",
-        "global_profiler.steps=[1]",
+        f"global_profiler.steps={list(range(1, STEPS + 1))}",
         f"global_profiler.save_path={output_dir / 'torch'}",
         "actor_rollout_ref.actor.profiler.enable=True",
         "actor_rollout_ref.actor.profiler.all_ranks=True",
         "trainer.device=cpu",
         f"trainer.n_gpus_per_node={WORLD_SIZE}",
         "trainer.nnodes=1",
-        "trainer.total_training_steps=1",
+        f"trainer.total_training_steps={STEPS}",
         'trainer.logger=["console","rl_insight"]',
         "trainer.val_before_train=False",
         "trainer.test_freq=-1",
@@ -133,11 +134,14 @@ def test_one_ppo_step_on_cpu_produces_aligned_traces(tmp_path, load_in_perfetto)
         assert {"actor_compute_log_prob", "actor_update"} <= lanes[f"rank_{rank}"]
     # Every rollout request is one span on a batch-slot lane of its replica.
     generates = [span for span in spans if span["name"] == "mock_generate"]
-    assert len(generates) == TRAIN_BATCH_SIZE * ROLLOUT_N
+    assert len(generates) == TRAIN_BATCH_SIZE * ROLLOUT_N * STEPS
     assert len({span["args"]["request_id"] for span in generates}) == len(generates)
     assert {span["tid"].split("/")[0] for span in generates} == {f"replica_{rank}" for rank in range(WORLD_SIZE)}
     assert all(span["dur"] >= MIN_GENERATE_US for span in generates)
-    assert len(list((output_dir / "torch").glob("*.json.gz"))) == WORLD_SIZE
+    assert len(list((output_dir / "torch").glob("*.json.gz"))) == WORLD_SIZE * STEPS
+    # The trainer marks every step.
+    step_spans = sorted(span["args"]["global_step"] for span in spans if span["name"] == "global_step")
+    assert step_spans == list(range(1, STEPS + 1))
 
     merged = tmp_path / "merged.json"
     assert merge([str(output_dir), "-o", str(merged), "--strict"]) == 0
@@ -145,6 +149,17 @@ def test_one_ppo_step_on_cpu_produces_aligned_traces(tmp_path, load_in_perfetto)
     # Every tracing process registered itself; the Torch traces link to the actor processes.
     manifest = json.loads((tmp_path / "merged.manifest.json").read_text())
     assert manifest["problems"] == []
+    # All processes share one run id, and every profiled step is a session with a
+    # time window and one Torch trace per rank.
+    [run_id] = manifest["runs"]
+    assert run_id.startswith("session_") and "-job-" in run_id
+    assert {process["run_id"] for process in manifest["processes"]} == {run_id}
+    assert [process["role"] for process in manifest["processes"]].count("trainer") == 1
+    assert [session["global_step"] for session in manifest["sessions"]] == list(range(1, STEPS + 1))
+    for session in manifest["sessions"]:
+        assert session["id"] == f"{run_id}-step-{session['global_step']}"
+        assert session["start_time_ns"] < session["end_time_ns"]
+        assert len(session["artifacts"]) == WORLD_SIZE
     processes = {process["key"]: process for process in manifest["processes"]}
     names = {process["actor_name"] for process in processes.values()}
     assert {f"mock_server_{replica}" for replica in range(WORLD_SIZE)} <= names
@@ -152,6 +167,17 @@ def test_one_ppo_step_on_cpu_produces_aligned_traces(tmp_path, load_in_perfetto)
     assert set(actor_ranks) == set(range(WORLD_SIZE))
     torch_artifacts = [artifact for artifact in manifest["artifacts"] if artifact["kind"] == "torch"]
     assert {artifact["process"] for artifact in torch_artifacts} == set(actor_ranks.values())
+    assert all("torch" in processes[artifact["process"]]["versions"] for artifact in torch_artifacts)
+
+    # One step on its own: its Torch traces and the RL-Insight spans in its window.
+    step = STEPS
+    merged = tmp_path / "step.json"
+    assert merge([str(output_dir), "-o", str(merged), "--strict", "--step", str(step)]) == 0
+    selected = json.loads((tmp_path / "step.manifest.json").read_text())
+    assert {artifact["global_step"] for artifact in selected["artifacts"] if artifact["selected"]} <= {None, step}
+    step_events = [event for event in json.loads(merged.read_text())["traceEvents"] if event["ph"] == "X"]
+    assert sum(event["name"] == "mock_generate" for event in step_events) == TRAIN_BATCH_SIZE * ROLLOUT_N
+    assert [event["args"]["global_step"] for event in step_events if event["name"] == "global_step"] == [step]
 
     processor = load_in_perfetto(merged)
     empty_processes = processor.query(

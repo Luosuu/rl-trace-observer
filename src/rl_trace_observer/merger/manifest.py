@@ -15,6 +15,15 @@ Problems are reported instead of raised, so a partial run still merges:
 * ``duplicate``: a copy of an artifact already seen (same file name and content).
 * ``missing``: an artifact a process registered but that is not in the inputs.
 * ``unlinked`` / ``ambiguous``: no process record, or several, match an artifact.
+
+:func:`select` then groups artifacts by :mod:`rl_trace_observer.context`: every
+process record names its run, profiler windows name their step, and the
+trainer's ``global_step`` spans give each step's time window. It keeps one run
+and, optionally, some steps, and reports:
+
+* ``mixed_runs``: the inputs hold artifacts of several runs and none was chosen.
+* ``no_step_window``: a chosen step has no ``global_step`` span, so RL-Insight
+  spans cannot be cut to it.
 """
 
 import hashlib
@@ -24,6 +33,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from rl_trace_observer.context import STEP_SPAN_NAME, profile_session_id
 from rl_trace_observer.process_record import SCHEMA_VERSION as RECORD_SCHEMA_VERSION
 
 from .sources import PROCESS_RECORD, RL_INSIGHT, ArtifactError, TraceSource, discover, read_source
@@ -43,6 +53,9 @@ class Process:
     clock: dict[str, int] | None = None
     record: str | None = None
     artifacts: list[str] = field(default_factory=list)
+    run_id: str | None = None
+    role: str | None = None
+    versions: dict[str, str] = field(default_factory=dict)
 
     @property
     def title(self) -> str:
@@ -64,6 +77,25 @@ class Artifact:
     rank: int | None = None
     process: str | None = None
     complete: bool = True
+    run_id: str | None = None
+    global_step: int | None = None
+    profile_session_id: str | None = None
+    role: str | None = None
+    # False when the artifact is outside the chosen run or steps.
+    selected: bool = True
+
+
+@dataclass
+class ProfileSession:
+    """One profiled step of a run: its time window and its step-specific artifacts."""
+
+    id: str
+    run_id: str | None
+    global_step: int
+    # From the trainer's global_step span; None when it was not recorded.
+    start_time_ns: int | None = None
+    end_time_ns: int | None = None
+    artifacts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -79,6 +111,8 @@ class SessionManifest:
     processes: dict[str, Process] = field(default_factory=dict)
     artifacts: list[Artifact] = field(default_factory=list)
     problems: list[Problem] = field(default_factory=list)
+    runs: list[str] = field(default_factory=list)
+    sessions: list[ProfileSession] = field(default_factory=list)
     schema_version: int = SCHEMA_VERSION
 
     def to_json(self, **extra: Any) -> dict[str, Any]:
@@ -86,6 +120,8 @@ class SessionManifest:
             "schema_version": self.schema_version,
             "inputs": self.inputs,
             **extra,
+            "runs": self.runs,
+            "sessions": [asdict(session) for session in self.sessions],
             "processes": [asdict(process) for process in self.processes.values()],
             "artifacts": [asdict(artifact) for artifact in self.artifacts],
             "problems": [asdict(problem) for problem in self.problems],
@@ -119,6 +155,9 @@ def _read_record(path: Path) -> Process:
             clock=record.get("clock"),
             record=str(path),
             artifacts=[str(path.parent / entry["file"]) for entry in record.get("artifacts", [])],
+            run_id=record.get("run_id"),
+            role=record.get("role"),
+            versions=dict(record.get("versions") or {}),
         )
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise ArtifactError(f"Cannot read process record {path}: {error!r}") from error
@@ -203,6 +242,7 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
             continue
 
         artifact.os_pid, artifact.rank, artifact.complete = source.os_pid, source.rank, source.complete
+        artifact.global_step, artifact.role = source.global_step, source.role
         if not source.complete:
             manifest.problems.append(Problem("incomplete", str(path), "final line truncated"))
         source.process, problem = _link(source, manifest.processes)
@@ -222,9 +262,125 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
         sources.append(source)
 
     manifest.processes.update(fallback)
+    for artifact in manifest.artifacts:
+        if (process := manifest.processes.get(artifact.process)) is not None:
+            artifact.run_id = process.run_id
+        artifact.profile_session_id = profile_session_id(artifact.run_id, artifact.global_step)
+    manifest.runs = sorted({process.run_id for process in manifest.processes.values() if process.run_id})
     found_paths = {str(path) for _, path in found}
     for process in manifest.processes.values():
         for registered in process.artifacts:
             if str(Path(registered).resolve()) not in found_paths:
                 manifest.problems.append(Problem("missing", registered, f"registered by process {process.key}"))
     return manifest, sources
+
+
+def _run_of(source: TraceSource, processes: dict[str, Process]) -> str | None:
+    process = processes.get(source.process) if source.process is not None else None
+    return process.run_id if process is not None else None
+
+
+def _step_windows(sources: list[TraceSource], processes: dict[str, Process]) -> dict[tuple, tuple[int, int]]:
+    """Map ``(run_id, global_step)`` to the step's absolute time window in epoch ns."""
+    windows: dict[tuple, tuple[int, int]] = {}
+    for source in sources:
+        if source.kind != RL_INSIGHT:
+            continue
+        for event in source.events:
+            args = event.get("args") or {}
+            if event.get("name") != STEP_SPAN_NAME or "global_step" not in args or "ts" not in event:
+                continue
+            start = source.base_ns + round(float(event["ts"]) * 1000)
+            end = start + round(float(event.get("dur", 0)) * 1000)
+            key = (args.get("run_id") or _run_of(source, processes), int(args["global_step"]))
+            previous = windows.get(key)
+            windows[key] = (min(start, previous[0]), max(end, previous[1])) if previous else (start, end)
+    return windows
+
+
+def _overlaps(source: TraceSource, event: dict[str, Any], windows: list[tuple[int, int]]) -> bool:
+    start = source.base_ns + round(float(event["ts"]) * 1000)
+    end = start + round(float(event.get("dur", 0)) * 1000)
+    return any(start <= window_end and end >= window_start for window_start, window_end in windows)
+
+
+def select(
+    manifest: SessionManifest,
+    sources: list[TraceSource],
+    *,
+    run: str | None = None,
+    steps: Iterable[int] | None = None,
+) -> list[TraceSource]:
+    """Record the manifest's profile sessions and keep the sources of ``run`` and ``steps``.
+
+    Torch and VizTracer sources are kept when their step is chosen; RL-Insight
+    sources keep the events that overlap a chosen step's window. Without
+    ``steps`` every step is kept; without ``run`` the inputs must hold one run.
+    """
+    steps = sorted(set(steps)) if steps is not None else None
+    processes = manifest.processes
+    windows = _step_windows(sources, processes)
+
+    sessions: dict[tuple, ProfileSession] = {}
+    for (run_id, step), (start, end) in windows.items():
+        sessions[(run_id, step)] = ProfileSession(
+            id=profile_session_id(run_id, step) or f"step-{step}",
+            run_id=run_id,
+            global_step=step,
+            start_time_ns=start,
+            end_time_ns=end,
+        )
+    for artifact in manifest.artifacts:
+        if artifact.global_step is None:
+            continue
+        key = (artifact.run_id, artifact.global_step)
+        session = sessions.setdefault(
+            key,
+            ProfileSession(
+                id=artifact.profile_session_id or f"step-{artifact.global_step}",
+                run_id=artifact.run_id,
+                global_step=artifact.global_step,
+            ),
+        )
+        session.artifacts.append(artifact.path)
+    manifest.sessions = sorted(sessions.values(), key=lambda session: (session.run_id or "", session.global_step))
+
+    inputs = ", ".join(manifest.inputs)
+    if run is None and len(manifest.runs) > 1:
+        manifest.problems.append(Problem("mixed_runs", inputs, f"artifacts of runs {', '.join(manifest.runs)}"))
+
+    artifacts = {artifact.path: artifact for artifact in manifest.artifacts}
+    for artifact in manifest.artifacts:
+        # Unreadable artifacts are never merged; readable ones are re-marked below.
+        artifact.selected = False
+    missing_windows: set[int] = set()
+    kept = []
+    for source in sources:
+        run_id = _run_of(source, processes)
+        keep = run is None or run_id == run
+        if keep and steps is not None:
+            if source.kind == RL_INSIGHT:
+                # Windows of this source's run; a source or span of unknown run matches any.
+                own = [
+                    (step, window)
+                    for (window_run, step), window in windows.items()
+                    if step in steps and (run_id is None or window_run is None or window_run == run_id)
+                ]
+                missing_windows.update(set(steps) - {step for step, _ in own})
+                chosen = [window for _, window in own]
+                source.events = [
+                    event
+                    for event in source.events
+                    if event.get("ph") == "M" or "ts" not in event or _overlaps(source, event, chosen)
+                ]
+                keep = bool(chosen)
+            else:
+                keep = source.global_step in steps
+        artifacts[str(source.path)].selected = keep
+        if keep:
+            kept.append(source)
+    for step in sorted(missing_windows):
+        manifest.problems.append(
+            Problem("no_step_window", inputs, f"no {STEP_SPAN_NAME} span for step {step}; RL-Insight spans left out")
+        )
+    return kept
