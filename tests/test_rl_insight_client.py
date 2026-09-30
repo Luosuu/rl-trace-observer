@@ -1,5 +1,7 @@
 import json
+import os
 import sys
+import types
 from unittest.mock import Mock
 
 from rl_trace_observer.integrations.rl_insight.client import (
@@ -72,15 +74,47 @@ def test_trace_event_is_also_forwarded(tmp_path):
     delegate.apply_event.assert_called_once_with(event)
 
 
-def test_registration_uses_rl_trace_backend_name():
+def test_registration_selects_backend_through_env(monkeypatch):
+    monkeypatch.delenv("RL_INSIGHT_SERVER_BACKEND", raising=False)
     register = Mock()
 
-    assert register_rl_insight_client(register)
+    register_rl_insight_client(register)
 
-    register.assert_called_once()
-    backend_name, factory = register.call_args.args
-    assert backend_name == BACKEND_NAME
-    assert callable(factory)
+    register.assert_called_once_with(BACKEND_NAME, create_rl_trace_observer_client)
+    assert os.environ["RL_INSIGHT_SERVER_BACKEND"] == BACKEND_NAME
+
+
+def test_registration_keeps_explicit_backend_choice(monkeypatch):
+    monkeypatch.setenv("RL_INSIGHT_SERVER_BACKEND", "ray")
+
+    register_rl_insight_client(Mock())
+
+    assert os.environ["RL_INSIGHT_SERVER_BACKEND"] == "ray"
+
+
+def test_forwarding_uses_ray_monitor_client(tmp_path, monkeypatch):
+    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("RL_TRACE_FORWARD_TO_RL_INSIGHT", "1")
+    ray_client = Mock()
+    ray_module = types.ModuleType("rl_insight.client.ray_monitor_client")
+    ray_module.create_ray_monitor_client = Mock(return_value=ray_client)
+    monkeypatch.setitem(sys.modules, "rl_insight.client.ray_monitor_client", ray_module)
+
+    client = create_rl_trace_observer_client("config")
+    client.apply_event(_trace_event())
+
+    ray_module.create_ray_monitor_client.assert_called_once_with("config")
+    ray_client.apply_event.assert_called_once()
+
+
+def test_delegate_failure_does_not_propagate(tmp_path):
+    delegate = Mock()
+    delegate.apply_event.side_effect = RuntimeError("hub unavailable")
+    client = ChromeTraceJsonlClient(tmp_path, delegate=delegate)
+
+    client.apply_event(_trace_event())
+
+    assert client.output_path.exists()
 
 
 def test_factory_uses_configured_output_directory(tmp_path, monkeypatch):

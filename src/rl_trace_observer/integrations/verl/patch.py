@@ -77,9 +77,9 @@ def install(profiler_class: type | None = None) -> bool:
             _stop_observers(self)
             raise
 
-    def patched_stop(self):
+    def patched_stop(self, *args, **kwargs):
         try:
-            return original_stop(self)
+            return original_stop(self, *args, **kwargs)
         finally:
             _stop_observers(self)
 

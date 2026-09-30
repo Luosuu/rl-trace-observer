@@ -29,8 +29,8 @@ class FakeDistProfiler:
         self.calls.append(("backend_start", kwargs))
         return "start-result"
 
-    def stop(self):
-        self.calls.append(("backend_stop", None))
+    def stop(self, run_command=True):
+        self.calls.append(("backend_stop", run_command))
         return "stop-result"
 
 
@@ -43,6 +43,17 @@ def clean_patch_and_registry():
     if is_installed():
         uninstall()
     ObserverRegistry._factories.clear()
+
+
+def test_stop_forwards_verl_arguments():
+    ObserverRegistry.register("test", Mock)
+    install(FakeDistProfiler)
+    profiler = FakeDistProfiler()
+
+    profiler.start()
+    profiler.stop(run_command=False)
+
+    assert profiler.calls[-1] == ("backend_stop", False)
 
 
 def test_observer_wraps_backend_and_receives_verl_context():
@@ -139,7 +150,6 @@ def test_install_is_idempotent_and_uninstall_restores_methods():
 
 
 def test_viztracer_observer_writes_actor_trace(tmp_path, monkeypatch):
-    pytest.importorskip("viztracer")
     from rl_trace_observer.integrations.verl.viztracer import VizTracerObserver
 
     monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path))

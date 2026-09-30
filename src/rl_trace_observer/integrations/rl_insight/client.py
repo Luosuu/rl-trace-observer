@@ -11,7 +11,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 BACKEND_NAME = "rl_trace_observer"
+RL_INSIGHT_BACKEND_ENV = "RL_INSIGHT_SERVER_BACKEND"
 _TRACE_EVENT_KIND = "trace"
+_FORWARD_ENV = "RL_TRACE_FORWARD_TO_RL_INSIGHT"
 
 
 def _enabled(name: str) -> bool:
@@ -51,7 +53,10 @@ class ChromeTraceJsonlClient:
             logger.exception("Failed to persist an RL-Insight trace event")
 
         if self._delegate is not None:
-            self._delegate.apply_event(event)
+            try:
+                self._delegate.apply_event(event)
+            except Exception:
+                logger.exception("Failed to forward an RL-Insight event to the original backend")
 
     @staticmethod
     def to_chrome_event(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -76,9 +81,13 @@ class ChromeTraceJsonlClient:
 
 
 def create_rl_trace_observer_client(config: object) -> ChromeTraceJsonlClient:
-    """RL-Insight monitor client factory registered by the external module."""
+    """RL-Insight monitor client factory registered as ``rl_trace_observer``.
+
+    With ``RL_TRACE_FORWARD_TO_RL_INSIGHT`` set, every event is also forwarded
+    to RL-Insight's built-in Ray monitor client.
+    """
     delegate = None
-    if _enabled("RL_TRACE_FORWARD_TO_RL_INSIGHT"):
+    if _enabled(_FORWARD_ENV):
         from rl_insight.client.ray_monitor_client import create_ray_monitor_client
 
         delegate = create_ray_monitor_client(config)
@@ -87,19 +96,35 @@ def create_rl_trace_observer_client(config: object) -> ChromeTraceJsonlClient:
     return ChromeTraceJsonlClient(output_dir=output_dir, delegate=delegate)
 
 
-def register_rl_insight_client(register: Callable[[str, Callable], None] | None = None) -> bool:
-    """Register the custom backend without importing RL-Insight at package import.
+def _supports_backend_env() -> bool:
+    from rl_insight.utils.constants import MonitorEnv
 
-    Returns ``False`` when RL-Insight is unavailable, allowing the optional
-    actor VizTracer integration to remain usable on its own.
+    return getattr(MonitorEnv, "SERVER_BACKEND", None) == RL_INSIGHT_BACKEND_ENV
+
+
+def register_rl_insight_client(register: Callable[[str, Callable], None] | None = None) -> None:
+    """Register the backend and make it RL-Insight's default in this process.
+
+    VERL workers lazily call ``rl_insight.init()`` without the trainer config,
+    so the backend must also be selected through ``RL_INSIGHT_SERVER_BACKEND``.
+    It defaults to this backend unless the user already set it.
+
+    Args:
+        register: RL-Insight's ``register_monitor_client``; injected by tests.
+
+    Raises:
+        RuntimeError: The installed RL-Insight does not support
+            ``RL_INSIGHT_SERVER_BACKEND``.
     """
     if register is None:
-        try:
-            from rl_insight.client.base import register_monitor_client
-        except ImportError:
-            logger.warning("RL-Insight is unavailable; semantic state collection is disabled")
-            return False
+        from rl_insight.client.base import register_monitor_client
+
+        if not _supports_backend_env():
+            raise RuntimeError(
+                f"The installed RL-Insight does not support {RL_INSIGHT_BACKEND_ENV}; install the "
+                "pinned fork with `uv sync`"
+            )
         register = register_monitor_client
 
     register(BACKEND_NAME, create_rl_trace_observer_client)
-    return True
+    os.environ.setdefault(RL_INSIGHT_BACKEND_ENV, BACKEND_NAME)
