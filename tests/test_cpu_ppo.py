@@ -8,7 +8,6 @@ own plugin, exactly as in a real run.
 
 import json
 import os
-import socket
 import subprocess
 import sys
 from collections import defaultdict
@@ -17,7 +16,6 @@ from pathlib import Path
 from cpu_ppo.assets import build_assets
 
 from rl_trace_observer.merger.cli import main as merge
-from rl_trace_observer.output import safe_component
 
 TESTS_DIR = Path(__file__).resolve().parent
 WORLD_SIZE = 2
@@ -101,6 +99,15 @@ def _run_main_ppo(assets: dict[str, Path], output_dir: Path, log: Path) -> subpr
         )
 
 
+def _failure_report(log: Path) -> str:
+    # Ray interleaves worker output, and a C++ stack trace easily pushes the
+    # actual error out of the tail; list the error lines first.
+    lines = log.read_text(errors="replace").splitlines()
+    markers = ("Error", "Exception", "enforce fail", "Traceback", "Killed", "OOM")
+    errors = list(dict.fromkeys(line for line in lines if any(marker in line for marker in markers)))
+    return "\n".join(["--- error lines ---", *errors[:80], "--- log tail ---", *lines[-60:]])
+
+
 def _rl_insight_spans(output_dir: Path) -> list[dict]:
     return [
         event
@@ -115,7 +122,7 @@ def test_one_ppo_step_on_cpu_produces_aligned_traces(tmp_path, load_in_perfetto)
     log = tmp_path / "main_ppo.log"
 
     result = _run_main_ppo(assets, output_dir, log)
-    assert result.returncode == 0, log.read_text()[-5000:]
+    assert result.returncode == 0, _failure_report(log)
 
     spans = _rl_insight_spans(output_dir)
     lanes = defaultdict(set)
@@ -135,6 +142,17 @@ def test_one_ppo_step_on_cpu_produces_aligned_traces(tmp_path, load_in_perfetto)
     merged = tmp_path / "merged.json"
     assert merge([str(output_dir), "-o", str(merged), "--strict"]) == 0
 
+    # Every tracing process registered itself; the Torch traces link to the actor processes.
+    manifest = json.loads((tmp_path / "merged.manifest.json").read_text())
+    assert manifest["problems"] == []
+    processes = {process["key"]: process for process in manifest["processes"]}
+    names = {process["actor_name"] for process in processes.values()}
+    assert {f"mock_server_{replica}" for replica in range(WORLD_SIZE)} <= names
+    actor_ranks = {process["rank"]: key for key, process in processes.items() if process["rank"] is not None}
+    assert set(actor_ranks) == set(range(WORLD_SIZE))
+    torch_artifacts = [artifact for artifact in manifest["artifacts"] if artifact["kind"] == "torch"]
+    assert {artifact["process"] for artifact in torch_artifacts} == set(actor_ranks.values())
+
     processor = load_in_perfetto(merged)
     empty_processes = processor.query(
         """
@@ -148,18 +166,21 @@ def test_one_ppo_step_on_cpu_produces_aligned_traces(tmp_path, load_in_perfetto)
     assert empty_processes.empty, empty_processes.name.tolist()
     slices = processor.query(
         """
-        select s.ts, s.dur, p.name as process
+        select s.ts, s.dur, t.name as thread, t.upid, p.name as process
         from slice s
         join thread_track tt on s.track_id = tt.id
-        join thread using (utid)
+        join thread t using (utid)
         join process p using (upid)
         where s.name = 'actor_update' and s.depth = 0
         """
     ).as_pandas_dataframe()
     assert len(slices) == 2 * WORLD_SIZE
     for rank in range(WORLD_SIZE):
-        pid = next(path.name.split("pid")[1].split("_")[0] for path in (output_dir / "torch").glob(f"*rank{rank}-*"))
-        rl_insight = slices[slices.process == f"RL-Insight {safe_component(socket.gethostname())} pid {pid}"].iloc[0]
-        torch_span = slices[slices.process.str.startswith("Torch") & slices.process.str.contains(f"pid {pid}")].iloc[0]
+        process = processes[actor_ranks[rank]]
+        own = slices[slices.process.str.startswith(f"{process['hostname']} pid {process['os_pid']} ")]
+        rl_insight = own[own.thread.str.startswith("RL-Insight")].iloc[0]
+        torch_span = own[own.thread.str.startswith("Torch")].iloc[0]
+        # Both profilers' view of the step sit in the same Perfetto process and line up.
+        assert rl_insight.upid == torch_span.upid
         assert abs(torch_span.ts - rl_insight.ts) < TOLERANCE_NS
         assert abs((torch_span.ts + torch_span.dur) - (rl_insight.ts + rl_insight.dur)) < TOLERANCE_NS

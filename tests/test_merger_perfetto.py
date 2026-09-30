@@ -67,17 +67,18 @@ def test_real_sources_are_aligned_in_perfetto(tmp_path, monkeypatch, load_in_per
 
     slices = processor.query(
         """
-        select s.name, s.ts, s.dur, p.name as process
+        select s.name, s.ts, s.dur, t.name as thread, t.upid
         from slice s
         join thread_track tt on s.track_id = tt.id
-        join thread using (utid)
-        join process p using (upid)
+        join thread t using (utid)
         where s.name = 'actor_update' or s.name like '_matmul_workload%'
         """
     ).as_pandas_dataframe()
     by_source = {
-        prefix: slices[slices.process.str.startswith(prefix)].iloc[0] for prefix in ("RL-Insight", "Torch", "VizTracer")
+        prefix: slices[slices.thread.str.startswith(prefix)].iloc[0] for prefix in ("RL-Insight", "Torch", "VizTracer")
     }
+    # The process record ties all three profilers to the one OS process that ran them.
+    assert len({span.upid for span in by_source.values()}) == 1
 
     rl_insight_span = by_source["RL-Insight"]
     for source in ("Torch", "VizTracer"):

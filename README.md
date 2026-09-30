@@ -113,18 +113,43 @@ Inputs are files or directories, searched recursively for:
 | `rl-insight-<host>-pid-<pid>.chrome.jsonl` | the RL-Insight backend above | epoch µs `ts` |
 | `<role>_..._rank<r>_pid<pid>_<timestamp>.json[.gz]` | VERL `global_profiler.tool=torch` | `baseTimeNanoseconds` |
 | `step-<s>-role-<r>-rank-<n>-pid-<pid>.viztracer.json` | the optional actor VizTracer | `viztracer_metadata.baseTimeNanoseconds` |
+| `rl-trace-process-<host>-pid-<pid>.json` | each tracing process (process record) | clock snapshot only |
 
-Every source is placed on one timeline starting at the earliest event. Each
-source process gets a synthetic pid with a descriptive `process_name` (and the
-original identity in `process_labels`), threads get trace-wide unique tids, and
-flow ids are renumbered per source, so identical OS pids, tids or Kineto flow
-ids on different nodes never collide. Events with negative durations are
-dropped with a warning; `--strict` turns warnings into a failure.
+Every process that writes an artifact also writes a process record with its
+hostname, pid, Ray job/node/actor identity, `torch.distributed` rank, a
+wall/monotonic clock snapshot and the files it registered. The merger uses the
+records to link Torch and VizTracer traces, whose filenames carry only a pid, to
+their host: by pid, and by rank when several hosts reused a pid.
+
+Every source is placed on one timeline starting at the earliest event. All
+sources of one OS process share one Perfetto process named
+`<hostname> pid <pid> · <Ray actor name>`, with thread names prefixed by their
+source (`RL-Insight · rank_0`, `Torch · thread …`, `VizTracer · …`). Other pids
+in a source, such as Kineto GPU devices, get their own process. Threads get
+trace-wide unique tids and flow ids are renumbered per source, so identical OS
+pids, tids or Kineto flow ids on different nodes never collide.
+
+Next to the trace, `rl-trace-merge` writes the session manifest
+(`<output>.manifest.json`, or `--manifest PATH`): every process, every artifact
+with its size, sha256, process and completeness, and the problems found:
+
+| Problem | Meaning |
+|---|---|
+| `incomplete` | an artifact was cut short (truncated JSONL line), cannot be read or is malformed; or a process record has an unsupported `schema_version` |
+| `duplicate` | an artifact is a copy of another input (same file name and content), and is merged once |
+| `missing` | a process registered an artifact that is not in the inputs |
+| `unlinked` | no process record matches a Torch or VizTracer trace's pid (and, when both are known, rank) |
+| `ambiguous` | several process records match and the rank cannot tell them apart |
+
+Problems and dropped events (negative durations) are warnings; `--strict` turns
+them into a failure. The manifest is written even when no trace is (nothing
+readable, no timed events, or a `--strict` failure), and a trace left at the
+output path by an earlier run is then removed. The trace and the manifest are
+each replaced atomically, and neither may be one of the inputs. A session is the set of artifacts under the inputs, so give
+each run its own `RL_TRACE_OUTPUT_DIR`.
 
 Timestamps are each host's wall clock, so cross-node ordering is only as good
-as the nodes' clock synchronization (NTP/PTP). Torch traces do not record their
-host, so they appear as separate processes from the same process's RL-Insight
-lanes until the session manifest provides that link.
+as the nodes' clock synchronization (NTP/PTP).
 
 ## Preserve the normal RL-Insight backend
 

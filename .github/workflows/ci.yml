@@ -31,4 +31,14 @@ jobs:
           unzip -q /tmp/perfetto.zip -d /tmp/perfetto
           chmod +x /tmp/perfetto/linux-amd64/trace_processor_shell
           echo "PERFETTO_TRACE_PROCESSOR=/tmp/perfetto/linux-amd64/trace_processor_shell" >> "$GITHUB_ENV"
-      - run: uv run --no-sync pytest -q -rs
+      - run: uv run --no-sync pytest -q -rs --basetemp="$RUNNER_TEMP/pytest"
+      # Keep the full main_ppo and Ray worker logs of a failed run.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            ${{ runner.temp }}/pytest/**/*.log
+            /tmp/ray/session_*/logs/
+          if-no-files-found: ignore
+          retention-days: 7

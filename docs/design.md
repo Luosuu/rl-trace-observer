@@ -193,6 +193,13 @@ manifest 还需要记录 profiler 版本、文件大小、checksum、写入完�
 
 节点本地目录不能假设对 driver 可见。collector 必须支持共享文件系统路径或显式上传/回传。
 
+**当前实现（schema_version 1）**：
+
+- 每个写 artifact 的进程在 `RL_TRACE_OUTPUT_DIR` 写 `rl-trace-process-<host>-pid-<pid>.json`（原子替换），记录 hostname、pid、Ray job/node/worker/actor id 与 actor 名、`torch.distributed` rank/world_size、首次写入时的 wall/monotonic clock snapshot，以及它登记的 artifact。RL-Insight client 创建时与 VizTracer 启动时写入；此时 VERL worker 的 process group 已初始化。RL-Insight JSONL 在 client 创建时即创建，空文件表示该进程没有 span。
+- `rl-trace-merge` 在合并前构建 session manifest，并输出 `<output>.manifest.json`：进程列表、每个 artifact 的 size/sha256/所属进程/rank/完整性，以及 `incomplete`、`duplicate`、`missing`、`unlinked`、`ambiguous` 问题（`duplicate` 指文件名与内容都相同的副本）。`--strict` 下任一问题都会失败；合并失败时仍写出 manifest，并删除输出路径上旧的 trace。
+- Torch/VizTracer 文件名只含 pid，按 pid 关联进程记录；多个 host 复用同一 pid 时用 rank（Kineto `distributedInfo` 或文件名）区分。
+- session 暂定为输入目录下的全部 artifact（每次运行使用独立的 `RL_TRACE_OUTPUT_DIR`）；`run_id` / `profile_session_id` / `global_step` 与 profiler 版本尚未记录。显式 artifact 回传尚未实现，目前依赖共享文件系统。
+
 ### 6.6 全局 identity
 
 Chrome trace 中不得直接复用跨节点 OS PID。merger 建立稳定映射：
@@ -303,11 +310,13 @@ manifest
 
 ### P1：TraceContext 与 artifact manifest
 
-- [ ] 定义 versioned TraceContext schema；
-- [ ] 定义 versioned manifest schema；
-- [ ] 为 artifact 增加 hostname、role、rank、session、checksum；
-- [ ] 支持共享目录和显式 artifact 回传；
-- [ ] 检测缺失、重复和未完成 artifact。
+- [ ] 定义 versioned TraceContext schema（跨进程传播，P6 request-level 前置）；
+- [x] 定义 versioned manifest schema（进程记录与 session manifest，schema_version 1）；
+- [x] 为 artifact 增加 hostname、rank、Ray actor、checksum；session 暂为输入目录；
+- [ ] 为 artifact 增加 role、run_id/profile_session_id、profiler 版本；
+- [x] 支持共享目录；
+- [ ] 支持显式 artifact 回传（节点本地目录）；
+- [x] 检测缺失、重复和未完成 artifact，并关联 Torch/VizTracer trace 到所属进程。
 
 完成标准：driver 可以列举一次 session 的全部预期和实际 artifact。
 

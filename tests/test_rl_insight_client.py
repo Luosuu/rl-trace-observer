@@ -59,7 +59,7 @@ def test_metrics_are_forwarded_but_not_persisted(tmp_path):
 
     client.apply_event(metric)
 
-    assert not client.output_path.exists()
+    assert client.output_path.read_text() == ""
     delegate.apply_event.assert_called_once_with(metric)
 
 
