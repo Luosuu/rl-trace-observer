@@ -34,7 +34,7 @@
 > Please check all the following items before requesting a review, otherwise the reviewer might deprioritize this PR for review.
 
 - [ ] Run lint and format checks: `uv run ruff check . && uv run ruff format --check .`
-- [ ] Run the tests with the affected extras synced, e.g. `uv sync --all-extras && uv run pytest`.
+- [ ] Run the tests: `uv sync --extra tokenspeed && uv run pytest`.
 - [ ] If dependencies changed, update the lock with `uv lock` and keep the extras in [`ray_runtime_env.yaml`](https://github.com/Luosuu/rl-trace-observer/blob/main/ray_runtime_env.yaml) consistent with `pyproject.toml`.
 - [ ] Add / Update the documentation ([README](https://github.com/Luosuu/rl-trace-observer/blob/main/README.md) and [design doc](https://github.com/Luosuu/rl-trace-observer/blob/main/docs/design.md)).
 - [ ] Add unit or end-to-end test(s) to [the CI workflow](https://github.com/Luosuu/rl-trace-observer/tree/main/.github/workflows) to cover all the code. If not feasible, explain why: ...
