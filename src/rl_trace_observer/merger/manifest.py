@@ -33,7 +33,7 @@ and, optionally, some steps, and reports:
 import hashlib
 import json
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -120,6 +120,8 @@ class SessionManifest:
     runs: list[str] = field(default_factory=list)
     sessions: list[ProfileSession] = field(default_factory=list)
     schema_version: int = SCHEMA_VERSION
+    # Problems added by the last select(), replaced by the next one.
+    _selection_problems: list[Problem] = field(default_factory=list, repr=False)
 
     def to_json(self, **extra: Any) -> dict[str, Any]:
         return {
@@ -343,9 +345,15 @@ def _run_of(source: TraceSource, processes: dict[str, Process]) -> str | None:
 
 
 def _step_windows(
-    sources: list[TraceSource], processes: dict[str, Process], problems: list[Problem]
+    sources: list[TraceSource],
+    processes: dict[str, Process],
+    problems: list[Problem],
+    marker_runs: dict[str, set[str]],
 ) -> dict[tuple, tuple[int, int]]:
-    """Map ``(run_id, global_step)`` to the step's absolute time window in epoch ns."""
+    """Map ``(run_id, global_step)`` to the step's absolute time window in epoch ns.
+
+    ``marker_runs`` receives, per source path, the run ids its markers name.
+    """
     windows: dict[tuple, tuple[int, int]] = {}
     for source in sources:
         if source.kind != RL_INSIGHT:
@@ -362,6 +370,8 @@ def _step_windows(
             except (KeyError, TypeError, ValueError, AttributeError):
                 malformed += 1
                 continue
+            if key[0] is not None:
+                marker_runs.setdefault(str(source.path), set()).add(key[0])
             previous = windows.get(key)
             windows[key] = (min(start, previous[0]), max(end, previous[1])) if previous else (start, end)
         if malformed:
@@ -390,7 +400,11 @@ def select(
     """
     steps = sorted(set(steps)) if steps is not None else None
     processes = manifest.processes
-    windows = _step_windows(sources, processes, manifest.problems)
+    for problem in manifest._selection_problems:
+        manifest.problems.remove(problem)
+    problems: list[Problem] = []
+    marker_runs: dict[str, set[str]] = {}
+    windows = _step_windows(sources, processes, problems, marker_runs)
 
     sessions: dict[tuple, ProfileSession] = {}
     for (run_id, step), (start, end) in windows.items():
@@ -418,7 +432,7 @@ def select(
 
     inputs = ", ".join(manifest.inputs)
     if run is None and len(manifest.runs) > 1:
-        manifest.problems.append(Problem("mixed_runs", inputs, f"artifacts of runs {', '.join(manifest.runs)}"))
+        problems.append(Problem("mixed_runs", inputs, f"artifacts of runs {', '.join(manifest.runs)}"))
 
     artifacts = {artifact.path: artifact for artifact in manifest.artifacts}
     for artifact in manifest.artifacts:
@@ -427,21 +441,34 @@ def select(
     kept = []
     for source in sources:
         run_id = _run_of(source, processes)
+        if run_id is None and len(named := marker_runs.get(str(source.path), set())) == 1:
+            # No process record, but the source's own step markers name its run.
+            [run_id] = named
         keep = run is None or run_id == run
         if keep and steps is not None:
             if source.kind == RL_INSIGHT:
                 # Windows of this source's run; a source or span of unknown run matches any.
-                own = [
-                    (step, window)
+                chosen = [
+                    window
                     for (window_run, step), window in windows.items()
                     if step in steps and (run_id is None or window_run is None or window_run == run_id)
                 ]
-                chosen = [window for _, window in own]
-                source.events = [
-                    event
-                    for event in source.events
-                    if event.get("ph") == "M" or "ts" not in event or _overlaps(source, event, chosen)
-                ]
+                events, malformed = [], 0
+                for event in source.events:
+                    if event.get("ph") == "M" or "ts" not in event:
+                        events.append(event)
+                        continue
+                    try:
+                        if _overlaps(source, event, chosen):
+                            events.append(event)
+                    except (TypeError, ValueError):
+                        malformed += 1
+                if malformed:
+                    problems.append(
+                        Problem("incomplete", str(source.path), f"{malformed} events with a malformed time")
+                    )
+                # A copy: the caller's sources stay whole for another selection.
+                source = replace(source, events=events)
                 keep = bool(chosen)
             else:
                 keep = source.global_step in steps
@@ -455,7 +482,9 @@ def select(
         if not any(key[1] == step and (run is None or key[0] in (run, None)) for key in windows)
     ]
     for step in missing_windows:
-        manifest.problems.append(
+        problems.append(
             Problem("no_step_window", inputs, f"no {STEP_SPAN_NAME} span for step {step}; RL-Insight spans left out")
         )
+    manifest.problems.extend(problems)
+    manifest._selection_problems = problems
     return kept

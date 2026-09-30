@@ -650,3 +650,51 @@ def test_torch_step_is_the_one_next_to_the_rank(tmp_path):
     source = read_source(TORCH, renamed)
 
     assert (source.global_step, source.role) == (1, "step99_actor_train")
+
+
+def test_select_can_be_called_again_for_another_step(tmp_path):
+    _two_step_run(tmp_path)
+    manifest, sources = build_manifest([tmp_path])
+
+    def step_markers(kept):
+        return [
+            event["args"]["global_step"] for source in kept for event in source.events if event["name"] == "global_step"
+        ]
+
+    assert step_markers(select(manifest, sources, steps=[1])) == [1]
+    assert step_markers(select(manifest, sources, steps=[2])) == [2]
+    assert manifest.problems == []
+    # Selection problems are replaced, not accumulated.
+    select(manifest, sources, steps=[9])
+    select(manifest, sources, steps=[9])
+    assert [problem.kind for problem in manifest.problems] == ["no_step_window"]
+
+
+def test_a_malformed_event_time_is_incomplete_when_selecting_steps(tmp_path):
+    _two_step_run(tmp_path)
+    path = tmp_path / "rl-insight-node-1-pid-20.chrome.jsonl"
+    event = {"name": "bad", "ph": "X", "ts": BASE_NS // 1000, "dur": "long", "pid": "20", "tid": "rank_0"}
+    path.write_text(path.read_text() + json.dumps(event) + "\n")
+
+    manifest, sources = build_manifest([tmp_path])
+    kept = select(manifest, sources, steps=[1])
+
+    assert [(problem.kind, problem.detail) for problem in manifest.problems] == [
+        ("incomplete", "1 events with a malformed time")
+    ]
+    assert "bad" not in {event["name"] for source in kept for event in source.events}
+
+
+def test_step_markers_name_the_run_of_a_source_without_a_record(tmp_path):
+    _jsonl(
+        tmp_path,
+        "node-1",
+        10,
+        lines=[_span_line("global_step", BASE_NS / 1000, 10, 10, "trainer", **MARKER, global_step=1, run_id="run-a")],
+    )
+
+    manifest, sources = build_manifest([tmp_path])
+    kept = select(manifest, sources, run="run-a")
+
+    assert [source.os_pid for source in kept] == [10]
+    assert [session.id for session in manifest.sessions] == ["run-a-step-1"]
