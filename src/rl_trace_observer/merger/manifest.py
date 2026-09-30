@@ -146,35 +146,56 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+# Optional process-record fields and the JSON types they must have.
+_RECORD_FIELDS: dict[str, type | tuple[type, ...]] = {
+    "hostname": str,
+    "run_id": str,
+    "role": str,
+    "ray": dict,
+    "torch_distributed": dict,
+    "clock": dict,
+    "versions": dict,
+    "artifacts": list,
+    "updated_wall_time_ns": int,
+}
+
+
 def _read_record(path: Path) -> Process:
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(record, dict):
+            raise TypeError("a process record must be a JSON object")
         if record.get("schema_version") != RECORD_SCHEMA_VERSION:
             raise ValueError(f"unsupported schema_version {record.get('schema_version')!r}")
+        # Validate every field up front, so later steps can trust the record.
+        for name, expected in _RECORD_FIELDS.items():
+            value = record.get(name)
+            if value is not None and (not isinstance(value, expected) or isinstance(value, bool)):
+                raise TypeError(f"{name} has the wrong type: {value!r}")
+        entries = record.get("artifacts") or []
+        if not all(isinstance(entry, dict) and isinstance(entry.get("file"), str) for entry in entries):
+            raise TypeError("every artifact entry needs a file name")
         host, os_pid = str(record["host"]), int(record["os_pid"])
-        distributed = record.get("torch_distributed") or {}
-        ray = record.get("ray")
-        run_id, role = record.get("run_id"), record.get("role")
-        for name, value in (("run_id", run_id), ("role", role)):
-            if value is not None and not isinstance(value, str):
-                raise TypeError(f"{name} must be a string, got {value!r}")
+        distributed, ray = record.get("torch_distributed") or {}, record.get("ray") or {}
+        run_id = record.get("run_id")
+        paths = [str((path.parent / entry["file"]).resolve()) for entry in entries]
         return Process(
             key=f"{host}:{os_pid}" if run_id is None else f"{host}:{os_pid}@{run_id}",
             host=host,
-            hostname=record.get("hostname", host),
+            hostname=record.get("hostname") or host,
             os_pid=os_pid,
             rank=distributed.get("rank"),
-            actor_name=(ray or {}).get("actor_name"),
-            ray=ray,
+            actor_name=ray.get("actor_name"),
+            ray=record.get("ray"),
             clock=record.get("clock"),
             record=str(path),
-            artifacts=[str((path.parent / entry["file"]).resolve()) for entry in record.get("artifacts", [])],
+            artifacts=paths,
             run_id=run_id,
-            role=role,
+            role=record.get("role"),
             updated_wall_time_ns=record.get("updated_wall_time_ns"),
             artifact_steps={
-                str((path.parent / entry["file"]).resolve()): int(entry["global_step"])
-                for entry in record.get("artifacts", [])
+                artifact: int(entry["global_step"])
+                for artifact, entry in zip(paths, entries, strict=True)
                 if entry.get("global_step") is not None
             },
             versions=dict(record.get("versions") or {}),

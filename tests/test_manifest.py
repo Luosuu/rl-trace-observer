@@ -291,6 +291,9 @@ def test_register_artifact_writes_this_process_record(tmp_path):
         '{"schema_version": 2, "host": "node-1", "os_pid": 1234}',
         '{"schema_version": 1, "host": "node-1", "os_pid": 1234, "run_id": ["a"]}',
         '{"schema_version": 1, "host": "node-1", "os_pid": 1234, "role": 7}',
+        '{"schema_version": 1, "host": "node-1", "os_pid": 1234, "clock": [1]}',
+        '{"schema_version": 1, "host": "node-1", "os_pid": 1234, "updated_wall_time_ns": "late"}',
+        "[1]",
     ],
 )
 def test_corrupt_record_is_incomplete(tmp_path, content):
