@@ -144,7 +144,8 @@ with its size, sha256, process and completeness, and the problems found:
 Problems and dropped events (negative durations) are warnings; `--strict` turns
 them into a failure. The manifest is written even when no trace is (nothing
 readable, no timed events, or a `--strict` failure), and a trace left at the
-output path by an earlier run is then removed. A session is the set of artifacts under the inputs, so give
+output path by an earlier run is then removed. The trace and the manifest are
+each replaced atomically, and neither may be one of the inputs. A session is the set of artifacts under the inputs, so give
 each run its own `RL_TRACE_OUTPUT_DIR`.
 
 Timestamps are each host's wall clock, so cross-node ordering is only as good

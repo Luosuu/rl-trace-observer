@@ -137,8 +137,11 @@ def _link(source: TraceSource, processes: dict[str, Process]) -> tuple[str | Non
         if process.os_pid == source.os_pid
         and (source.rank is None or process.rank is None or process.rank == source.rank)
     ]
-    if len(candidates) > 1 and source.rank is not None:
-        candidates = [process for process in candidates if process.rank == source.rank]
+    # Prefer the exact rank; records written before torch.distributed was
+    # initialized have none, and several of those stay ambiguous.
+    exact = [process for process in candidates if source.rank is not None and process.rank == source.rank]
+    if len(candidates) > 1 and exact:
+        candidates = exact
     if len(candidates) == 1:
         return candidates[0].key, None
     if not candidates:

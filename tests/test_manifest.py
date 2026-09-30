@@ -319,3 +319,44 @@ def test_manifest_names_no_output_when_the_trace_cannot_be_written(tmp_path):
 
     assert main([str(tmp_path), "-o", str(tmp_path / "blocked" / "merged.json"), "--manifest", str(manifest)]) == 1
     assert json.loads(manifest.read_text())["output"] is None
+
+
+def test_records_without_rank_are_ambiguous_for_a_ranked_trace(tmp_path):
+    # Records written before torch.distributed was initialized have no rank.
+    _record(tmp_path, "node-1", 1234)
+    _record(tmp_path, "node-2", 1234)
+    _torch(tmp_path, 1234, rank=1)
+
+    manifest, _ = build_manifest([tmp_path])
+
+    assert [problem.kind for problem in manifest.problems] == ["ambiguous"]
+
+
+def test_cli_refuses_to_overwrite_or_remove_an_input(tmp_path):
+    torch = _torch(tmp_path, 1234, rank=0)
+    content = torch.read_bytes()
+
+    # --strict fails (unlinked trace), which would otherwise remove the "earlier" output.
+    with pytest.raises(SystemExit):
+        main([str(tmp_path), "-o", str(torch), "--strict"])
+    with pytest.raises(SystemExit):
+        main([str(tmp_path), "-o", str(tmp_path / "merged.json"), "--manifest", str(torch)])
+    assert torch.read_bytes() == content
+
+
+def test_cli_refuses_a_manifest_at_the_output_path(tmp_path):
+    _jsonl(tmp_path, "node-1", 1234)
+    output = tmp_path / "out" / "merged.json"
+
+    with pytest.raises(SystemExit):
+        main([str(tmp_path), "-o", str(output), "--manifest", str(tmp_path / "out" / ".." / "out" / "merged.json")])
+    assert not output.exists()
+
+
+def test_trace_is_removed_when_its_manifest_cannot_be_written(tmp_path):
+    _jsonl(tmp_path, "node-1", 1234)
+    (tmp_path / "blocked").write_text("a file, not a directory")
+    output = tmp_path / "merged.json"
+
+    assert main([str(tmp_path), "-o", str(output), "--manifest", str(tmp_path / "blocked" / "m.json")]) == 1
+    assert not output.exists()
