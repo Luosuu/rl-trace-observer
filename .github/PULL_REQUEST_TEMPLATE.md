@@ -5,7 +5,7 @@
 ### Checklist Before Starting
 
 - [ ] Search for similar PRs. Paste at least one query link here: ...
-- [ ] Format the PR title as `[{modules}] {type}: {description}`
+- [ ] Format the PR title as `[{modules}] {type}: {description}` (This will be checked by the CI)
   - `{modules}` include `rl-insight`, `verl`, `tokenspeed`, `viztracer`, `torch`, `ray`, `merger`, `manifest`, `clock`, `deps`, `ci`, `doc`, `misc`
   - If this PR involves multiple modules, separate them with `,` like `[rl-insight, verl]`
   - `{type}` is in `feat`, `fix`, `refactor`, `chore`, `test`
