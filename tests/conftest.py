@@ -1,11 +1,25 @@
 import os
+from pathlib import Path
 
 import pytest
 
-# Under `uv run`, Ray otherwise rebuilds a separate uv environment for every
-# worker from the bare project, without the extras synced for this run. Test
-# workers must use the same environment as the driver. Ray reads this on import.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Under `uv run`, Ray's uv hook would replace the py_executable from
+# ray_runtime_env.yaml with the driver's bare `uv run` flags. Tests exercise the
+# yaml as written instead. Ray reads this on import.
 os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
+
+
+def load_ray_runtime_env(**env_vars: str) -> dict:
+    """Load the project's ray_runtime_env.yaml, as `ray job submit` would."""
+    import yaml
+
+    runtime_env = yaml.safe_load((REPO_ROOT / "ray_runtime_env.yaml").read_text())
+    runtime_env["working_dir"] = str(REPO_ROOT / runtime_env["working_dir"])
+    runtime_env["env_vars"] = {**runtime_env.get("env_vars", {}), **env_vars}
+    return runtime_env
+
 
 _BACKEND_ENV = "RL_INSIGHT_SERVER_BACKEND"
 

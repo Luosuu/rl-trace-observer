@@ -1,11 +1,11 @@
 import json
 import os
 import sys
+import types
 from unittest.mock import Mock
 
 from rl_trace_observer.integrations.rl_insight.client import (
     BACKEND_NAME,
-    DEFAULT_BACKEND,
     ChromeTraceJsonlClient,
     create_rl_trace_observer_client,
     register_rl_insight_client,
@@ -74,95 +74,37 @@ def test_trace_event_is_also_forwarded(tmp_path):
     delegate.apply_event.assert_called_once_with(event)
 
 
-def test_registration_uses_rl_trace_backend_name():
-    registry = {}
-
-    assert register_rl_insight_client(registry, backend_env=False)
-
-    assert callable(registry[BACKEND_NAME])
-
-
-def test_registration_captures_default_backend(tmp_path, monkeypatch):
-    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path))
-    monkeypatch.setenv("RL_TRACE_FORWARD_TO_RL_INSIGHT", "1")
-    original_client = Mock()
-    original_factory = Mock(return_value=original_client)
-    registry = {DEFAULT_BACKEND: original_factory}
-
-    register_rl_insight_client(registry, backend_env=False)
-    client = registry[DEFAULT_BACKEND]("config")
-    client.apply_event(_trace_event())
-
-    original_factory.assert_called_once_with("config")
-    original_client.apply_event.assert_called_once()
-    assert client.output_path.exists()
-
-
-def test_registration_is_idempotent(tmp_path, monkeypatch):
-    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path))
-    monkeypatch.setenv("RL_TRACE_FORWARD_TO_RL_INSIGHT", "1")
-    original_factory = Mock(return_value=Mock())
-    registry = {DEFAULT_BACKEND: original_factory}
-
-    register_rl_insight_client(registry, backend_env=False)
-    first_tee = registry[DEFAULT_BACKEND]
-    register_rl_insight_client(registry, backend_env=False)
-
-    assert registry[DEFAULT_BACKEND] is first_tee
-    registry[BACKEND_NAME]("config")
-    original_factory.assert_called_once_with("config")
-
-
-def test_default_backend_capture_can_be_disabled(monkeypatch):
-    monkeypatch.setenv("RL_TRACE_CAPTURE_DEFAULT_BACKEND", "0")
-    original_factory = Mock()
-    registry = {DEFAULT_BACKEND: original_factory}
-
-    register_rl_insight_client(registry, backend_env=False)
-
-    assert registry[DEFAULT_BACKEND] is original_factory
-    assert BACKEND_NAME in registry
-
-
-def test_forwarding_is_disabled_by_default(tmp_path, monkeypatch):
-    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path))
-    monkeypatch.delenv("RL_TRACE_FORWARD_TO_RL_INSIGHT", raising=False)
-    original_factory = Mock()
-    registry = {DEFAULT_BACKEND: original_factory}
-
-    register_rl_insight_client(registry, backend_env=False)
-    registry[DEFAULT_BACKEND]("config")
-
-    original_factory.assert_not_called()
-
-
-def test_backend_env_is_preferred_over_replacing_default(monkeypatch):
+def test_registration_selects_backend_through_env(monkeypatch):
     monkeypatch.delenv("RL_INSIGHT_SERVER_BACKEND", raising=False)
-    original_factory = Mock()
-    registry = {DEFAULT_BACKEND: original_factory}
+    register = Mock()
 
-    register_rl_insight_client(registry, backend_env=True)
+    assert register_rl_insight_client(register)
 
-    assert registry[DEFAULT_BACKEND] is original_factory
-    assert registry[BACKEND_NAME].original_factory is original_factory
+    register.assert_called_once_with(BACKEND_NAME, create_rl_trace_observer_client)
     assert os.environ["RL_INSIGHT_SERVER_BACKEND"] == BACKEND_NAME
 
 
-def test_backend_env_keeps_explicit_user_choice(monkeypatch):
+def test_registration_keeps_explicit_backend_choice(monkeypatch):
     monkeypatch.setenv("RL_INSIGHT_SERVER_BACKEND", "ray")
 
-    register_rl_insight_client({}, backend_env=True)
+    register_rl_insight_client(Mock())
 
     assert os.environ["RL_INSIGHT_SERVER_BACKEND"] == "ray"
 
 
-def test_backend_env_capture_can_be_disabled(monkeypatch):
-    monkeypatch.delenv("RL_INSIGHT_SERVER_BACKEND", raising=False)
-    monkeypatch.setenv("RL_TRACE_CAPTURE_DEFAULT_BACKEND", "0")
+def test_forwarding_uses_ray_monitor_client(tmp_path, monkeypatch):
+    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("RL_TRACE_FORWARD_TO_RL_INSIGHT", "1")
+    ray_client = Mock()
+    ray_module = types.ModuleType("rl_insight.client.ray_monitor_client")
+    ray_module.create_ray_monitor_client = Mock(return_value=ray_client)
+    monkeypatch.setitem(sys.modules, "rl_insight.client.ray_monitor_client", ray_module)
 
-    register_rl_insight_client({}, backend_env=True)
+    client = create_rl_trace_observer_client("config")
+    client.apply_event(_trace_event())
 
-    assert "RL_INSIGHT_SERVER_BACKEND" not in os.environ
+    ray_module.create_ray_monitor_client.assert_called_once_with("config")
+    ray_client.apply_event.assert_called_once()
 
 
 def test_delegate_failure_does_not_propagate(tmp_path):

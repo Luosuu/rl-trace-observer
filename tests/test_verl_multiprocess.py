@@ -13,6 +13,7 @@ ray = pytest.importorskip("ray")
 pytest.importorskip("rl_insight.client.base")
 pytest.importorskip("verl")
 
+from conftest import load_ray_runtime_env  # noqa: E402
 from verl.single_controller.base.decorator import Dispatch, register  # noqa: E402
 from verl.single_controller.base.worker import Worker  # noqa: E402
 from verl.single_controller.ray.base import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup  # noqa: E402
@@ -52,13 +53,8 @@ def _start_ray(output_dir, **extra_env):
     # Mirrors verl.trainer.main_ppo: enabling the rl_insight logger sets this in
     # the driver, and get_ppo_ray_runtime_env forwards it to every worker.
     os.environ["VERL_RL_INSIGHT_ENABLE"] = "1"
-    runtime_env = get_ppo_ray_runtime_env()
-    runtime_env["env_vars"].update(
-        {
-            "RL_TRACE_OUTPUT_DIR": str(output_dir),
-            "RL_INSIGHT_SERVER_URL": "local://rl-trace-observer",
-            **extra_env,
-        }
+    runtime_env = load_ray_runtime_env(
+        **get_ppo_ray_runtime_env()["env_vars"], RL_TRACE_OUTPUT_DIR=str(output_dir), **extra_env
     )
     ray.init(num_cpus=4, include_dashboard=False, log_to_driver=False, runtime_env=runtime_env)
 

@@ -49,43 +49,31 @@ their own semantic artifact. No GPU is required.
 
 ## Zero-patch VERL integration
 
-Install this package and `rl-insight` in the VERL driver and worker runtime:
+VERL >= 0.9 loads the package's `verl.plugins` entry point automatically in
+every process that imports verl. With `VERL_USE_EXTERNAL_PLUGINS=none`, load it
+explicitly with
+`VERL_USE_EXTERNAL_MODULES=rl_trace_observer.integrations.verl.register`.
+
+Run on Ray with [`ray_runtime_env.yaml`](ray_runtime_env.yaml), following Ray's
+uv integration: the project directory is uploaded as `working_dir` and every
+worker starts through `uv run --locked --extra ... python`, so all processes use
+the environment pinned by `uv.lock`. Set `RL_TRACE_OUTPUT_DIR` in the yaml to a
+directory shared by all nodes, then submit with the same extras on the driver:
 
 ```bash
-uv sync --extra verl --extra rl-insight
-
-# VERL >= 0.9 loads the package's `verl.plugins` entry point automatically in
-# every process that imports verl. With VERL_USE_EXTERNAL_PLUGINS=none, or on
-# VERL versions without plugin discovery, load it explicitly:
-# export VERL_USE_EXTERNAL_MODULES=rl_trace_observer.integrations.verl.register
-export RL_TRACE_OUTPUT_DIR=/path/to/profile-artifacts
-
-# RL-Insight currently requires a non-empty URL during initialization. The
-# local RL Trace Observer backend does not contact this URL.
-export RL_INSIGHT_SERVER_URL=local://rl-trace-observer
-```
-
-Select the custom monitor backend and enable the existing VERL logger. When
-launching through `uv run`, Ray starts every worker with the same `uv run`
-flags, so pass the extras there too:
-
-```bash
-uv run --extra verl --extra rl-insight python -m verl.trainer.main_ppo \
+ray job submit --runtime-env ray_runtime_env.yaml -- \
+  uv run --locked --extra verl --extra tokenspeed --extra rl-insight --extra viztracer \
+  python -m verl.trainer.main_ppo \
   trainer.logger='["console","rl_insight"]' \
-  +trainer.rl_insight.server.backend=rl_trace_observer \
   ...
 ```
 
-VERL workers initialize RL-Insight lazily without the trainer config, so they
-would otherwise select RL-Insight's default `ray` backend. Loading the external
-module routes them to the local JSONL client as well, so driver and worker spans
-are both captured:
-
-- If RL-Insight supports `RL_INSIGHT_SERVER_BACKEND`, the module sets it to
-  `rl_trace_observer` in each process unless it is already set.
-- Otherwise it replaces RL-Insight's default `ray` factory with the same client.
-
-Set `RL_TRACE_CAPTURE_DEFAULT_BACKEND=0` to leave the default backend untouched.
+`trainer.logger` containing `rl_insight` makes VERL enable RL-Insight in every
+worker. VERL workers initialize RL-Insight lazily without the trainer config, so
+the plugin selects its backend through `RL_INSIGHT_SERVER_BACKEND`, which it
+defaults to `rl_trace_observer` in each process; an explicitly set value wins.
+This requires the pinned RL-Insight fork; the plugin raises an error on an
+RL-Insight without `RL_INSIGHT_SERVER_BACKEND`.
 
 Each process incrementally writes:
 

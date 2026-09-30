@@ -1,17 +1,21 @@
 """Multi-process smoke test: every Ray worker must write its own semantic artifact."""
 
 import json
+from pathlib import Path
 
 import pytest
 
 ray = pytest.importorskip("ray")
 pytest.importorskip("rl_insight.client.base")
 
+from conftest import load_ray_runtime_env  # noqa: E402
+
 
 @ray.remote
 class _Worker:
-    def run(self, lane_id: str) -> int:
+    def run(self, lane_id: str) -> tuple[int, str, str]:
         import os
+        import sys
 
         # Mirrors VERL_USE_EXTERNAL_MODULES loading the plugin in each worker.
         import rl_insight
@@ -22,7 +26,7 @@ class _Worker:
         rl_insight.init()
         with rl_insight.trace_state("actor_update", state_lane_id=lane_id):
             pass
-        return os.getpid()
+        return os.getpid(), sys.prefix, os.getcwd()
 
 
 @pytest.fixture
@@ -31,12 +35,7 @@ def ray_cluster(tmp_path):
         num_cpus=2,
         include_dashboard=False,
         log_to_driver=False,
-        runtime_env={
-            "env_vars": {
-                "RL_TRACE_OUTPUT_DIR": str(tmp_path),
-                "RL_INSIGHT_SERVER_URL": "local://rl-trace-observer",
-            }
-        },
+        runtime_env=load_ray_runtime_env(RL_TRACE_OUTPUT_DIR=str(tmp_path)),
     )
     yield tmp_path
     ray.shutdown()
@@ -44,7 +43,13 @@ def ray_cluster(tmp_path):
 
 def test_each_ray_worker_writes_semantic_artifact(ray_cluster):
     workers = [_Worker.remote() for _ in range(2)]
-    pids = ray.get([worker.run.remote(f"rank_{rank}") for rank, worker in enumerate(workers)])
+    results = ray.get([worker.run.remote(f"rank_{rank}") for rank, worker in enumerate(workers)])
+    pids = [pid for pid, _, _ in results]
+
+    # ray_runtime_env.yaml: each worker runs in the environment uv builds inside
+    # the uploaded working_dir, not in the driver's environment.
+    for _, prefix, cwd in results:
+        assert Path(prefix) == Path(cwd) / ".venv"
 
     artifacts = sorted(ray_cluster.glob("*.chrome.jsonl"))
     assert len(set(pids)) == 2

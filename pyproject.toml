@@ -13,7 +13,7 @@ dependencies = []
 # 0.9 adds verl.plugins entry point discovery and the RL-Insight hooks used here.
 verl = ["verl>=0.9.1"]
 tokenspeed = ["tokenspeed"]
-rl-insight = ["rl-insight>=0.2.1"]
+rl-insight = ["rl-insight"]
 viztracer = ["viztracer>=0.16"]
 
 [dependency-groups]
@@ -23,9 +23,8 @@ dev = ["pytest>=8", "ruff>=0.12"]
 rl-trace-observer = "rl_trace_observer.integrations.verl.register"
 
 [tool.uv.sources]
-# uv installs the fork that adds RL_INSIGHT_SERVER_BACKEND until it lands
-# upstream (branch tianle/server-backend-env). pip users get the PyPI release,
-# which still works through the default-backend tee.
+# Fork adding RL_INSIGHT_SERVER_BACKEND (branch tianle/server-backend-env),
+# required until it lands upstream.
 rl-insight = { git = "https://github.com/Luosuu/rl-insight", rev = "72763beecf2c9652ad182ba83ce9104417a70d1e" }
 
 [tool.uv]

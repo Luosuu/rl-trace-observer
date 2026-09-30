@@ -4,18 +4,16 @@ import os
 import re
 import socket
 import threading
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 BACKEND_NAME = "rl_trace_observer"
-DEFAULT_BACKEND = "ray"
+RL_INSIGHT_BACKEND_ENV = "RL_INSIGHT_SERVER_BACKEND"
 _TRACE_EVENT_KIND = "trace"
 _FORWARD_ENV = "RL_TRACE_FORWARD_TO_RL_INSIGHT"
-_CAPTURE_DEFAULT_ENV = "RL_TRACE_CAPTURE_DEFAULT_BACKEND"
-_RL_INSIGHT_BACKEND_ENV = "RL_INSIGHT_SERVER_BACKEND"
 
 
 def _enabled(name: str) -> bool:
@@ -82,104 +80,59 @@ class ChromeTraceJsonlClient:
         }
 
 
-def create_rl_trace_observer_client(
-    config: object, original_factory: Callable[[object], object] | None = None
-) -> ChromeTraceJsonlClient:
-    """Create a local JSONL client that optionally tees into the original backend.
+def create_rl_trace_observer_client(config: object) -> ChromeTraceJsonlClient:
+    """RL-Insight monitor client factory registered as ``rl_trace_observer``.
 
-    Args:
-        config: Merged RL-Insight monitor config passed by ``create_monitor_client``.
-        original_factory: RL-Insight's own client factory, used as the forwarding
-            delegate. When omitted, the built-in Ray monitor client is imported.
+    With ``RL_TRACE_FORWARD_TO_RL_INSIGHT`` set, every event is also forwarded
+    to RL-Insight's built-in Ray monitor client.
     """
     delegate = None
     if _enabled(_FORWARD_ENV):
-        if original_factory is None:
-            from rl_insight.client.ray_monitor_client import create_ray_monitor_client
+        from rl_insight.client.ray_monitor_client import create_ray_monitor_client
 
-            original_factory = create_ray_monitor_client
-        delegate = original_factory(config)
+        delegate = create_ray_monitor_client(config)
 
     output_dir = os.getenv("RL_TRACE_OUTPUT_DIR", "rl_trace_outputs")
     return ChromeTraceJsonlClient(output_dir=output_dir, delegate=delegate)
 
 
-class _TeeFactory:
-    """Registry entry that remembers the RL-Insight factory it replaced."""
-
-    def __init__(self, original_factory: Callable[[object], object] | None):
-        self.original_factory = original_factory
-
-    def __call__(self, config: object) -> ChromeTraceJsonlClient:
-        return create_rl_trace_observer_client(config, original_factory=self.original_factory)
-
-
-def _default_registry() -> MutableMapping[str, Callable] | None:
-    try:
-        # Importing ``base`` runs ``rl_insight.client.__init__`` first, which
-        # registers the built-in Ray factory that is captured below.
-        from rl_insight.client.base import MONITOR_CLIENT_REGISTRY
-    except ImportError:
-        return None
-    return MONITOR_CLIENT_REGISTRY
-
-
 def _supports_backend_env() -> bool:
-    try:
-        from rl_insight.utils.constants import MonitorEnv
-    except ImportError:
-        return False
-    return getattr(MonitorEnv, "SERVER_BACKEND", None) == _RL_INSIGHT_BACKEND_ENV
+    from rl_insight.utils.constants import MonitorEnv
+
+    return getattr(MonitorEnv, "SERVER_BACKEND", None) == RL_INSIGHT_BACKEND_ENV
 
 
-def _capture_default_enabled() -> bool:
-    return os.getenv(_CAPTURE_DEFAULT_ENV, "1").lower() not in {"0", "false", "no", "off"}
-
-
-def register_rl_insight_client(
-    registry: MutableMapping[str, Callable] | None = None, backend_env: bool | None = None
-) -> bool:
-    """Register the custom backend and route default RL-Insight clients to it.
+def register_rl_insight_client(register: Callable[[str, Callable], None] | None = None) -> bool:
+    """Register the backend and make it RL-Insight's default in this process.
 
     VERL workers lazily call ``rl_insight.init()`` without the trainer config,
-    so without intervention they select RL-Insight's default ``ray`` backend.
-    When RL-Insight supports ``RL_INSIGHT_SERVER_BACKEND``, it defaults to this
-    backend in the current process. Older RL-Insight versions instead get their
-    default factory replaced by a tee that writes local JSONL. In both cases
-    ``RL_TRACE_FORWARD_TO_RL_INSIGHT`` forwards events to the original Ray
-    factory, and ``RL_TRACE_CAPTURE_DEFAULT_BACKEND=0`` leaves the default
-    backend untouched.
-
-    Registration is idempotent: an already installed tee is never wrapped again.
+    so the backend must also be selected through ``RL_INSIGHT_SERVER_BACKEND``.
+    It defaults to this backend unless the user already set it.
 
     Args:
-        registry: RL-Insight's client registry; injected by tests.
-        backend_env: Whether RL-Insight honors ``RL_INSIGHT_SERVER_BACKEND``.
-            Detected from the installed RL-Insight when omitted.
+        register: RL-Insight's ``register_monitor_client``; injected by tests.
 
     Returns:
         ``False`` when RL-Insight is unavailable, allowing the optional actor
         VizTracer integration to remain usable on its own.
+
+    Raises:
+        RuntimeError: The installed RL-Insight does not support
+            ``RL_INSIGHT_SERVER_BACKEND``.
     """
-    if registry is None:
-        registry = _default_registry()
-        if registry is None:
+    if register is None:
+        try:
+            from rl_insight.client.base import register_monitor_client
+        except ImportError:
             logger.warning("RL-Insight is unavailable; semantic state collection is disabled")
             return False
-    if backend_env is None:
-        backend_env = _supports_backend_env()
+        if not _supports_backend_env():
+            raise RuntimeError(
+                f"The installed RL-Insight does not support {RL_INSIGHT_BACKEND_ENV}; install the "
+                "pinned fork with `uv sync --extra rl-insight`"
+            )
+        register = register_monitor_client
 
-    current_default = registry.get(DEFAULT_BACKEND)
-    if isinstance(current_default, _TeeFactory):
-        tee_factory = current_default
-    else:
-        if current_default is None:
-            logger.warning("RL-Insight has no %r backend registered; forwarding is unavailable", DEFAULT_BACKEND)
-        tee_factory = _TeeFactory(current_default)
-        if _capture_default_enabled() and not backend_env:
-            registry[DEFAULT_BACKEND] = tee_factory
-    registry[BACKEND_NAME] = tee_factory
-    if _capture_default_enabled() and backend_env:
-        # An explicit user choice of backend wins over this default.
-        os.environ.setdefault(_RL_INSIGHT_BACKEND_ENV, BACKEND_NAME)
+    register(BACKEND_NAME, create_rl_trace_observer_client)
+    os.environ.setdefault(RL_INSIGHT_BACKEND_ENV, BACKEND_NAME)
     return True

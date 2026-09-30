@@ -1,0 +1,24 @@
+# Ray runtime environment for VERL runs with RL Trace Observer.
+#
+#   ray job submit --runtime-env ray_runtime_env.yaml -- \
+#     uv run --locked --extra verl --extra tokenspeed --extra rl-insight --extra viztracer \
+#     python -m verl.trainer.main_ppo trainer.logger='["console","rl_insight"]' ...
+#
+# Every Ray worker starts through `uv run` inside the uploaded working_dir, so
+# it gets the environment pinned by uv.lock, including the RL-Insight fork.
+# Keep the extras here identical to the ones on the driver's `uv run`.
+#
+# The trailing `python` is required: Ray appends the path of its own
+# default_worker.py, and `uv run <script.py>` discovers the project from the
+# script's location instead of the working_dir.
+working_dir: .
+py_executable: uv run --locked --extra verl --extra tokenspeed --extra rl-insight --extra viztracer python
+excludes:
+  - .git/
+  - .venv/
+  - rl_trace_outputs/
+env_vars:
+  # RL-Insight requires a non-empty URL; the local backend never contacts it.
+  RL_INSIGHT_SERVER_URL: local://rl-trace-observer
+  # Set to a directory shared by all nodes (worker cwd is the unpacked working_dir):
+  # RL_TRACE_OUTPUT_DIR: /shared/profile-artifacts

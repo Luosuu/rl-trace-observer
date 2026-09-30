@@ -45,3 +45,12 @@ def test_explicit_backend_is_captured(monitor_env):
         pass
 
     assert [event["name"] for event in _read_events(monitor_env)] == ["train_batch"]
+
+
+def test_rl_insight_without_backend_env_fails_fast(monkeypatch):
+    from rl_insight.utils.constants import MonitorEnv
+
+    monkeypatch.delattr(MonitorEnv, "SERVER_BACKEND")
+
+    with pytest.raises(RuntimeError, match="RL_INSIGHT_SERVER_BACKEND"):
+        register_rl_insight_client()
