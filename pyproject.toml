@@ -12,7 +12,9 @@ dependencies = []
 [project.optional-dependencies]
 verl = ["verl"]
 tokenspeed = ["tokenspeed"]
-rl-insight = ["rl-insight>=0.2.1"]
+# Pinned to the fork until RL_INSIGHT_SERVER_BACKEND lands upstream; older
+# rl-insight releases (>=0.2.1) still work through the default-backend tee.
+rl-insight = ["rl-insight @ git+https://github.com/Luosuu/rl-insight@tianle/server-backend-env"]
 viztracer = ["viztracer>=0.16"]
 test = ["pytest>=8"]
 
