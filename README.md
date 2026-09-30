@@ -41,6 +41,23 @@ controller: a driver, two actor workers and a stand-in rollout server each load
 the plugin through VERL's plugin discovery and write their own semantic
 artifact. No GPU is required.
 
+### CPU PPO end-to-end test
+
+`tests/test_cpu_ppo.py` runs VERL's real `verl.trainer.main_ppo` for one PPO
+step on CPU (about 90 s): a driver, two FSDP2 actor workers with the Torch
+profiler enabled, and two rollout replicas. It needs no GPU or network access:
+
+- `tests/cpu_ppo/assets.py` builds a tiny Qwen2 model, a byte-level BPE ChatML
+  tokenizer and a parquet dataset offline.
+- `tests/cpu_ppo/cpu_plugin.py`, loaded through `VERL_USE_EXTERNAL_MODULES`,
+  registers a `cpu` platform, the FSDP engines for cpu and a `mock` rollout
+  whose servers return short random completions, using only VERL's extension
+  points (plus one workaround listed in its docstring).
+
+The test merges the resulting RL-Insight and Torch artifacts with
+`rl-trace-merge` and checks in Perfetto that every rank's `actor_update` lines
+up on both timelines.
+
 ## Zero-patch VERL integration
 
 VERL >= 0.9 loads the package's `verl.plugins` entry point automatically in

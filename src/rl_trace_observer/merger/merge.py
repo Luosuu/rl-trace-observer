@@ -68,10 +68,12 @@ class _SourceRemapper:
         if key not in self._pids:
             pid = self._pids[key] = next(self._next_pid)
             source = self._source
-            if source.kind == RL_INSIGHT:
+            if source.kind == RL_INSIGHT or key == source.labels.get("pid"):
+                # The profiled process itself: its recorded name is only the
+                # process title at export time (e.g. a Ray method name).
                 name = source.title
             else:
-                name = f"{source.title} · {self._process_names.get(key) or key or 'unassigned'}"
+                name = f"{source.title} · {self._process_names.get(key) or key}"
             labels = ", ".join(f"{k}={v}" for k, v in {**source.labels, "file": source.path.name}.items())
             self._metadata.append(_metadata("process_name", pid, 0, {"name": name}))
             self._metadata.append(_metadata("process_sort_index", pid, 0, {"sort_index": pid}))

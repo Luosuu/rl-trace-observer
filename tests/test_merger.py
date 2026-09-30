@@ -133,7 +133,9 @@ def test_merge_names_processes_and_threads(tmp_path):
 
     assert ("process_name", "RL-Insight node-1 pid 1234") in names
     assert ("thread_name", "rank_0") in names
-    assert ("process_name", "Torch actor_train_step3_rank0-of-2 pid 1234 · python3") in names
+    # The profiled process is named after its source; other pids keep their own name.
+    assert ("process_name", "Torch actor_train_step3_rank0-of-2 pid 1234") in names
+    assert ("process_name", "Torch actor_train_step3_rank0-of-2 pid 1234 · 0") in names
     assert ("thread_name", "thread 1234") in names
     assert all(isinstance(e["pid"], int) and isinstance(e["tid"], int) for e in result.trace["traceEvents"])
 
@@ -164,3 +166,41 @@ def test_cli_writes_trace_and_strict_mode_fails_on_warnings(tmp_path):
 
 def test_cli_fails_without_artifacts(tmp_path):
     assert main([str(tmp_path), "-o", str(tmp_path / "merged.json")]) == 1
+
+
+def test_kineto_bookkeeping_processes_are_dropped(tmp_path):
+    events = _cpu_events(1234, 0.0) + [
+        {"ph": "X", "name": "PyTorch Profiler (0)", "pid": "Spans", "tid": "PyTorch Profiler", "ts": 0.0, "dur": 9.0},
+        {"ph": "i", "name": "Iteration Start: PyTorch Profiler", "pid": "Traces", "tid": "x", "ts": 0.0},
+        {"ph": "i", "name": "Record Window End", "pid": "", "tid": "", "ts": 9.0},
+    ]
+    _write_torch(tmp_path / TORCH_NAME.format(pid=1234), events)
+
+    result = merge_sources(read_source(kind, path) for kind, path in discover([tmp_path]))
+    process_names = [e["args"]["name"] for e in result.trace["traceEvents"] if e["name"] == "process_name"]
+
+    assert process_names == [
+        "Torch actor_train_step3_rank0-of-2 pid 1234",
+        "Torch actor_train_step3_rank0-of-2 pid 1234 · 0",
+    ]
+
+
+def test_viztracer_main_process_is_named_after_its_source(tmp_path):
+    path = tmp_path / "step-3-role-e2e-rank-0-pid-42.viztracer.json"
+    path.write_text(
+        json.dumps(
+            {
+                "viztracer_metadata": {"baseTimeNanoseconds": BASE_NS},
+                "traceEvents": [
+                    {"ph": "M", "name": "process_name", "pid": 42, "tid": 42, "args": {"name": "MainProcess"}},
+                    {"ph": "X", "name": "f", "pid": 42, "tid": 42, "ts": 1.0, "dur": 1.0},
+                ],
+            }
+        )
+    )
+
+    result = merge_sources(read_source(kind, p) for kind, p in discover([tmp_path]))
+
+    assert [e["args"]["name"] for e in result.trace["traceEvents"] if e["name"] == "process_name"] == [
+        "VizTracer e2e step 3 rank 0 pid 42"
+    ]
