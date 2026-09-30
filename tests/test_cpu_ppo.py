@@ -99,6 +99,15 @@ def _run_main_ppo(assets: dict[str, Path], output_dir: Path, log: Path) -> subpr
         )
 
 
+def _failure_report(log: Path) -> str:
+    # Ray interleaves worker output, and a C++ stack trace easily pushes the
+    # actual error out of the tail; list the error lines first.
+    lines = log.read_text(errors="replace").splitlines()
+    markers = ("Error", "Exception", "enforce fail", "Traceback", "Killed", "OOM")
+    errors = list(dict.fromkeys(line for line in lines if any(marker in line for marker in markers)))
+    return "\n".join(["--- error lines ---", *errors[:80], "--- log tail ---", *lines[-60:]])
+
+
 def _rl_insight_spans(output_dir: Path) -> list[dict]:
     return [
         event
@@ -113,7 +122,7 @@ def test_one_ppo_step_on_cpu_produces_aligned_traces(tmp_path, load_in_perfetto)
     log = tmp_path / "main_ppo.log"
 
     result = _run_main_ppo(assets, output_dir, log)
-    assert result.returncode == 0, log.read_text()[-5000:]
+    assert result.returncode == 0, _failure_report(log)
 
     spans = _rl_insight_spans(output_dir)
     lanes = defaultdict(set)
