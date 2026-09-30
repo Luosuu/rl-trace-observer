@@ -175,6 +175,7 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
     # timestamp), so only a file with both the same name and content is a copy;
     # e.g. every process without spans writes an identical empty JSONL.
     seen: dict[tuple[str, str], str] = {}
+    fallback: dict[str, Process] = {}
     for kind, path in found:
         if kind == PROCESS_RECORD:
             continue
@@ -194,8 +195,9 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
         seen[identity] = str(path)
         try:
             source = read_source(kind, path)
-        except (ValueError, TypeError, KeyError, AttributeError) as error:
-            # ArtifactError, or valid JSON with malformed fields (e.g. a null line).
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+            # ArtifactError, valid JSON with malformed fields (e.g. a null
+            # line), or a file that became unreadable after hashing.
             artifact.complete = False
             manifest.problems.append(Problem("incomplete", str(path), str(error) or repr(error)))
             continue
@@ -207,15 +209,19 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
         if problem is not None:
             manifest.problems.append(problem)
         elif source.kind == RL_INSIGHT and source.process not in manifest.processes:
-            # Older runs wrote no process records; the filename still names the process.
-            manifest.processes[source.process] = Process(
-                key=source.process, host=source.host, hostname=source.host, os_pid=source.os_pid
+            # Older runs wrote no process records; the filename still names the
+            # process. Such a process only names the RL-Insight source: it is
+            # kept out of linking, where its pid could claim another host's trace.
+            fallback.setdefault(
+                source.process,
+                Process(key=source.process, host=source.host, hostname=source.host, os_pid=source.os_pid),
             )
         if source.process in manifest.processes:
             source.host = manifest.processes[source.process].host
         artifact.process = source.process
         sources.append(source)
 
+    manifest.processes.update(fallback)
     found_paths = {str(path) for _, path in found}
     for process in manifest.processes.values():
         for registered in process.artifacts:

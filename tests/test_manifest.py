@@ -360,3 +360,67 @@ def test_trace_is_removed_when_its_manifest_cannot_be_written(tmp_path):
 
     assert main([str(tmp_path), "-o", str(output), "--manifest", str(tmp_path / "blocked" / "m.json")]) == 1
     assert not output.exists()
+
+
+@pytest.mark.parametrize("torch_dir", ["a", "z"])
+def test_rl_insight_file_without_a_record_never_claims_another_trace(tmp_path, torch_dir):
+    # Without records the Torch trace's host is unknown, whichever file is read first.
+    _jsonl(tmp_path, "node-1", 1234)
+    (tmp_path / torch_dir).mkdir()
+    _torch(tmp_path / torch_dir, 1234, rank=0)
+
+    manifest, sources = build_manifest([tmp_path])
+
+    assert [problem.kind for problem in manifest.problems] == ["unlinked"]
+    assert sorted(str(source.process) for source in sources) == ["None", "node-1:1234"]
+
+
+def test_artifact_that_cannot_be_read_after_hashing_is_incomplete(tmp_path, monkeypatch):
+    from rl_trace_observer.merger import manifest as manifest_module
+
+    _jsonl(tmp_path, "node-1", 1234)
+
+    def vanish(kind, path):
+        raise FileNotFoundError(2, "No such file or directory", str(path))
+
+    monkeypatch.setattr(manifest_module, "read_source", vanish)
+    manifest, sources = build_manifest([tmp_path])
+
+    assert [problem.kind for problem in manifest.problems] == ["incomplete"]
+    assert sources == []
+
+
+def test_manifest_is_written_when_a_stale_trace_cannot_be_removed(tmp_path, monkeypatch):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    _torch(artifacts, 1234, rank=0)
+    output = tmp_path / "merged.json"
+    output.write_text("{}")
+    unlink = type(output).unlink
+
+    def refuse(path, missing_ok=False):
+        if path == output:
+            raise PermissionError(13, "Permission denied", str(path))
+        return unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(type(output), "unlink", refuse)
+
+    # --strict fails on the unlinked trace.
+    assert main([str(artifacts), "-o", str(output), "--strict"]) == 1
+    assert json.loads((tmp_path / "merged.manifest.json").read_text())["output"] is None
+
+
+def test_register_artifact_through_a_symlinked_directory_updates_one_record(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    register_artifact(real, "rl_insight_jsonl", real / "rl-insight-a.chrome.jsonl")
+    register_artifact(link, "viztracer", link / "step-1-role-e2e-rank-0-pid-1.viztracer.json")
+
+    record = json.loads(record_path(real).read_text())
+    assert [entry["file"] for entry in record["artifacts"]] == [
+        "rl-insight-a.chrome.jsonl",
+        "step-1-role-e2e-rank-0-pid-1.viztracer.json",
+    ]

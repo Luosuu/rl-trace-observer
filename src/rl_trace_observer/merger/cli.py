@@ -92,7 +92,10 @@ def main(argv: list[str] | None = None) -> int:
     if result is None and args.output.is_file():
         # A trace from an earlier run must not sit next to this manifest.
         logger.warning("Removing %s from an earlier run", args.output)
-        args.output.unlink()
+        try:
+            args.output.unlink()
+        except OSError as error:
+            logger.error("Cannot remove %s: %s", args.output, error)
     document = manifest.to_json(
         global_base_time_ns=result.global_base_ns if result else None,
         output=str(args.output) if result else None,

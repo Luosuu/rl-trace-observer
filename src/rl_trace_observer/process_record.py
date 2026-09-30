@@ -65,6 +65,9 @@ def register_artifact(output_dir: Path, kind: str, path: Path) -> Path:
     The process identity is re-read on every call, so a record first written
     before ``torch.distributed`` or Ray was initialized picks them up later.
     """
+    # The same directory can be reached through a symlink or "..": key the
+    # cache, and the relative artifact paths, by the resolved directory.
+    output_dir = output_dir.resolve()
     target = record_path(output_dir)
     with _lock:
         record = _records.setdefault(
@@ -80,7 +83,7 @@ def register_artifact(output_dir: Path, kind: str, path: Path) -> Path:
         )
         record["ray"] = _ray_identity()
         record["torch_distributed"] = _torch_distributed()
-        entry = {"kind": kind, "file": os.path.relpath(path, output_dir)}
+        entry = {"kind": kind, "file": os.path.relpath(Path(path).resolve(), output_dir)}
         if entry not in record["artifacts"]:
             record["artifacts"].append(entry)
         record["updated_wall_time_ns"] = time.time_ns()
