@@ -24,6 +24,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from rl_trace_observer.process_record import SCHEMA_VERSION as RECORD_SCHEMA_VERSION
+
 from .sources import PROCESS_RECORD, RL_INSIGHT, ArtifactError, TraceSource, discover, read_source
 
 SCHEMA_VERSION = 1
@@ -101,6 +103,8 @@ def _sha256(path: Path) -> str:
 def _read_record(path: Path) -> Process:
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
+        if record.get("schema_version") != RECORD_SCHEMA_VERSION:
+            raise ValueError(f"unsupported schema_version {record.get('schema_version')!r}")
         host, os_pid = str(record["host"]), int(record["os_pid"])
         distributed = record.get("torch_distributed") or {}
         ray = record.get("ray")
@@ -124,13 +128,22 @@ def _link(source: TraceSource, processes: dict[str, Process]) -> tuple[str | Non
     """Return the key of the process that wrote ``source``, or the problem why not."""
     if source.process is not None:
         return source.process, None
-    candidates = [process for process in processes.values() if process.os_pid == source.os_pid]
+    # A process whose known rank differs from the source's cannot have written
+    # it, even when it is the only one with that pid (another host's record may
+    # be missing).
+    candidates = [
+        process
+        for process in processes.values()
+        if process.os_pid == source.os_pid
+        and (source.rank is None or process.rank is None or process.rank == source.rank)
+    ]
     if len(candidates) > 1 and source.rank is not None:
         candidates = [process for process in candidates if process.rank == source.rank]
     if len(candidates) == 1:
         return candidates[0].key, None
     if not candidates:
-        return None, Problem("unlinked", str(source.path), f"no process record for pid {source.os_pid}")
+        rank = f" and rank {source.rank}" if source.rank is not None else ""
+        return None, Problem("unlinked", str(source.path), f"no process record for pid {source.os_pid}{rank}")
     hosts = ", ".join(sorted(process.host for process in candidates))
     return None, Problem("ambiguous", str(source.path), f"pid {source.os_pid} matches processes on {hosts}")
 
@@ -178,9 +191,10 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
         seen[identity] = str(path)
         try:
             source = read_source(kind, path)
-        except ArtifactError as error:
+        except (ValueError, TypeError, KeyError, AttributeError) as error:
+            # ArtifactError, or valid JSON with malformed fields (e.g. a null line).
             artifact.complete = False
-            manifest.problems.append(Problem("incomplete", str(path), str(error)))
+            manifest.problems.append(Problem("incomplete", str(path), str(error) or repr(error)))
             continue
 
         artifact.os_pid, artifact.rank, artifact.complete = source.os_pid, source.rank, source.complete

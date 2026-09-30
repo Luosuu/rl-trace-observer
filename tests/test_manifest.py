@@ -268,7 +268,11 @@ def test_register_artifact_writes_this_process_record(tmp_path):
         "{",
         '{"host": "node-1"}',
         '{"host": "node-1", "os_pid": 1234, "artifacts": [{"kind": "viztracer"}]}',
-        '{"host": "node-1", "os_pid": 1234, "ray": "not-a-dict"}',
+        '{"schema_version": 1, "host": "node-1", "os_pid": 1234, "ray": "not-a-dict"}',
+        '{"schema_version": 1, "host": "node-1", "os_pid": 1234, "artifacts": [{"kind": "viztracer"}]}',
+        # Missing or unsupported versions are not read with version 1 semantics.
+        '{"host": "node-1", "os_pid": 1234}',
+        '{"schema_version": 2, "host": "node-1", "os_pid": 1234}',
     ],
 )
 def test_corrupt_record_is_incomplete(tmp_path, content):
@@ -277,3 +281,41 @@ def test_corrupt_record_is_incomplete(tmp_path, content):
     manifest, _ = build_manifest([tmp_path])
 
     assert [problem.kind for problem in manifest.problems] == ["incomplete"]
+
+
+def test_sole_record_with_another_rank_does_not_claim_the_trace(tmp_path):
+    # The rank-1 process's record is missing; the rank-0 record with the same pid is on another host.
+    _record(tmp_path, "node-1", 1234, rank=0)
+    _torch(tmp_path, 1234, rank=1)
+
+    manifest, sources = build_manifest([tmp_path])
+
+    assert [problem.kind for problem in manifest.problems] == ["unlinked"]
+    assert sources[0].process is None
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        lambda root: _jsonl(root, "node-1", 1234, lines=["null"]),
+        lambda root: _torch(root, 1234, rank=0).write_bytes(
+            gzip.compress(json.dumps({"baseTimeNanoseconds": "soon", "traceEvents": []}).encode())
+        ),
+    ],
+)
+def test_malformed_fields_make_an_artifact_incomplete(tmp_path, write):
+    write(tmp_path)
+
+    manifest, sources = build_manifest([tmp_path])
+
+    assert [problem.kind for problem in manifest.problems] == ["incomplete"]
+    assert sources == []
+
+
+def test_manifest_names_no_output_when_the_trace_cannot_be_written(tmp_path):
+    _jsonl(tmp_path, "node-1", 1234)
+    (tmp_path / "blocked").write_text("a file, not a directory")
+    manifest = tmp_path / "session.json"
+
+    assert main([str(tmp_path), "-o", str(tmp_path / "blocked" / "merged.json"), "--manifest", str(manifest)]) == 1
+    assert json.loads(manifest.read_text())["output"] is None

@@ -135,10 +135,10 @@ with its size, sha256, process and completeness, and the problems found:
 
 | Problem | Meaning |
 |---|---|
-| `incomplete` | an artifact was cut short (truncated JSONL line) or cannot be read |
+| `incomplete` | an artifact was cut short (truncated JSONL line), cannot be read or is malformed; or a process record has an unsupported `schema_version` |
 | `duplicate` | an artifact is a copy of another input (same file name and content), and is merged once |
 | `missing` | a process registered an artifact that is not in the inputs |
-| `unlinked` | no process record matches a Torch or VizTracer trace's pid |
+| `unlinked` | no process record matches a Torch or VizTracer trace's pid (and, when both are known, rank) |
 | `ambiguous` | several process records match and the rank cannot tell them apart |
 
 Problems and dropped events (negative durations) are warnings; `--strict` turns

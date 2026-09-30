@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -16,6 +17,17 @@ logger = logging.getLogger("rl_trace_observer.merger")
 def _default_manifest_path(output: Path) -> Path:
     stem = output.name.removesuffix(".gz").removesuffix(".json")
     return output.with_name(f"{stem}.manifest.json")
+
+
+def _write_atomically(path: Path, trace: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as file:
+            json.dump(trace, file, separators=(",", ":"))
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -55,9 +67,17 @@ def main(argv: list[str] | None = None) -> int:
             )
             result = None
 
+    # Write the trace atomically before the manifest, so a manifest naming an
+    # output always describes a complete trace.
+    if result is not None:
+        try:
+            _write_atomically(args.output, result.trace)
+        except OSError as error:
+            logger.error("Cannot write %s: %s", args.output, error)
+            result = None
     # The manifest is written even when merging fails: its problems explain why.
     # A trace left from an earlier run must not sit next to it.
-    if result is None and args.output.exists():
+    if result is None and args.output.is_file():
         logger.warning("Removing %s from an earlier run", args.output)
         args.output.unlink()
     manifest_path = args.manifest or _default_manifest_path(args.output)
@@ -76,9 +96,6 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("No trace written; manifest: %s", manifest_path)
         return 1
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8") as file:
-        json.dump(result.trace, file, separators=(",", ":"))
     counts = Counter(source.kind for source in sources)
     logger.info(
         "Merged %s from %d processes into %s (%d events); manifest: %s",
