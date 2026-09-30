@@ -131,12 +131,13 @@ def test_merge_names_processes_and_threads(tmp_path):
         if event["name"] in {"process_name", "thread_name"}
     }
 
+    # Without process records the Torch trace cannot be tied to a host, so each
+    # source keeps its own process; threads are named with their source kind.
     assert ("process_name", "RL-Insight node-1 pid 1234") in names
-    assert ("thread_name", "rank_0") in names
-    # The profiled process is named after its source; other pids keep their own name.
+    assert ("thread_name", "RL-Insight · rank_0") in names
     assert ("process_name", "Torch actor_train_step3_rank0-of-2 pid 1234") in names
     assert ("process_name", "Torch actor_train_step3_rank0-of-2 pid 1234 · 0") in names
-    assert ("thread_name", "thread 1234") in names
+    assert ("thread_name", "Torch · thread 1234") in names
     assert all(isinstance(e["pid"], int) and isinstance(e["tid"], int) for e in result.trace["traceEvents"])
 
 

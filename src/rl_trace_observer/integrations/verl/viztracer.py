@@ -1,7 +1,11 @@
+import logging
 import os
 
 from rl_trace_observer.observer import ObserverContext
 from rl_trace_observer.output import safe_component, trace_output_dir
+from rl_trace_observer.process_record import register_artifact
+
+logger = logging.getLogger(__name__)
 
 
 class VizTracerObserver:
@@ -24,6 +28,10 @@ class VizTracerObserver:
             f"step-{safe_component(profile_step)}-role-{safe_component(role)}-"
             f"rank-{context.rank}-pid-{os.getpid()}.viztracer.json"
         )
+        try:
+            register_artifact(output_dir, "viztracer", output_file)
+        except Exception:
+            logger.exception("Failed to write the process record for %s", output_file)
         self._tracer = VizTracer(
             output_file=str(output_file),
             min_duration=int(os.getenv("RL_TRACE_VIZTRACER_MIN_DURATION_US", "100")),

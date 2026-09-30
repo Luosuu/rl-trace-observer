@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from rl_trace_observer.output import safe_component, trace_output_dir
+from rl_trace_observer.process_record import register_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,12 @@ class ChromeTraceJsonlClient:
         output_dir.mkdir(parents=True, exist_ok=True)
         hostname = safe_component(socket.gethostname())
         self.output_path = output_dir / f"rl-insight-{hostname}-pid-{os.getpid()}.chrome.jsonl"
+        # Created up front: an empty file means "no spans", not a lost artifact.
+        self.output_path.touch(exist_ok=True)
+        try:
+            register_artifact(output_dir, "rl_insight_jsonl", self.output_path)
+        except Exception:
+            logger.exception("Failed to write the process record for %s", self.output_path)
         self._delegate = delegate
         self._write_lock = threading.Lock()
 

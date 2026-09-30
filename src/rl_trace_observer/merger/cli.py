@@ -4,12 +4,18 @@ import argparse
 import json
 import logging
 import sys
+from collections import Counter
 from pathlib import Path
 
+from .manifest import build_manifest
 from .merge import merge_sources
-from .sources import discover, read_source
 
 logger = logging.getLogger("rl_trace_observer.merger")
+
+
+def _default_manifest_path(output: Path) -> Path:
+    stem = output.name.removesuffix(".gz").removesuffix(".json")
+    return output.with_name(f"{stem}.manifest.json")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -19,31 +25,48 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("inputs", nargs="+", type=Path, help="artifact files or directories (searched recursively)")
     parser.add_argument("-o", "--output", type=Path, required=True, help="merged Chrome Trace JSON to write")
-    parser.add_argument("--strict", action="store_true", help="fail instead of warning on dropped events")
+    parser.add_argument(
+        "--manifest", type=Path, help="session manifest to write (default: <output stem>.manifest.json)"
+    )
+    parser.add_argument(
+        "--strict", action="store_true", help="fail on any manifest problem or dropped event instead of warning"
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    artifacts = discover(args.inputs)
-    if not artifacts:
-        logger.error("No trace artifacts found in %s", ", ".join(map(str, args.inputs)))
+    manifest, sources = build_manifest(args.inputs)
+    for problem in manifest.problems:
+        logger.warning("%s: %s (%s)", problem.kind, problem.path, problem.detail)
+    if not sources:
+        logger.error("No readable trace artifacts found in %s", ", ".join(map(str, args.inputs)))
         return 1
 
-    sources = [read_source(kind, path) for kind, path in artifacts]
-    result = merge_sources(sources)
+    result = merge_sources(sources, manifest.processes)
     for warning in result.warnings:
         logger.warning(warning)
-    if args.strict and result.warnings:
-        return 1
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path = args.manifest or _default_manifest_path(args.output)
+    manifest_path.write_text(
+        json.dumps(manifest.to_json(global_base_time_ns=result.global_base_ns, output=str(args.output)), indent=2),
+        encoding="utf-8",
+    )
+    if args.strict and (manifest.problems or result.warnings):
+        logger.error(
+            "Strict mode: %d manifest problems, %d merge warnings", len(manifest.problems), len(result.warnings)
+        )
+        return 1
+
     with args.output.open("w", encoding="utf-8") as file:
         json.dump(result.trace, file, separators=(",", ":"))
-    counts = {kind: sum(1 for k, _ in artifacts if k == kind) for kind in sorted({k for k, _ in artifacts})}
+    counts = Counter(source.kind for source in sources)
     logger.info(
-        "Merged %s into %s (%d events)",
-        ", ".join(f"{count} {kind}" for kind, count in counts.items()),
+        "Merged %s from %d processes into %s (%d events); manifest: %s",
+        ", ".join(f"{count} {kind}" for kind, count in sorted(counts.items())),
+        len(manifest.processes),
         args.output,
         len(result.trace["traceEvents"]),
+        manifest_path,
     )
     return 0
 
