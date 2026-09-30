@@ -29,5 +29,6 @@ jobs:
           curl -sSfL -o /tmp/perfetto.zip \
             "https://github.com/google/perfetto/releases/download/${PERFETTO_VERSION}/linux-amd64.zip"
           unzip -q /tmp/perfetto.zip -d /tmp/perfetto
+          chmod +x /tmp/perfetto/linux-amd64/trace_processor_shell
           echo "PERFETTO_TRACE_PROCESSOR=/tmp/perfetto/linux-amd64/trace_processor_shell" >> "$GITHUB_ENV"
       - run: uv run --no-sync pytest -q -rs
