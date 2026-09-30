@@ -1,12 +1,7 @@
 import os
-import re
-from pathlib import Path
 
 from rl_trace_observer.observer import ObserverContext
-
-
-def _safe_component(value: object) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_") or "unknown"
+from rl_trace_observer.output import safe_component, trace_output_dir
 
 
 class VizTracerObserver:
@@ -23,11 +18,10 @@ class VizTracerObserver:
 
         from viztracer import VizTracer
 
-        output_dir = Path(os.getenv("RL_TRACE_OUTPUT_DIR", "rl_trace_outputs")).expanduser().resolve()
-        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = trace_output_dir()
         profile_step = context.metadata.get("profile_step", "unknown")
         output_file = output_dir / (
-            f"step-{_safe_component(profile_step)}-role-{_safe_component(role)}-"
+            f"step-{safe_component(profile_step)}-role-{safe_component(role)}-"
             f"rank-{context.rank}-pid-{os.getpid()}.viztracer.json"
         )
         self._tracer = VizTracer(

@@ -52,8 +52,9 @@ Run on Ray with [`ray_runtime_env.yaml`](ray_runtime_env.yaml), following Ray's
 uv integration: the project directory is uploaded as `working_dir` and every
 worker starts through `uv run --locked --extra tokenspeed python`, so all
 processes use the environment pinned by `uv.lock`. Set `RL_TRACE_OUTPUT_DIR` in
-the yaml to a directory shared by all nodes, then submit with the same extras on
-the driver:
+the yaml to an absolute directory shared by all nodes; it is required, and a
+relative path is rejected because each worker runs inside a temporary copy of
+the working_dir. Then submit with the same extras on the driver:
 
 ```bash
 ray job submit --runtime-env ray_runtime_env.yaml -- \
@@ -78,6 +79,35 @@ Each process incrementally writes:
 Incremental JSONL output avoids relying on graceful Ray worker shutdown. The
 final merger can combine these absolute-time state events with actor Torch
 Profiler traces and TokenSpeed VizTracer/Proton traces.
+
+## Merge into one Perfetto trace
+
+`rl-trace-merge` combines the artifacts of a profiling run into a single Chrome
+Trace that opens in [Perfetto](https://ui.perfetto.dev):
+
+```bash
+uv run rl-trace-merge /shared/profile-artifacts /path/to/torch/save_path -o merged.json
+```
+
+Inputs are files or directories, searched recursively for:
+
+| Artifact | Written by | Time anchor |
+|---|---|---|
+| `rl-insight-<host>-pid-<pid>.chrome.jsonl` | the RL-Insight backend above | epoch µs `ts` |
+| `<role>_..._rank<r>_pid<pid>_<timestamp>.json[.gz]` | VERL `global_profiler.tool=torch` | `baseTimeNanoseconds` |
+| `step-<s>-role-<r>-rank-<n>-pid-<pid>.viztracer.json` | the optional actor VizTracer | `viztracer_metadata.baseTimeNanoseconds` |
+
+Every source is placed on one timeline starting at the earliest event. Each
+source process gets a synthetic pid with a descriptive `process_name` (and the
+original identity in `process_labels`), threads get trace-wide unique tids, and
+flow ids are renumbered per source, so identical OS pids, tids or Kineto flow
+ids on different nodes never collide. Events with negative durations are
+dropped with a warning; `--strict` turns warnings into a failure.
+
+Timestamps are each host's wall clock, so cross-node ordering is only as good
+as the nodes' clock synchronization (NTP/PTP). Torch traces do not record their
+host, so they appear as separate processes from the same process's RL-Insight
+lanes until the session manifest provides that link.
 
 ## Preserve the normal RL-Insight backend
 
