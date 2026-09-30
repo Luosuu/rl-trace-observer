@@ -46,3 +46,13 @@ def test_context_round_trips_and_names_its_profile_session(monkeypatch):
 def test_context_of_another_schema_version_is_rejected():
     with pytest.raises(ValueError, match="schema_version"):
         TraceContext.from_json({"schema_version": SCHEMA_VERSION + 1, "run_id": "x"})
+
+
+def test_callers_can_supply_a_propagated_run_id(monkeypatch):
+    # e.g. a rollout server outside Ray, given the run id by the trainer.
+    monkeypatch.delenv(RUN_ID_ENV, raising=False)
+
+    context = TraceContext.current(run_id="ppo-run-001", global_step=3)
+
+    assert context.run_id == "ppo-run-001"
+    assert context.profile_session_id == "ppo-run-001-step-3"

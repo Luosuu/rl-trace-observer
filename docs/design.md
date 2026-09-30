@@ -203,9 +203,9 @@ manifest 还需要记录 profiler 版本、文件大小、checksum、写入完�
 **当前实现（schema_version 1）**：
 
 - 每个写 artifact 的进程在 `RL_TRACE_OUTPUT_DIR` 写 `rl-trace-process-<host>-pid-<pid>.json`（原子替换），记录 hostname、pid、Ray job/node/worker/actor id 与 actor 名、`torch.distributed` rank/world_size、首次写入时的 wall/monotonic clock snapshot，以及它登记的 artifact。RL-Insight client 创建时与 VizTracer 启动时写入；此时 VERL worker 的 process group 已初始化。RL-Insight JSONL 在 client 创建时即创建，空文件表示该进程没有 span。
-- `rl-trace-merge` 在合并前构建 session manifest，并输出 `<output>.manifest.json`：进程列表、每个 artifact 的 size/sha256/所属进程/rank/完整性，以及 `incomplete`、`duplicate`、`missing`、`unlinked`、`ambiguous` 问题（`duplicate` 指文件名与内容都相同的副本）。`--strict` 下任一问题都会失败；合并失败时仍写出 manifest，并删除输出路径上旧的 trace。
+- `rl-trace-merge` 在合并前构建 session manifest，并输出 `<output>.manifest.json`：进程列表、每个 artifact 的 size/sha256/所属进程/rank/完整性，以及 `incomplete`、`duplicate`、`missing`、`unlinked`、`ambiguous` 问题（`duplicate` 指文件名与内容都相同的非空副本）。`--strict` 下任一问题都会失败；合并失败时仍写出 manifest，并删除输出路径上旧的 trace。
 - Torch/VizTracer 文件名只含 pid，按 pid 关联进程记录；多个 host 复用同一 pid 时用 rank（Kineto `distributedInfo` 或文件名）区分。
-- 进程记录还包含 `run_id`、`role` 和已加载框架/profiler 的版本（`versions`）；artifact 条目可带 `global_step`。manifest 增加 `runs` 与 `sessions`（每个 profile session 的时间窗口与 step 专属 artifact），以及 `mixed_runs`（多个 run 且未用 `--run` 选择）、`no_step_window`（所选 step 没有 `global_step` span）问题。
+- 进程以 host、pid 和 run 为键（`<host>:<pid>@<run_id>`），不同 run 复用同一 host/pid 不会混淆；进程登记过的 artifact 直接按登记关系关联。进程记录还包含 `run_id`、`role` 和已加载框架/profiler 的版本（`versions`）；artifact 条目可带 `global_step`。manifest 增加 `runs` 与 `sessions`（每个 profile session 的时间窗口与 step 专属 artifact），以及 `mixed_runs`（多个 run 且未用 `--run` 选择）、`no_step_window`（所选 step 没有 `global_step` span）问题。
 - session 暂定为输入目录下的全部 artifact（每次运行使用独立的 `RL_TRACE_OUTPUT_DIR`）；`run_id` / `profile_session_id` / `global_step` 与 profiler 版本尚未记录。显式 artifact 回传尚未实现，目前依赖共享文件系统。
 
 ### 6.6 全局 identity

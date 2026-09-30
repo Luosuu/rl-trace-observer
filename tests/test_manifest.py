@@ -486,7 +486,7 @@ def test_sessions_are_the_steps_of_a_run(tmp_path):
         (1, "actor_train", "run-a-step-1"),
         (2, "actor_train", "run-a-step-2"),
     ]
-    assert manifest.processes["node-1:10"].role == "trainer"
+    assert manifest.processes["node-1:10@run-a"].role == "trainer"
 
 
 def test_one_step_keeps_its_traces_and_the_spans_in_its_window(tmp_path):
@@ -524,7 +524,7 @@ def test_several_runs_must_be_chosen_between(tmp_path):
     manifest, sources = build_manifest([tmp_path])
     kept = select(manifest, sources, run="run-b")
     assert manifest.problems == []
-    assert [source.process for source in kept] == ["node-2:30"]
+    assert [source.process for source in kept] == ["node-2:30@run-b"]
 
 
 def test_a_step_without_a_window_leaves_rl_insight_spans_out(tmp_path):
@@ -553,3 +553,53 @@ def test_cli_merges_one_step_and_records_the_selection(tmp_path):
     assert names.count("global_step") == 1
 
     assert main([str(artifacts), "-o", str(output), "--run", "run-z"]) == 1
+
+
+def test_a_pid_reused_by_another_run_keeps_each_runs_identity(tmp_path):
+    # The same container ran twice: same hostname and pid, different runs.
+    first, second = tmp_path / "a", tmp_path / "b"
+    for root, run_id in ((first, "run-a"), (second, "run-b")):
+        root.mkdir()
+        _record(root, "node-1", 1, run_id=run_id, artifacts=["rl-insight-node-1-pid-1.chrome.jsonl"])
+        _jsonl(root, "node-1", 1, lines=[_span_line("actor_update", BASE_NS / 1000, 10, 1, "rank_0", run=run_id)])
+        # An idle process of each run left the same empty file.
+        _record(root, "node-1", 2, run_id=run_id, artifacts=["rl-insight-node-1-pid-2.chrome.jsonl"])
+        (root / "rl-insight-node-1-pid-2.chrome.jsonl").touch()
+
+    manifest, sources = build_manifest([tmp_path])
+
+    assert manifest.problems == []
+    assert manifest.runs == ["run-a", "run-b"]
+    assert sorted(source.process for source in sources) == [
+        "node-1:1@run-a",
+        "node-1:1@run-b",
+        "node-1:2@run-a",
+        "node-1:2@run-b",
+    ]
+    kept = select(manifest, sources, run="run-b")
+    assert sorted(source.process for source in kept) == ["node-1:1@run-b", "node-1:2@run-b"]
+
+
+def test_malformed_step_markers_are_incomplete(tmp_path):
+    _record(tmp_path, "node-1", 10, run_id="run-a")
+    _jsonl(
+        tmp_path, "node-1", 10, lines=[_span_line("global_step", BASE_NS / 1000, 10, 10, "trainer", global_step="x")]
+    )
+
+    manifest, sources = build_manifest([tmp_path])
+    select(manifest, sources)
+
+    assert [(problem.kind, problem.detail) for problem in manifest.problems] == [
+        ("incomplete", "1 malformed global_step spans")
+    ]
+
+
+def test_a_step_without_a_window_is_reported_without_rl_insight_sources(tmp_path):
+    _record(tmp_path, "node-1", 20, rank=0, run_id="run-a")
+    _torch(tmp_path, 20, rank=0, step=1)
+
+    manifest, sources = build_manifest([tmp_path])
+    kept = select(manifest, sources, steps=[1])
+
+    assert [problem.kind for problem in manifest.problems] == ["no_step_window"]
+    assert [source.kind for source in kept] == ["torch"]

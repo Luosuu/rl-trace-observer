@@ -65,13 +65,10 @@ class TraceContext:
 
     @classmethod
     def current(cls, **values: Any) -> "TraceContext":
-        """Context of this process; ``values`` fill in what only the caller knows."""
-        return cls(
-            run_id=current_run_id(),
-            hostname=socket.gethostname(),
-            os_pid=os.getpid(),
-            **values,
-        )
+        """Context of this process; ``values`` fill in or override what the caller knows,
+        e.g. a ``run_id`` propagated to a process outside Ray."""
+        defaults = {"run_id": current_run_id(), "hostname": socket.gethostname(), "os_pid": os.getpid()}
+        return cls(**{**defaults, **values})
 
     def to_json(self) -> dict[str, Any]:
         data = asdict(self)

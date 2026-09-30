@@ -4,10 +4,14 @@ A session is the set of artifacts under the merger's inputs. Process records
 (``rl-trace-process-<host>-pid-<pid>.json``) identify each OS process that wrote
 artifacts. The manifest links every artifact to a process:
 
-* RL-Insight JSONL names its host and pid in the filename.
+* An artifact a process registered is linked to that process's record.
+* Otherwise RL-Insight JSONL is matched by the host and pid in its filename.
 * Torch and VizTracer filenames carry only a pid (and a rank), so they are
   matched to the record with that pid, using the rank when several hosts
   reused the same pid.
+
+Processes are keyed by host, pid and run, so a pid reused by another run (e.g.
+a repeated containerized job) is a different process.
 
 Problems are reported instead of raised, so a partial run still merges:
 
@@ -144,8 +148,9 @@ def _read_record(path: Path) -> Process:
         host, os_pid = str(record["host"]), int(record["os_pid"])
         distributed = record.get("torch_distributed") or {}
         ray = record.get("ray")
+        run_id = record.get("run_id")
         return Process(
-            key=f"{host}:{os_pid}",
+            key=f"{host}:{os_pid}" if run_id is None else f"{host}:{os_pid}@{run_id}",
             host=host,
             hostname=record.get("hostname", host),
             os_pid=os_pid,
@@ -154,8 +159,8 @@ def _read_record(path: Path) -> Process:
             ray=ray,
             clock=record.get("clock"),
             record=str(path),
-            artifacts=[str(path.parent / entry["file"]) for entry in record.get("artifacts", [])],
-            run_id=record.get("run_id"),
+            artifacts=[str((path.parent / entry["file"]).resolve()) for entry in record.get("artifacts", [])],
+            run_id=run_id,
             role=record.get("role"),
             versions=dict(record.get("versions") or {}),
         )
@@ -163,10 +168,24 @@ def _read_record(path: Path) -> Process:
         raise ArtifactError(f"Cannot read process record {path}: {error!r}") from error
 
 
-def _link(source: TraceSource, processes: dict[str, Process]) -> tuple[str | None, Problem | None]:
-    """Return the key of the process that wrote ``source``, or the problem why not."""
-    if source.process is not None:
-        return source.process, None
+def _link(
+    source: TraceSource, processes: dict[str, Process], registered_by: dict[str, str]
+) -> tuple[str | None, Problem | None]:
+    """Return the key of the process that wrote ``source``, or the problem why not.
+
+    An RL-Insight source that no record matches returns ``(None, None)``: its
+    filename still names its process.
+    """
+    if (key := registered_by.get(str(source.path))) is not None:
+        return key, None
+    if source.kind == RL_INSIGHT:
+        candidates = [
+            process for process in processes.values() if process.host == source.host and process.os_pid == source.os_pid
+        ]
+        if len(candidates) > 1:
+            runs = ", ".join(sorted(str(process.run_id) for process in candidates))
+            return None, Problem("ambiguous", str(source.path), f"{source.host} pid {source.os_pid} in runs {runs}")
+        return (candidates[0].key if candidates else None), None
     # A process whose known rank differs from the source's cannot have written
     # it, even when it is the only one with that pid (another host's record may
     # be missing).
@@ -208,6 +227,7 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
             manifest.problems.append(Problem("duplicate", str(path), f"second record for process {process.key}"))
             continue
         manifest.processes[process.key] = process
+    registered_by = {path: process.key for process in manifest.processes.values() for path in process.artifacts}
 
     sources: list[TraceSource] = []
     # Artifact names carry the writer's identity (host and pid, or pid and a
@@ -227,7 +247,9 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
             manifest.problems.append(Problem("incomplete", str(path), f"cannot read: {error}"))
             continue
         identity = (path.name, artifact.sha256)
-        if identity in seen:
+        # Empty files hold nothing to merge twice, and idle processes of two
+        # runs that reused a host and pid write identical empty files.
+        if identity in seen and artifact.size_bytes:
             artifact.complete = False
             manifest.problems.append(Problem("duplicate", str(path), f"copy of {seen[identity]}"))
             continue
@@ -245,13 +267,14 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
         artifact.global_step, artifact.role = source.global_step, source.role
         if not source.complete:
             manifest.problems.append(Problem("incomplete", str(path), "final line truncated"))
-        source.process, problem = _link(source, manifest.processes)
+        source.process, problem = _link(source, manifest.processes, registered_by)
         if problem is not None:
             manifest.problems.append(problem)
-        elif source.kind == RL_INSIGHT and source.process not in manifest.processes:
+        elif source.kind == RL_INSIGHT and source.process is None:
             # Older runs wrote no process records; the filename still names the
             # process. Such a process only names the RL-Insight source: it is
             # kept out of linking, where its pid could claim another host's trace.
+            source.process = f"{source.host}:{source.os_pid}"
             fallback.setdefault(
                 source.process,
                 Process(key=source.process, host=source.host, hostname=source.host, os_pid=source.os_pid),
@@ -270,7 +293,7 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
     found_paths = {str(path) for _, path in found}
     for process in manifest.processes.values():
         for registered in process.artifacts:
-            if str(Path(registered).resolve()) not in found_paths:
+            if registered not in found_paths:
                 manifest.problems.append(Problem("missing", registered, f"registered by process {process.key}"))
     return manifest, sources
 
@@ -280,21 +303,30 @@ def _run_of(source: TraceSource, processes: dict[str, Process]) -> str | None:
     return process.run_id if process is not None else None
 
 
-def _step_windows(sources: list[TraceSource], processes: dict[str, Process]) -> dict[tuple, tuple[int, int]]:
+def _step_windows(
+    sources: list[TraceSource], processes: dict[str, Process], problems: list[Problem]
+) -> dict[tuple, tuple[int, int]]:
     """Map ``(run_id, global_step)`` to the step's absolute time window in epoch ns."""
     windows: dict[tuple, tuple[int, int]] = {}
     for source in sources:
         if source.kind != RL_INSIGHT:
             continue
+        malformed = 0
         for event in source.events:
-            args = event.get("args") or {}
-            if event.get("name") != STEP_SPAN_NAME or "global_step" not in args or "ts" not in event:
+            if event.get("name") != STEP_SPAN_NAME:
                 continue
-            start = source.base_ns + round(float(event["ts"]) * 1000)
-            end = start + round(float(event.get("dur", 0)) * 1000)
-            key = (args.get("run_id") or _run_of(source, processes), int(args["global_step"]))
+            try:
+                args = event["args"]
+                start = source.base_ns + round(float(event["ts"]) * 1000)
+                end = start + round(float(event.get("dur", 0)) * 1000)
+                key = (args.get("run_id") or _run_of(source, processes), int(args["global_step"]))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                malformed += 1
+                continue
             previous = windows.get(key)
             windows[key] = (min(start, previous[0]), max(end, previous[1])) if previous else (start, end)
+        if malformed:
+            problems.append(Problem("incomplete", str(source.path), f"{malformed} malformed {STEP_SPAN_NAME} spans"))
     return windows
 
 
@@ -319,7 +351,7 @@ def select(
     """
     steps = sorted(set(steps)) if steps is not None else None
     processes = manifest.processes
-    windows = _step_windows(sources, processes)
+    windows = _step_windows(sources, processes, manifest.problems)
 
     sessions: dict[tuple, ProfileSession] = {}
     for (run_id, step), (start, end) in windows.items():
@@ -353,7 +385,6 @@ def select(
     for artifact in manifest.artifacts:
         # Unreadable artifacts are never merged; readable ones are re-marked below.
         artifact.selected = False
-    missing_windows: set[int] = set()
     kept = []
     for source in sources:
         run_id = _run_of(source, processes)
@@ -366,7 +397,6 @@ def select(
                     for (window_run, step), window in windows.items()
                     if step in steps and (run_id is None or window_run is None or window_run == run_id)
                 ]
-                missing_windows.update(set(steps) - {step for step, _ in own})
                 chosen = [window for _, window in own]
                 source.events = [
                     event
@@ -379,7 +409,13 @@ def select(
         artifacts[str(source.path)].selected = keep
         if keep:
             kept.append(source)
-    for step in sorted(missing_windows):
+    # A chosen step needs a window of the chosen run, whatever sources there are.
+    missing_windows = [
+        step
+        for step in steps or []
+        if not any(key[1] == step and (run is None or key[0] in (run, None)) for key in windows)
+    ]
+    for step in missing_windows:
         manifest.problems.append(
             Problem("no_step_window", inputs, f"no {STEP_SPAN_NAME} span for step {step}; RL-Insight spans left out")
         )

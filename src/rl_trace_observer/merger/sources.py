@@ -151,7 +151,6 @@ def read_rl_insight_jsonl(path: Path) -> TraceSource:
         os_pid=pid,
         host=host,
         complete=complete,
-        process=f"{host}:{pid}",
     )
 
 
