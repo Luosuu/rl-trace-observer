@@ -1,27 +1,26 @@
 """Build the session manifest: which artifacts exist, whose they are, what is wrong.
 
-A session is the set of artifacts under the merger's inputs. Process records
-(``rl-trace-process-<host>-pid-<pid>.json``) identify each OS process that wrote
-artifacts. The manifest links every artifact to a process:
-
-* An artifact a process registered is linked to that process's record.
-* Otherwise RL-Insight JSONL is matched by the host and pid in its filename.
-* Torch and VizTracer filenames carry only a pid (and a rank), so they are
-  matched to the record with that pid, using the rank when several hosts
-  reused the same pid.
+Every process that writes an artifact registers it in its process record
+(``rl-trace-process-<host>-pid-<pid>.json``): RL-Insight JSONL and VizTracer
+reports when they are created, VERL's Torch traces when they are exported. The
+record is the only source of ownership: an artifact belongs to the process
+that registered it, with the step and role it registered. Nothing is inferred
+from filenames, pids or ranks.
 
 Processes are keyed by host, pid and run, so a pid reused by another run (e.g.
 a repeated containerized job) is a different process.
 
 Problems are reported instead of raised, so a partial run still merges:
 
-* ``incomplete``: an artifact cut short or unreadable.
-* ``duplicate``: a copy of an artifact already seen (same file name and content).
+* ``incomplete``: an artifact or record cut short, unreadable or malformed.
+* ``duplicate``: a copy of an artifact already seen (same file name and
+  content), or a second record for one process.
 * ``missing``: an artifact a process registered but that is not in the inputs.
-* ``unlinked`` / ``ambiguous``: no process record, or several, match an artifact.
+* ``unlinked``: an artifact no process registered, e.g. from a run without this
+  package; it is merged on its own.
 
-:func:`select` then groups artifacts by :mod:`rl_trace_observer.context`: every
-process record names its run, profiler windows name their step, and the
+:func:`select` then groups artifacts by run and step: every process record
+names its run, registered profiler artifacts name their step, and the
 trainer's ``global_step`` spans give each step's time window. It keeps one run
 and, optionally, some steps, and reports:
 
@@ -56,14 +55,11 @@ class Process:
     ray: dict[str, Any] | None = None
     clock: dict[str, int] | None = None
     record: str | None = None
-    artifacts: list[str] = field(default_factory=list)
     run_id: str | None = None
     role: str | None = None
     versions: dict[str, str] = field(default_factory=dict)
-    # Last time the process updated its record (epoch ns).
-    updated_wall_time_ns: int | None = None
-    # Registered artifact path -> the global step the process said it covers.
-    artifact_steps: dict[str, int] = field(default_factory=dict)
+    # Registered artifact path -> its record entry (kind, file, global_step, role).
+    artifacts: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def title(self) -> str:
@@ -81,8 +77,6 @@ class Artifact:
     path: str
     size_bytes: int
     sha256: str
-    os_pid: int | None = None
-    rank: int | None = None
     process: str | None = None
     complete: bool = True
     run_id: str | None = None
@@ -147,7 +141,7 @@ def _sha256(path: Path) -> str:
 
 
 # Optional process-record fields and the JSON types they must have.
-_RECORD_FIELDS: dict[str, type | tuple[type, ...]] = {
+_RECORD_FIELDS: dict[str, type] = {
     "hostname": str,
     "run_id": str,
     "role": str,
@@ -156,128 +150,52 @@ _RECORD_FIELDS: dict[str, type | tuple[type, ...]] = {
     "clock": dict,
     "versions": dict,
     "artifacts": list,
-    "updated_wall_time_ns": int,
 }
+_ENTRY_FIELDS: dict[str, type] = {"kind": str, "file": str, "global_step": int, "role": str}
+
+
+def _check_types(data: object, fields: dict[str, type], what: str) -> None:
+    if not isinstance(data, dict):
+        raise TypeError(f"{what} must be a JSON object")
+    for name, expected in fields.items():
+        value = data.get(name)
+        if value is not None and (not isinstance(value, expected) or isinstance(value, bool)):
+            raise TypeError(f"{what} field {name} has the wrong type: {value!r}")
 
 
 def _read_record(path: Path) -> Process:
+    """Read and validate a process record, so later steps can trust it."""
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(record, dict):
-            raise TypeError("a process record must be a JSON object")
+        _check_types(record, _RECORD_FIELDS, "record")
         if record.get("schema_version") != RECORD_SCHEMA_VERSION:
             raise ValueError(f"unsupported schema_version {record.get('schema_version')!r}")
-        # Validate every field up front, so later steps can trust the record.
-        for name, expected in _RECORD_FIELDS.items():
-            value = record.get(name)
-            if value is not None and (not isinstance(value, expected) or isinstance(value, bool)):
-                raise TypeError(f"{name} has the wrong type: {value!r}")
         entries = record.get("artifacts") or []
-        if not all(isinstance(entry, dict) and isinstance(entry.get("file"), str) for entry in entries):
-            raise TypeError("every artifact entry needs a file name")
+        for entry in entries:
+            _check_types(entry, _ENTRY_FIELDS, "artifact entry")
+            if "file" not in entry:
+                raise KeyError("file")
         host, os_pid = str(record["host"]), int(record["os_pid"])
-        distributed, ray = record.get("torch_distributed") or {}, record.get("ray") or {}
         run_id = record.get("run_id")
-        paths = [str((path.parent / entry["file"]).resolve()) for entry in entries]
+        ray = record.get("ray") or {}
         return Process(
             key=f"{host}:{os_pid}" if run_id is None else f"{host}:{os_pid}@{run_id}",
             host=host,
             hostname=record.get("hostname") or host,
             os_pid=os_pid,
-            rank=distributed.get("rank"),
+            rank=(record.get("torch_distributed") or {}).get("rank"),
             actor_name=ray.get("actor_name"),
             ray=record.get("ray"),
             clock=record.get("clock"),
             record=str(path),
-            artifacts=paths,
             run_id=run_id,
             role=record.get("role"),
-            updated_wall_time_ns=record.get("updated_wall_time_ns"),
-            artifact_steps={
-                artifact: int(entry["global_step"])
-                for artifact, entry in zip(paths, entries, strict=True)
-                if entry.get("global_step") is not None
-            },
             versions=dict(record.get("versions") or {}),
+            # Entries are relative to the record, so a copied output directory still links.
+            artifacts={str((path.parent / entry["file"]).resolve()): entry for entry in entries},
         )
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+    except (OSError, ValueError, KeyError, TypeError) as error:
         raise ArtifactError(f"Cannot read process record {path}: {error!r}") from error
-
-
-def _run_spans(processes: dict[str, Process]) -> dict[str, tuple[int, int]]:
-    """Time each run's records cover: its first record to its last update (epoch ns).
-
-    The trainer updates its record after every step, so a run's span ends after
-    its last profiled step starts.
-    """
-    spans: dict[str, tuple[int, int]] = {}
-    for process in processes.values():
-        start = (process.clock or {}).get("wall_time_ns")
-        end = process.updated_wall_time_ns
-        if process.run_id is None or not isinstance(start, int) or not isinstance(end, int):
-            continue
-        previous = spans.get(process.run_id, (start, end))
-        spans[process.run_id] = (min(start, previous[0]), max(end, previous[1]))
-    return spans
-
-
-def _start_ns(source: TraceSource) -> int | None:
-    starts = [float(event["ts"]) for event in source.events if event.get("ph") != "M" and "ts" in event]
-    return source.base_ns + round(min(starts) * 1000) if starts else None
-
-
-def _link(
-    source: TraceSource,
-    processes: dict[str, Process],
-    registered_by: dict[str, str],
-    run_spans: dict[str, tuple[int, int]] | None = None,
-) -> tuple[str | None, Problem | None]:
-    """Return the key of the process that wrote ``source``, or the problem why not.
-
-    An RL-Insight source that no record matches returns ``(None, None)``: its
-    filename still names its process.
-    """
-    if (key := registered_by.get(str(source.path))) is not None:
-        return key, None
-    if source.kind == RL_INSIGHT:
-        candidates = [
-            process for process in processes.values() if process.host == source.host and process.os_pid == source.os_pid
-        ]
-        if len(candidates) > 1:
-            runs = ", ".join(sorted(str(process.run_id) for process in candidates))
-            return None, Problem("ambiguous", str(source.path), f"{source.host} pid {source.os_pid} in runs {runs}")
-        return (candidates[0].key if candidates else None), None
-    # A process whose known rank differs from the source's cannot have written
-    # it, even when it is the only one with that pid (another host's record may
-    # be missing).
-    candidates = [
-        process
-        for process in processes.values()
-        if process.os_pid == source.os_pid
-        and (source.rank is None or process.rank is None or process.rank == source.rank)
-    ]
-    # Prefer the exact rank; records written before torch.distributed was
-    # initialized have none, and several of those stay ambiguous.
-    exact = [process for process in candidates if source.rank is not None and process.rank == source.rank]
-    if len(candidates) > 1 and exact:
-        candidates = exact
-    # Runs that reused the pid (and rank): keep the run whose records span the
-    # trace. VERL's Torch traces are not registered by any process.
-    if len(candidates) > 1 and run_spans and (start := _start_ns(source)) is not None:
-        during = [
-            process
-            for process in candidates
-            if process.run_id in run_spans and run_spans[process.run_id][0] <= start <= run_spans[process.run_id][1]
-        ]
-        if during:
-            candidates = during
-    if len(candidates) == 1:
-        return candidates[0].key, None
-    if not candidates:
-        rank = f" and rank {source.rank}" if source.rank is not None else ""
-        return None, Problem("unlinked", str(source.path), f"no process record for pid {source.os_pid}{rank}")
-    hosts = ", ".join(sorted(process.host for process in candidates))
-    return None, Problem("ambiguous", str(source.path), f"pid {source.os_pid} matches processes on {hosts}")
 
 
 def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceSource]]:
@@ -298,16 +216,17 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
             manifest.problems.append(Problem("duplicate", str(path), f"second record for process {process.key}"))
             continue
         manifest.processes[process.key] = process
-    registered_by = {path: process.key for process in manifest.processes.values() for path in process.artifacts}
-    run_spans = _run_spans(manifest.processes)
+    registered_by = {path: process for process in manifest.processes.values() for path in process.artifacts}
+    manifest.runs = sorted({process.run_id for process in manifest.processes.values() if process.run_id})
 
     sources: list[TraceSource] = []
     # Artifact names carry the writer's identity (host and pid, or pid and a
-    # timestamp), so only a file with both the same name and content is a copy;
-    # e.g. every process without spans writes an identical empty JSONL.
+    # timestamp), so only a file with both the same name and content is a copy.
+    # Empty files are exempt: idle processes of two runs that reused a host and
+    # pid write identical empty JSONL files, and there is nothing to merge twice.
     seen: dict[tuple[str, str], str] = {}
-    fallback: dict[str, Process] = {}
-    for kind, path in found:
+    # Registered files first, so of a file and its copy the copy is the duplicate.
+    for kind, path in sorted(found, key=lambda item: str(item[1]) not in registered_by):
         if kind == PROCESS_RECORD:
             continue
         artifact = Artifact(kind=kind, path=str(path), size_bytes=0, sha256="")
@@ -319,8 +238,6 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
             manifest.problems.append(Problem("incomplete", str(path), f"cannot read: {error}"))
             continue
         identity = (path.name, artifact.sha256)
-        # Empty files hold nothing to merge twice, and idle processes of two
-        # runs that reused a host and pid write identical empty files.
         if identity in seen and artifact.size_bytes:
             artifact.complete = False
             manifest.problems.append(Problem("duplicate", str(path), f"copy of {seen[identity]}"))
@@ -334,40 +251,23 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
             artifact.complete = False
             manifest.problems.append(Problem("incomplete", str(path), str(error) or repr(error)))
             continue
-
-        artifact.os_pid, artifact.rank, artifact.complete = source.os_pid, source.rank, source.complete
-        artifact.global_step, artifact.role = source.global_step, source.role
+        artifact.complete = source.complete
         if not source.complete:
             manifest.problems.append(Problem("incomplete", str(path), "final line truncated"))
-        source.process, problem = _link(source, manifest.processes, registered_by, run_spans)
-        if problem is not None:
-            manifest.problems.append(problem)
-        elif source.kind == RL_INSIGHT and source.process is None:
-            # Older runs wrote no process records; the filename still names the
-            # process. Such a process only names the RL-Insight source: it is
-            # kept out of linking, where its pid could claim another host's trace.
-            source.process = f"{source.host}:{source.os_pid}"
-            fallback.setdefault(
-                source.process,
-                Process(key=source.process, host=source.host, hostname=source.host, os_pid=source.os_pid),
-            )
-        if source.process in manifest.processes:
-            source.host = manifest.processes[source.process].host
-        artifact.process = source.process
+
+        process = registered_by.get(str(path))
+        if process is None:
+            manifest.problems.append(Problem("unlinked", str(path), "no process record registered it"))
+        else:
+            entry = process.artifacts[str(path)]
+            source.process, source.host = process.key, process.host
+            source.global_step = entry.get("global_step")
+            source.role = entry.get("role") or process.role
+            artifact.process, artifact.run_id = process.key, process.run_id
+            artifact.global_step, artifact.role = source.global_step, source.role
+            artifact.profile_session_id = profile_session_id(artifact.run_id, artifact.global_step)
         sources.append(source)
 
-    manifest.processes.update(fallback)
-    readable = {str(source.path): source for source in sources}
-    for artifact in manifest.artifacts:
-        if (process := manifest.processes.get(artifact.process)) is not None:
-            artifact.run_id = process.run_id
-            # The filename's role and step win; the record fills in what it lacks.
-            artifact.role = artifact.role or process.role
-            if artifact.global_step is None and artifact.path in process.artifact_steps:
-                artifact.global_step = process.artifact_steps[artifact.path]
-                readable[artifact.path].global_step = artifact.global_step
-        artifact.profile_session_id = profile_session_id(artifact.run_id, artifact.global_step)
-    manifest.runs = sorted({process.run_id for process in manifest.processes.values() if process.run_id})
     found_paths = {str(path) for _, path in found}
     for process in manifest.processes.values():
         for registered in process.artifacts:
@@ -382,15 +282,9 @@ def _run_of(source: TraceSource, processes: dict[str, Process]) -> str | None:
 
 
 def _step_windows(
-    sources: list[TraceSource],
-    processes: dict[str, Process],
-    problems: list[Problem],
-    marker_runs: dict[str, set[str]],
+    sources: list[TraceSource], processes: dict[str, Process], problems: list[Problem]
 ) -> dict[tuple, tuple[int, int]]:
-    """Map ``(run_id, global_step)`` to the step's absolute time window in epoch ns.
-
-    ``marker_runs`` receives, per source path, the run ids its markers name.
-    """
+    """Map ``(run_id, global_step)`` to the step's absolute time window in epoch ns."""
     windows: dict[tuple, tuple[int, int]] = {}
     for source in sources:
         if source.kind != RL_INSIGHT:
@@ -401,17 +295,15 @@ def _step_windows(
             if event.get("name") != STEP_SPAN_NAME or not isinstance(args, dict) or not args.get(STEP_MARKER_ATTRIBUTE):
                 continue
             try:
-                start = source.base_ns + round(float(event["ts"]) * 1000)
-                end = start + round(float(event.get("dur", 0)) * 1000)
                 marker_run = args.get("run_id")
                 if marker_run is not None and not isinstance(marker_run, str):
                     raise TypeError(f"run_id must be a string, got {marker_run!r}")
+                start = source.base_ns + round(float(event["ts"]) * 1000)
+                end = start + round(float(event.get("dur", 0)) * 1000)
                 key = (marker_run or _run_of(source, processes), int(args["global_step"]))
-            except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+            except (KeyError, TypeError, ValueError, OverflowError):
                 malformed += 1
                 continue
-            if key[0] is not None:
-                marker_runs.setdefault(str(source.path), set()).add(key[0])
             previous = windows.get(key)
             windows[key] = (min(start, previous[0]), max(end, previous[1])) if previous else (start, end)
         if malformed:
@@ -425,43 +317,7 @@ def _overlaps(source: TraceSource, event: dict[str, Any], windows: list[tuple[in
     return any(start <= window_end and end >= window_start for window_start, window_end in windows)
 
 
-def select(
-    manifest: SessionManifest,
-    sources: list[TraceSource],
-    *,
-    run: str | None = None,
-    steps: Iterable[int] | None = None,
-) -> list[TraceSource]:
-    """Record the manifest's profile sessions and keep the sources of ``run`` and ``steps``.
-
-    Torch and VizTracer sources are kept when their step is chosen; RL-Insight
-    sources keep the events that overlap a chosen step's window. Without
-    ``steps`` every step is kept; without ``run`` the inputs must hold one run.
-    """
-    steps = sorted(set(steps)) if steps is not None else None
-    processes = manifest.processes
-    for problem in manifest._selection_problems:
-        manifest.problems.remove(problem)
-    problems: list[Problem] = []
-    marker_runs: dict[str, set[str]] = {}
-    windows = _step_windows(sources, processes, problems, marker_runs)
-
-    # A source without a process record takes the one run its step markers name.
-    artifacts = {artifact.path: artifact for artifact in manifest.artifacts}
-    source_runs = {}
-    for source in sources:
-        run_id = _run_of(source, processes)
-        if run_id is None and len(named := marker_runs.get(str(source.path), set())) == 1:
-            [run_id] = named
-        source_runs[str(source.path)] = run_id
-        artifact = artifacts[str(source.path)]
-        artifact.run_id = run_id
-        artifact.profile_session_id = profile_session_id(run_id, artifact.global_step)
-    manifest.runs = sorted(
-        {process.run_id for process in processes.values() if process.run_id}
-        | {artifact.run_id for artifact in manifest.artifacts if artifact.run_id}
-    )
-
+def _sessions(windows: dict[tuple, tuple[int, int]], artifacts: list[Artifact]) -> list[ProfileSession]:
     sessions: dict[tuple, ProfileSession] = {}
     for (run_id, step), (start, end) in windows.items():
         sessions[(run_id, step)] = ProfileSession(
@@ -471,12 +327,11 @@ def select(
             start_time_ns=start,
             end_time_ns=end,
         )
-    for artifact in manifest.artifacts:
+    for artifact in artifacts:
         if artifact.global_step is None:
             continue
-        key = (artifact.run_id, artifact.global_step)
         session = sessions.setdefault(
-            key,
+            (artifact.run_id, artifact.global_step),
             ProfileSession(
                 id=artifact.profile_session_id or f"step-{artifact.global_step}",
                 run_id=artifact.run_id,
@@ -484,18 +339,59 @@ def select(
             ),
         )
         session.artifacts.append(artifact.path)
-    manifest.sessions = sorted(sessions.values(), key=lambda session: (session.run_id or "", session.global_step))
+    return sorted(sessions.values(), key=lambda session: (session.run_id or "", session.global_step))
+
+
+def _cut_to_windows(source: TraceSource, windows: list[tuple[int, int]], problems: list[Problem]) -> TraceSource:
+    """A copy of ``source`` with the events that overlap ``windows``; the original stays whole."""
+    events, malformed = [], 0
+    for event in source.events:
+        if event.get("ph") == "M" or "ts" not in event:
+            events.append(event)
+            continue
+        try:
+            if _overlaps(source, event, windows):
+                events.append(event)
+        except (TypeError, ValueError, OverflowError):
+            malformed += 1
+    if malformed:
+        problems.append(Problem("incomplete", str(source.path), f"{malformed} events with a malformed time"))
+    return replace(source, events=events)
+
+
+def select(
+    manifest: SessionManifest,
+    sources: list[TraceSource],
+    *,
+    run: str | None = None,
+    steps: Iterable[int] | None = None,
+) -> list[TraceSource]:
+    """Record the manifest's profile sessions and keep the sources of ``run`` and ``steps``.
+
+    Torch and VizTracer sources are kept when their registered step is chosen;
+    RL-Insight sources keep the events that overlap a chosen step's window.
+    Without ``steps`` every step is kept; without ``run`` the inputs must hold
+    one run. Repeated calls start from the same ``sources``.
+    """
+    steps = sorted(set(steps)) if steps is not None else None
+    processes = manifest.processes
+    for problem in manifest._selection_problems:
+        manifest.problems.remove(problem)
+    problems: list[Problem] = []
+    windows = _step_windows(sources, processes, problems)
+    manifest.sessions = _sessions(windows, manifest.artifacts)
 
     inputs = ", ".join(manifest.inputs)
     if run is None and len(manifest.runs) > 1:
         problems.append(Problem("mixed_runs", inputs, f"artifacts of runs {', '.join(manifest.runs)}"))
 
+    artifacts = {artifact.path: artifact for artifact in manifest.artifacts}
     for artifact in manifest.artifacts:
         # Unreadable artifacts are never merged; readable ones are re-marked below.
         artifact.selected = False
     kept = []
     for source in sources:
-        run_id = source_runs[str(source.path)]
+        run_id = _run_of(source, processes)
         keep = run is None or run_id == run
         if keep and steps is not None:
             if source.kind == RL_INSIGHT:
@@ -505,38 +401,19 @@ def select(
                     for (window_run, step), window in windows.items()
                     if step in steps and (run_id is None or window_run is None or window_run == run_id)
                 ]
-                events, malformed = [], 0
-                for event in source.events:
-                    if event.get("ph") == "M" or "ts" not in event:
-                        events.append(event)
-                        continue
-                    try:
-                        if _overlaps(source, event, chosen):
-                            events.append(event)
-                    except (TypeError, ValueError, OverflowError):
-                        malformed += 1
-                if malformed:
-                    problems.append(
-                        Problem("incomplete", str(source.path), f"{malformed} events with a malformed time")
-                    )
-                # A copy: the caller's sources stay whole for another selection.
-                source = replace(source, events=events)
+                source = _cut_to_windows(source, chosen, problems)
                 keep = bool(chosen)
             else:
                 keep = source.global_step in steps
         artifacts[str(source.path)].selected = keep
         if keep:
             kept.append(source)
+
     # A chosen step needs a window of the chosen run, whatever sources there are.
-    missing_windows = [
-        step
-        for step in steps or []
-        if not any(key[1] == step and (run is None or key[0] in (run, None)) for key in windows)
-    ]
-    for step in missing_windows:
-        problems.append(
-            Problem("no_step_window", inputs, f"no {STEP_SPAN_NAME} span for step {step}; RL-Insight spans left out")
-        )
+    for step in steps or []:
+        if not any(key[1] == step and (run is None or key[0] in (run, None)) for key in windows):
+            detail = f"no {STEP_SPAN_NAME} span for step {step}; RL-Insight spans left out"
+            problems.append(Problem("no_step_window", inputs, detail))
     manifest.problems.extend(problems)
     manifest._selection_problems = problems
     return kept

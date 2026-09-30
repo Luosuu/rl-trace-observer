@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from rl_trace_observer.integrations.verl import steps
+from rl_trace_observer.integrations.verl.import_hook import when_imported
 from rl_trace_observer.process_record import record_path
 
 
@@ -46,7 +47,7 @@ def spans(monkeypatch, tmp_path):
 
 
 def test_step_is_marked_once_the_trainer_module_is_imported(trainer_module, spans):
-    steps.when_imported(trainer_module, steps.patch_trainer)
+    when_imported(trainer_module, steps.patch_trainer)
     module = importlib.import_module(trainer_module)
 
     metrics = {}
@@ -69,7 +70,7 @@ def test_step_is_marked_once_the_trainer_module_is_imported(trainer_module, span
 
 
 def test_step_is_marked_even_when_it_fails(trainer_module, spans):
-    steps.when_imported(trainer_module, steps.patch_trainer)
+    when_imported(trainer_module, steps.patch_trainer)
     module = importlib.import_module(trainer_module)
 
     with pytest.raises(TypeError):
@@ -80,14 +81,14 @@ def test_step_is_marked_even_when_it_fails(trainer_module, spans):
 def test_already_imported_module_is_patched_immediately(trainer_module, spans):
     module = importlib.import_module(trainer_module)
 
-    steps.when_imported(trainer_module, steps.patch_trainer)
+    when_imported(trainer_module, steps.patch_trainer)
 
     module.PPOTrainer().step({}, {})
     assert len(spans) == 1
 
 
 def test_patched_module_keeps_its_source(trainer_module, spans):
-    steps.when_imported(trainer_module, steps.patch_trainer)
+    when_imported(trainer_module, steps.patch_trainer)
     module = importlib.import_module(trainer_module)
 
     # Tracebacks and inspect read the source through the module's loader.

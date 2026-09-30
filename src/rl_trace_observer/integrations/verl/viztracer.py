@@ -30,7 +30,7 @@ class VizTracerObserver:
         )
         try:
             step = int(profile_step) if str(profile_step).isdigit() else None
-            register_artifact(output_dir, "viztracer", output_file, global_step=step)
+            register_artifact(output_dir, "viztracer", output_file, global_step=step, role=str(role))
         except Exception:
             logger.exception("Failed to write the process record for %s", output_file)
         self._tracer = VizTracer(

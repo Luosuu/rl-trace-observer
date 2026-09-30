@@ -43,11 +43,6 @@ _VIZTRACER_FILE = re.compile(
 # iteration markers ("Traces") and window-end instants (empty pid). GPU devices
 # use integer pids and are kept.
 _KINETO_BOOKKEEPING_PIDS = frozenset({"Spans", "Traces", ""})
-_TORCH_RANK = re.compile(r"_rank(?P<rank>\d+)(?:-of-\d+)?(?:_|$)")
-# build_trace_basename: [<save_file_prefix>_][<role>_][step<n>_]rank<r>...
-# The step is the segment right before the rank; a save_file_prefix may contain "step<n>" too.
-_TORCH_STEP = re.compile(r"(?:^|_)step(?P<step>\d+)_rank\d+")
-_TORCH_ROLE = re.compile(r"^(?P<role>.+?)_(?:step\d+_)?rank\d+")
 
 
 class ArtifactError(ValueError):
@@ -64,14 +59,13 @@ class TraceSource:
     base_ns: int
     events: list[dict[str, Any]]
     os_pid: int
-    rank: int | None = None
     host: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     # False when the artifact was cut short, e.g. a worker killed mid-write.
     complete: bool = True
     # Key of the OS process this artifact belongs to ("<host>:<pid>"), once known.
     process: str | None = None
-    # The training step a profiler window covers; RL-Insight sources span steps.
+    # Registered by the writing process; RL-Insight sources span steps.
     global_step: int | None = None
     role: str | None = None
 
@@ -178,11 +172,6 @@ def read_torch_trace(path: Path) -> TraceSource:
     data = _load_json(path)
     label, pid = match["label"], int(match["pid"])
     events = [event for event in data.get("traceEvents", []) if event.get("pid") not in _KINETO_BOOKKEEPING_PIDS]
-    # Kineto records the torch.distributed rank once the process group exists;
-    # VERL's filename carries the rank it was given otherwise.
-    rank = data.get("distributedInfo", {}).get("rank")
-    if rank is None and (rank_match := _TORCH_RANK.search(label)):
-        rank = int(rank_match["rank"])
     return TraceSource(
         kind=TORCH,
         path=path,
@@ -190,10 +179,7 @@ def read_torch_trace(path: Path) -> TraceSource:
         base_ns=_anchor(data.get("baseTimeNanoseconds"), path, "baseTimeNanoseconds"),
         events=events,
         os_pid=pid,
-        rank=rank,
         labels={"label": label},
-        global_step=int(step_match["step"]) if (step_match := _TORCH_STEP.search(label)) else None,
-        role=role_match["role"] if (role_match := _TORCH_ROLE.match(label)) else None,
     )
 
 
@@ -212,8 +198,5 @@ def read_viztracer_trace(path: Path) -> TraceSource:
         base_ns=_anchor(metadata.get("baseTimeNanoseconds"), path, "viztracer_metadata.baseTimeNanoseconds"),
         events=list(data.get("traceEvents", [])),
         os_pid=pid,
-        rank=rank,
         labels={"step": step, "role": role},
-        global_step=int(step) if step.isdigit() else None,
-        role=role,
     )

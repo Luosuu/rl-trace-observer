@@ -118,9 +118,12 @@ Inputs are files or directories, searched recursively for:
 Every process that writes an artifact also writes a process record with its
 hostname, pid, run id, role, Ray job/node/actor identity, `torch.distributed`
 rank, the versions of the profilers and frameworks it loaded, a wall/monotonic
-clock snapshot and the files it registered. The merger uses the records to link
-Torch and VizTracer traces, whose filenames carry only a pid, to their host: by
-pid, and by rank when several hosts reused a pid.
+clock snapshot and the files it registered, each with its step and role.
+RL-Insight and VizTracer register their files when they create them; VERL's
+Torch traces are registered when VERL exports them. The merger links an artifact
+only through the record that registered it, and never infers ownership from a
+filename, pid or rank; an artifact nobody registered (e.g. from a run without
+this package) is reported as `unlinked` and merged as a process of its own.
 
 ### Runs and profiled steps
 
@@ -159,8 +162,7 @@ with its size, sha256, process and completeness, and the problems found:
 | `incomplete` | an artifact was cut short (truncated JSONL line), cannot be read or is malformed; or a process record has an unsupported `schema_version` |
 | `duplicate` | a non-empty artifact is a copy of another input (same file name and content), and is merged once |
 | `missing` | a process registered an artifact that is not in the inputs |
-| `unlinked` | no process record matches a Torch or VizTracer trace's pid (and, when both are known, rank) |
-| `ambiguous` | several process records match and the rank cannot tell them apart |
+| `unlinked` | no process record registered the artifact; it is merged on its own |
 | `mixed_runs` | the inputs hold artifacts of several runs and `--run` chose none |
 | `no_step_window` | a `--step` has no `global_step` span, so RL-Insight spans are left out |
 
