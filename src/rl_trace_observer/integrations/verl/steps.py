@@ -17,7 +17,7 @@ import time
 from collections.abc import Callable
 from types import ModuleType
 
-from rl_trace_observer.context import STEP_SPAN_NAME, current_run_id
+from rl_trace_observer.context import STEP_MARKER_ATTRIBUTE, STEP_SPAN_NAME, current_run_id
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ def _emit_step_span(trainer: object, start_time_ns: int, end_time_ns: int) -> No
     global_step = getattr(trainer, "global_steps", None)
     if global_step is None:
         return
-    attributes = {"state_lane_id": "trainer", "global_step": int(global_step)}
+    attributes = {"state_lane_id": "trainer", "global_step": int(global_step), STEP_MARKER_ATTRIBUTE: True}
     if run_id := current_run_id():
         attributes["run_id"] = run_id
     RLInsightLogger.trace_span(

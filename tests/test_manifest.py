@@ -5,15 +5,18 @@ import socket
 
 import pytest
 
-from rl_trace_observer.merger import build_manifest, merge_sources, select
+from rl_trace_observer.context import STEP_MARKER_ATTRIBUTE
+from rl_trace_observer.merger import build_manifest, merge_sources, read_source, select
 from rl_trace_observer.merger.cli import main
+from rl_trace_observer.merger.sources import TORCH
 from rl_trace_observer.output import safe_component
 from rl_trace_observer.process_record import SCHEMA_VERSION, record_path, register_artifact
 
 BASE_NS = 1_790_000_000_000_000_000
+MARKER = {STEP_MARKER_ATTRIBUTE: True}
 
 
-def _record(root, host, pid, *, rank=None, actor=None, artifacts=(), run_id=None, role=None):
+def _record(root, host, pid, *, rank=None, actor=None, artifacts=(), run_id=None, role=None, lifetime_ns=None):
     path = root / f"rl-trace-process-{host}-pid-{pid}.json"
     path.write_text(
         json.dumps(
@@ -27,6 +30,11 @@ def _record(root, host, pid, *, rank=None, actor=None, artifacts=(), run_id=None
                 "artifacts": [{"kind": "rl_insight_jsonl", "file": name} for name in artifacts],
                 "run_id": run_id,
                 "role": role,
+                **(
+                    {"clock": {"wall_time_ns": lifetime_ns[0]}, "updated_wall_time_ns": lifetime_ns[1]}
+                    if lifetime_ns
+                    else {}
+                ),
             }
         )
     )
@@ -449,8 +457,8 @@ def _two_step_run(root, run_id="run-a"):
         "node-1",
         10,
         lines=[
-            _span_line("global_step", base_us, 1000, 10, "trainer", global_step=1, run_id=run_id),
-            _span_line("global_step", base_us + 2000, 1000, 10, "trainer", global_step=2, run_id=run_id),
+            _span_line("global_step", base_us, 1000, 10, "trainer", **MARKER, global_step=1, run_id=run_id),
+            _span_line("global_step", base_us + 2000, 1000, 10, "trainer", **MARKER, global_step=2, run_id=run_id),
         ],
     )
     _record(root, "node-1", 20, rank=0, run_id=run_id)
@@ -583,7 +591,10 @@ def test_a_pid_reused_by_another_run_keeps_each_runs_identity(tmp_path):
 def test_malformed_step_markers_are_incomplete(tmp_path):
     _record(tmp_path, "node-1", 10, run_id="run-a")
     _jsonl(
-        tmp_path, "node-1", 10, lines=[_span_line("global_step", BASE_NS / 1000, 10, 10, "trainer", global_step="x")]
+        tmp_path,
+        "node-1",
+        10,
+        lines=[_span_line("global_step", BASE_NS / 1000, 10, 10, "trainer", **MARKER, global_step="x")],
     )
 
     manifest, sources = build_manifest([tmp_path])
@@ -603,3 +614,39 @@ def test_a_step_without_a_window_is_reported_without_rl_insight_sources(tmp_path
 
     assert [problem.kind for problem in manifest.problems] == ["no_step_window"]
     assert [source.kind for source in kept] == ["torch"]
+
+
+def test_a_torch_trace_of_a_reused_pid_and_rank_links_to_the_run_it_ran_in(tmp_path):
+    # Torch traces are not registered, so the records' lifetimes tell the runs apart.
+    hour = 3_600_000_000_000
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    _record(tmp_path / "a", "node-1", 7, rank=0, run_id="run-a", lifetime_ns=(BASE_NS - 2 * hour, BASE_NS - hour))
+    _record(tmp_path / "b", "node-1", 7, rank=0, run_id="run-b", lifetime_ns=(BASE_NS - 1_000, BASE_NS + hour))
+    _torch(tmp_path, 7, rank=0)
+
+    manifest, sources = build_manifest([tmp_path])
+
+    assert manifest.problems == []
+    assert [source.process for source in sources] == ["node-1:7@run-b"]
+
+
+def test_a_user_span_named_global_step_is_not_a_step_marker(tmp_path):
+    _record(tmp_path, "node-1", 10, run_id="run-a")
+    _jsonl(tmp_path, "node-1", 10, lines=[_span_line("global_step", BASE_NS / 1000, 10, 10, "app", step="warmup")])
+
+    manifest, sources = build_manifest([tmp_path])
+    select(manifest, sources)
+
+    assert manifest.problems == []
+    assert manifest.sessions == []
+
+
+def test_torch_step_is_the_one_next_to_the_rank(tmp_path):
+    path = _torch(tmp_path, 1234, rank=0, step=1)
+    renamed = path.with_name("step99_" + path.name)
+    path.rename(renamed)
+
+    source = read_source(TORCH, renamed)
+
+    assert (source.global_step, source.role) == (1, "step99_actor_train")

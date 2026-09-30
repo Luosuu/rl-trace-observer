@@ -37,7 +37,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from rl_trace_observer.context import STEP_SPAN_NAME, profile_session_id
+from rl_trace_observer.context import STEP_MARKER_ATTRIBUTE, STEP_SPAN_NAME, profile_session_id
 from rl_trace_observer.process_record import SCHEMA_VERSION as RECORD_SCHEMA_VERSION
 
 from .sources import PROCESS_RECORD, RL_INSIGHT, ArtifactError, TraceSource, discover, read_source
@@ -60,6 +60,8 @@ class Process:
     run_id: str | None = None
     role: str | None = None
     versions: dict[str, str] = field(default_factory=dict)
+    # Last time the process updated its record (epoch ns).
+    updated_wall_time_ns: int | None = None
 
     @property
     def title(self) -> str:
@@ -162,14 +164,40 @@ def _read_record(path: Path) -> Process:
             artifacts=[str((path.parent / entry["file"]).resolve()) for entry in record.get("artifacts", [])],
             run_id=run_id,
             role=record.get("role"),
+            updated_wall_time_ns=record.get("updated_wall_time_ns"),
             versions=dict(record.get("versions") or {}),
         )
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise ArtifactError(f"Cannot read process record {path}: {error!r}") from error
 
 
+def _run_spans(processes: dict[str, Process]) -> dict[str, tuple[int, int]]:
+    """Time each run's records cover: its first record to its last update (epoch ns).
+
+    The trainer updates its record after every step, so a run's span ends after
+    its last profiled step starts.
+    """
+    spans: dict[str, tuple[int, int]] = {}
+    for process in processes.values():
+        start = (process.clock or {}).get("wall_time_ns")
+        end = process.updated_wall_time_ns
+        if process.run_id is None or not isinstance(start, int) or not isinstance(end, int):
+            continue
+        previous = spans.get(process.run_id, (start, end))
+        spans[process.run_id] = (min(start, previous[0]), max(end, previous[1]))
+    return spans
+
+
+def _start_ns(source: TraceSource) -> int | None:
+    starts = [float(event["ts"]) for event in source.events if event.get("ph") != "M" and "ts" in event]
+    return source.base_ns + round(min(starts) * 1000) if starts else None
+
+
 def _link(
-    source: TraceSource, processes: dict[str, Process], registered_by: dict[str, str]
+    source: TraceSource,
+    processes: dict[str, Process],
+    registered_by: dict[str, str],
+    run_spans: dict[str, tuple[int, int]] | None = None,
 ) -> tuple[str | None, Problem | None]:
     """Return the key of the process that wrote ``source``, or the problem why not.
 
@@ -200,6 +228,16 @@ def _link(
     exact = [process for process in candidates if source.rank is not None and process.rank == source.rank]
     if len(candidates) > 1 and exact:
         candidates = exact
+    # Runs that reused the pid (and rank): keep the run whose records span the
+    # trace. VERL's Torch traces are not registered by any process.
+    if len(candidates) > 1 and run_spans and (start := _start_ns(source)) is not None:
+        during = [
+            process
+            for process in candidates
+            if process.run_id in run_spans and run_spans[process.run_id][0] <= start <= run_spans[process.run_id][1]
+        ]
+        if during:
+            candidates = during
     if len(candidates) == 1:
         return candidates[0].key, None
     if not candidates:
@@ -228,6 +266,7 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
             continue
         manifest.processes[process.key] = process
     registered_by = {path: process.key for process in manifest.processes.values() for path in process.artifacts}
+    run_spans = _run_spans(manifest.processes)
 
     sources: list[TraceSource] = []
     # Artifact names carry the writer's identity (host and pid, or pid and a
@@ -267,7 +306,7 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
         artifact.global_step, artifact.role = source.global_step, source.role
         if not source.complete:
             manifest.problems.append(Problem("incomplete", str(path), "final line truncated"))
-        source.process, problem = _link(source, manifest.processes, registered_by)
+        source.process, problem = _link(source, manifest.processes, registered_by, run_spans)
         if problem is not None:
             manifest.problems.append(problem)
         elif source.kind == RL_INSIGHT and source.process is None:
@@ -313,10 +352,10 @@ def _step_windows(
             continue
         malformed = 0
         for event in source.events:
-            if event.get("name") != STEP_SPAN_NAME:
+            args = event.get("args")
+            if event.get("name") != STEP_SPAN_NAME or not isinstance(args, dict) or not args.get(STEP_MARKER_ATTRIBUTE):
                 continue
             try:
-                args = event["args"]
                 start = source.base_ns + round(float(event["ts"]) * 1000)
                 end = start + round(float(event.get("dur", 0)) * 1000)
                 key = (args.get("run_id") or _run_of(source, processes), int(args["global_step"]))

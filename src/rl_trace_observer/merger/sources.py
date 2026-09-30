@@ -45,7 +45,8 @@ _VIZTRACER_FILE = re.compile(
 _KINETO_BOOKKEEPING_PIDS = frozenset({"Spans", "Traces", ""})
 _TORCH_RANK = re.compile(r"_rank(?P<rank>\d+)(?:-of-\d+)?(?:_|$)")
 # build_trace_basename: [<save_file_prefix>_][<role>_][step<n>_]rank<r>...
-_TORCH_STEP = re.compile(r"(?:^|_)step(?P<step>\d+)(?:_|$)")
+# The step is the segment right before the rank; a save_file_prefix may contain "step<n>" too.
+_TORCH_STEP = re.compile(r"(?:^|_)step(?P<step>\d+)_rank\d+")
 _TORCH_ROLE = re.compile(r"^(?P<role>.+?)_(?:step\d+_)?rank\d+")
 
 

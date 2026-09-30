@@ -20,8 +20,10 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 RUN_ID_ENV = "RL_TRACE_RUN_ID"
-# RL-Insight span the trainer records around each training step.
+# RL-Insight span the trainer records around each training step, told apart
+# from any user span of the same name by the marker attribute.
 STEP_SPAN_NAME = "global_step"
+STEP_MARKER_ATTRIBUTE = "rl_trace_observer.step_marker"
 
 
 def current_run_id() -> str | None:

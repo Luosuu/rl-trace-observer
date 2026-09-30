@@ -54,7 +54,12 @@ def test_step_is_marked_once_the_trainer_module_is_imported(trainer_module, span
     assert metrics == {"ran": True}
     [(name, span)] = spans
     assert name == "global_step"
-    assert span["attributes"] == {"state_lane_id": "trainer", "global_step": 3, "run_id": "run-a"}
+    assert span["attributes"] == {
+        "state_lane_id": "trainer",
+        "global_step": 3,
+        "run_id": "run-a",
+        "rl_trace_observer.step_marker": True,
+    }
     assert span["start_time_ns"] <= span["end_time_ns"]
     # Patching twice does not wrap twice.
     assert steps.patch_trainer(module) is False
