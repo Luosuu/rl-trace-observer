@@ -63,6 +63,15 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+def _die_with_parent() -> None:
+    """Have Linux stop the server when this actor's process exits, e.g. when Ray kills it."""
+    if sys.platform == "linux":
+        import ctypes
+        import signal
+
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+
+
 def _readable_json(path: Path) -> bool:
     try:
         json.loads(path.read_text(encoding="utf-8"))
@@ -143,7 +152,9 @@ class TokenSpeedServer:
         command = self._command()
         logger.info("Replica %d: launching %s", self.replica_rank, shlex.join(command))
         # Output goes to this actor's Ray log.
-        self._process = subprocess.Popen(command, env=env, stdout=sys.stdout, stderr=sys.stderr)
+        self._process = subprocess.Popen(
+            command, env=env, stdout=sys.stdout, stderr=sys.stderr, preexec_fn=_die_with_parent
+        )
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=30))
 
         deadline = time.monotonic() + float(os.environ.get(STARTUP_TIMEOUT_ENV, "1800"))
@@ -171,7 +182,7 @@ class TokenSpeedServer:
         except Exception:
             logger.debug("No process record for the TokenSpeed server actor", exc_info=True)
 
-    def __del__(self):
+    def shutdown(self) -> None:
         if self._process is not None and self._process.poll() is None:
             self._process.terminate()
 
