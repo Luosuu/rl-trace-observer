@@ -4,6 +4,9 @@ RL-Insight spans carry no step, so the driver records one ``global_step`` span
 per step of VERL's v1 trainer (``PPOTrainer.step``: rollout and training). The
 merger uses these spans as the time window of each profile session.
 
+It also tells a TokenSpeed rollout which step it profiles: VERL starts rollout
+profiling without naming the step.
+
 ``PPOTrainer`` lives in a heavy module that the plugin must not import itself,
 so the patch is applied when VERL imports it.
 """
@@ -63,8 +66,18 @@ def patch_trainer(module: ModuleType) -> bool:
             except Exception:
                 logger.exception("Failed to record the global_step span")
 
+    original_start_profiling = trainer_class._start_rollout_profiling
+
+    @functools.wraps(original_start_profiling)
+    def _start_rollout_profiling(self):
+        if self.config.actor_rollout_ref.rollout.name != "tokenspeed":
+            return original_start_profiling(self)
+        for manager in self._rollout_server_managers():
+            manager.start_profile(global_step=self.global_steps)
+
     setattr(step, _PATCHED, True)
     trainer_class.step = step
+    trainer_class._start_rollout_profiling = _start_rollout_profiling
     return True
 
 

@@ -103,6 +103,17 @@ def classify(path: Path) -> str | None:
     return None
 
 
+def tokenspeed_profile_file(path: Path) -> tuple[str, str, str] | None:
+    """Return ``(kind, profile_id, rank_tag)`` for a TokenSpeed profile file, or ``None``."""
+    for kind, pattern in (
+        (TOKENSPEED_VIZTRACER, _TOKENSPEED_VIZTRACER_FILE),
+        (TOKENSPEED_PROTON, _TOKENSPEED_PROTON_FILE),
+    ):
+        if match := pattern.match(path.name):
+            return kind, match["profile_id"], match["rank_tag"]
+    return None
+
+
 def discover(paths: Iterable[Path]) -> list[tuple[str, Path]]:
     """Find artifacts and process records in the given files and directories (recursively)."""
     found: dict[Path, str] = {}
