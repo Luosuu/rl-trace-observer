@@ -7,11 +7,13 @@ through TokenSpeed's control port, which serves SGLang-style ``/generate`` and
 the RL control routes; TokenSpeed itself is not modified.
 
 Profiling: each profiled step asks TokenSpeed for ``VIZTRACER`` and ``PROTON``
-traces (``RL_TRACE_TOKENSPEED_PROFILE_ACTIVITIES``) under
-``<RL_TRACE_OUTPUT_DIR>/rollout/replica<r>`` with ``profile_id
-<run_id>-step-<n>``. The scheduler processes never load this package, so once
-``/stop_profile`` returns this actor registers each rank's files in its own
-process record, with the step and the scheduler's ``rank_tag``.
+traces (``RL_TRACE_TOKENSPEED_PROFILE_ACTIVITIES``) in a directory of its own,
+``<RL_TRACE_OUTPUT_DIR>/rollout/replica<r>/<run_id>-step-<n>``. The directory,
+not the file name, identifies the profile: ``tokenspeed serve`` names the files
+after a timestamp whatever ``profile_id`` is sent. The scheduler processes
+never load this package, so once ``/stop_profile`` returns this actor registers
+each rank's files in its own process record, with the step and the scheduler's
+``rank_tag``.
 """
 
 import asyncio
@@ -313,15 +315,15 @@ class TokenSpeedServer:
         activities = [activity for activity in activities if activity]
         if not activities or self._profile is not None:
             return
+        run_id = current_run_id() or "run"
+        profile_id = profile_session_id(run_id, global_step) or f"{run_id}-{time.strftime('%Y%m%d-%H%M%S')}"
         try:
-            from rl_trace_observer.output import trace_output_dir
+            from rl_trace_observer.output import safe_component, trace_output_dir
 
-            output_dir = trace_output_dir() / "rollout" / f"replica{self.replica_rank}"
+            output_dir = trace_output_dir() / "rollout" / f"replica{self.replica_rank}" / safe_component(profile_id)
         except ValueError as error:
             logger.warning("Not profiling TokenSpeed: %s", error)
             return
-        run_id = current_run_id() or "run"
-        profile_id = profile_session_id(run_id, global_step) or f"{run_id}-{time.strftime('%Y%m%d-%H%M%S')}"
         body = {"output_dir": str(output_dir), "activities": activities, "profile_id": profile_id}
         try:
             await self._post("/start_profile", body, timeout=300)
@@ -357,9 +359,9 @@ class TokenSpeedServer:
         deadline = time.monotonic() + ARTIFACT_WAIT_SECONDS
         while True:
             files = {}
-            for path in sorted(output_dir.glob(f"{profile_id}-*")) if output_dir.is_dir() else []:
+            for path in sorted(output_dir.iterdir()) if output_dir.is_dir() else []:
                 parsed = tokenspeed_profile_file(path)
-                if parsed and parsed[0] in kinds and parsed[1] == profile_id and _readable_json(path):
+                if parsed and parsed[0] in kinds and _readable_json(path):
                     files[path] = parsed
             if len(files) >= expected or time.monotonic() > deadline:
                 break

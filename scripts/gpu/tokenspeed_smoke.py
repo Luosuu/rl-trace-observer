@@ -7,11 +7,10 @@ Launches ``tokenspeed serve`` (TP=2 by default), then checks and records:
    VizTracer report and one Proton Chrome trace per TP rank, each with its
    ``baseTimeNanoseconds`` anchor;
 3. releasing and resuming weights and KV cache keeps generation working;
-4. weights sent the way the VERL rollout sends them (released, weights resumed,
-   NCCL group from a "trainer" on the next GPU, buckets broadcast with
-   ``/update_weights_from_distributed``) are loaded: zeroing the final norm
-   changes greedy output and sending the original weights restores it, with
-   and without ``/pause_generation`` around the update;
+4. weights broadcast from a "trainer" on the next GPU through
+   ``/update_weights_from_distributed`` are loaded, for each way of wrapping
+   the update (``SYNC_PROTOCOLS``): zeroing the final norm changes greedy
+   output and sending the original weights restores it;
 5. ``rl-trace-merge`` and ``tokenspeed merge-traces --all-ranks`` both merge
    the profile.
 
@@ -124,18 +123,38 @@ def _run(function, timeout: float, name: str, on_timeout=None):
     return result.get("value")
 
 
+# How a weight update is wrapped: the server state around /update_weights_from_distributed.
+# "verl" is the order of VERL's hybrid trainer: sleep, wake the weights, update, wake the KV cache.
+SYNC_PROTOCOLS = {
+    "awake": ([], []),
+    "awake_pause": ([("/pause_generation", None)], [("/continue_generation", None)]),
+    "kv_released": (
+        [("/release_memory_occupation", ["kv_cache"])],
+        [("/resume_memory_occupation", ["kv_cache"])],
+    ),
+    "full_cycle": (
+        [
+            ("/release_memory_occupation", ["kv_cache", "weights"]),
+            ("/resume_memory_occupation", ["kv_cache", "weights"]),
+        ],
+        [],
+    ),
+    "verl": (
+        [("/release_memory_occupation", ["kv_cache", "weights"]), ("/resume_memory_occupation", ["weights"])],
+        [("/resume_memory_occupation", ["kv_cache"])],
+    ),
+}
+
+
 class _WeightSync:
     """One server receiving weights from a "trainer" rank on the next GPU, like TokenSpeedServerAdapter."""
 
-    def __init__(self, model_path: str, tp: int, out: Path, prompt: list[int], pause: bool):
-        import torch
-
+    def __init__(self, model_path: str, tp: int, out: Path, prompt: list[int], protocol: str):
         from rl_trace_observer.integrations.tokenspeed.adapter import _join_group
 
-        self.prompt, self.pause, self.out = prompt, pause, out
-        self.device = torch.device("cuda", tp)
-        self.group_name = f"smoke_{int(pause)}"
-        self.server = Server(model_path, tp, out / f"weight_sync_server_pause{int(pause)}.log")
+        self.prompt, self.protocol, self.out, self.tp = prompt, protocol, out, tp
+        self.group_name = f"smoke_{protocol}_{tp}"
+        self.server = Server(model_path, tp, out / f"weight_sync_{protocol}_tp{tp}.log")
         port = _free_port()
         body = {
             "master_address": "127.0.0.1",
@@ -145,27 +164,24 @@ class _WeightSync:
             "group_name": self.group_name,
             "backend": "nccl",
         }
-        self.server.post("/release_memory_occupation", {"tags": ["kv_cache", "weights"]})
-        self.server.post("/resume_memory_occupation", {"tags": ["weights"]})
         with concurrent.futures.ThreadPoolExecutor(1) as pool:
-            joined = pool.submit(self.server.post, "/init_weights_update_group", body, 300)
+            joined = pool.submit(self.server.post, "/init_weights_update_group", body, 120)
             self.group = _run(
                 lambda: self._on_device(_join_group, "127.0.0.1", port, 1 + tp, self.group_name, "nccl"),
-                300,
+                120,
                 "join",
                 self.dump,
             )
-            joined.result(timeout=300)
-        self.server.post("/resume_memory_occupation", {"tags": ["kv_cache"]})
+            joined.result(timeout=120)
 
     def _on_device(self, function, *args):
         import torch
 
-        torch.cuda.set_device(self.device)
+        torch.cuda.set_device(torch.device("cuda", self.tp))
         return function(*args)
 
     def dump(self):
-        self.server.dump_stacks(self.out / "weight_sync_stacks.txt")
+        self.server.dump_stacks(self.out / f"weight_sync_{self.protocol}_tp{self.tp}_stacks.txt")
 
     def greedy(self) -> list[int]:
         body = {"input_ids": list(self.prompt), "sampling_params": {"max_new_tokens": 32, "temperature": 0.0}}
@@ -185,51 +201,54 @@ class _WeightSync:
                 "flush_cache": False,
             }
             with concurrent.futures.ThreadPoolExecutor(1) as pool:
-                received = pool.submit(self.server.post, "/update_weights_from_distributed", body, 300)
+                received = pool.submit(self.server.post, "/update_weights_from_distributed", body, 120)
                 for n in bucket:
                     torch.distributed.broadcast(named[n], src=0, group=self.group)
                 torch.cuda.synchronize()
-                received.result(timeout=300)
+                received.result(timeout=120)
 
     def sync(self, named: dict) -> None:
-        """Sleep, wake the weights, send them and wake the KV cache, as in a VERL step."""
-        self.server.post("/release_memory_occupation", {"tags": ["kv_cache", "weights"]})
-        self.server.post("/resume_memory_occupation", {"tags": ["weights"]})
-        if self.pause:
-            self.server.post("/pause_generation")
-        _run(lambda: self._on_device(self._send, named), 300, f"send pause={self.pause}", self.dump)
-        if self.pause:
-            self.server.post("/continue_generation")
-        self.server.post("/resume_memory_occupation", {"tags": ["kv_cache"]})
+        before, after = SYNC_PROTOCOLS[self.protocol]
+        for path, tags in before:
+            self.server.post(path, {"tags": tags} if tags else None)
+        _run(lambda: self._on_device(self._send, named), 120, f"send {self.protocol} tp={self.tp}", self.dump)
+        for path, tags in after:
+            self.server.post(path, {"tags": tags} if tags else None)
         requests.get(self.server.url("/flush_cache"), timeout=60)
 
 
 def weight_sync(model_path: str, tp: int, out: Path, prompt: list[int], checks: dict) -> dict:
-    """Zero the final norm, then restore it, through the weight-sync API; see the module docstring."""
+    """For each protocol, zero the final norm and restore it through the weight-sync API."""
     import torch
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16).to(torch.device("cuda", tp))
-    weights = {name: tensor.detach().contiguous() for name, tensor in model.state_dict().items()}
-    zeroed = {**weights, "model.norm.weight": torch.zeros_like(weights["model.norm.weight"])}
     report = {}
-    for pause in (False, True):
+    cases = [(protocol, tp) for protocol in SYNC_PROTOCOLS] + [("verl", 1)]
+    for protocol, case_tp in cases:
+        device = torch.device("cuda", case_tp)
+        model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16).to(device)
+        weights = {name: tensor.detach().contiguous() for name, tensor in model.state_dict().items()}
+        zeroed = {**weights, "model.norm.weight": torch.zeros_like(weights["model.norm.weight"])}
+        name = f"weight_sync_{protocol}_tp{case_tp}"
         sync = None
         try:
-            sync = _WeightSync(model_path, tp, out, prompt, pause)
+            sync = _WeightSync(model_path, case_tp, out, prompt, protocol)
             before = sync.greedy()
             sync.sync(zeroed)
             changed = sync.greedy()
             sync.sync(weights)
             after = sync.greedy()
-            report[f"pause={pause}"] = {"changed": changed != before, "restored": after == before}
-            checks[f"weight_sync_pause{int(pause)}"] = changed != before and after == before
+            report[name] = {"changed": changed != before, "restored": after == before}
+            checks[name] = changed != before and after == before
         except Exception as error:
-            report[f"pause={pause}"] = {"error": repr(error)}
-            checks[f"weight_sync_pause{int(pause)}"] = False
+            report[name] = {"error": repr(error)}
+            checks[name] = False
         finally:
             if sync is not None:
                 sync.server.close()
+            del model, weights, zeroed
+            torch.cuda.empty_cache()
+        print(f"  {name}: {report[name]}", flush=True)
     return report
 
 
