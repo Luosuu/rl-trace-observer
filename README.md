@@ -103,6 +103,35 @@ Incremental JSONL output avoids relying on graceful Ray worker shutdown. The
 final merger can combine these absolute-time state events with actor Torch
 Profiler traces and TokenSpeed VizTracer/Proton traces.
 
+## TokenSpeed rollout
+
+`actor_rollout_ref.rollout.name=tokenspeed` runs VERL's rollout on
+[TokenSpeed](https://github.com/lightseekorg/tokenspeed). The plugin registers it in every VERL process, and nothing
+in VERL or TokenSpeed is modified:
+
+- Each replica is hybrid. A Ray actor launches `tokenspeed serve` on the GPUs of `tensor_model_parallel_size`
+  training workers and drives it through TokenSpeed's control port: SGLang-style `/generate` with log probs,
+  `/release_memory_occupation` while the workers train, and `/resume_memory_occupation` before generating. Every
+  request is a `tokenspeed_generate` RL-Insight span on a `replica_<r>/slot_<k>` lane.
+- Weights go over TokenSpeed's NCCL weight-sync API (`/init_weights_update_group`, `/update_weights_from_distributed`).
+  An NCCL group cannot hold two ranks on one GPU, so replica `k` receives from the first training rank of replica
+  `k + 1`. This needs at least two replicas.
+- On profiled steps (`global_profiler.steps`), every replica records `VIZTRACER` and `PROTON` traces under
+  `$RL_TRACE_OUTPUT_DIR/rollout/replica<r>`, with profile id `<run_id>-step-<n>`. The server actor then registers each
+  scheduler rank's files. `rl-trace-merge --step <n>` shows each rank as a process of its own.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RL_TRACE_TOKENSPEED_PROFILE_ACTIVITIES` | `VIZTRACER,PROTON` | `/start_profile` activities; empty disables rollout profiling |
+| `RL_TRACE_TOKENSPEED_ARGS` | | extra `tokenspeed serve` arguments |
+| `RL_TRACE_TOKENSPEED_COMMAND` | `python -m tokenspeed.cli serve` | the server command (the CPU test points it at a fake server) |
+| `RL_TRACE_TOKENSPEED_STARTUP_TIMEOUT` | `1800` | seconds to wait for `/health` |
+
+`TOKENSPEED_KERNEL_PROFILE_DATA=trace` and `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace` are set for the
+server unless you set them. `tests/test_cpu_tokenspeed_ppo.py` runs the real `main_ppo` against a fake TokenSpeed
+server on CPU, sending weights over gloo. `scripts/gpu/run_e2e.sh` runs the GPU experiments on one 8-GPU node, and
+`scripts/gpu/submit_nebius.sh` submits it as a Nebius AI job.
+
 ## Merge into one Perfetto trace
 
 `rl-trace-merge` combines the artifacts of a profiling run into a single Chrome
