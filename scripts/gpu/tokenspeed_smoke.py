@@ -43,8 +43,11 @@ def _free_port() -> int:
 class Server:
     def __init__(self, model: str, tp: int, log: Path, extra_args: tuple[str, ...] = ()):
         self.port, self.control_port = _free_port(), _free_port()
+        from rl_trace_observer.integrations.tokenspeed.weight_group import SITE_DIR
+
         env = {
             **os.environ,
+            "PYTHONPATH": os.pathsep.join(filter(None, [str(SITE_DIR), os.environ.get("PYTHONPATH")])),
             # The server takes the first tp GPUs; the "trainer" uses the next one.
             "CUDA_VISIBLE_DEVICES": ",".join(os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2").split(",")[:tp]),
             "TOKENSPEED_KERNEL_PROFILE_DATA": "trace",
@@ -133,7 +136,7 @@ SYNC_PROTOCOLS = {
     ),
 }
 # Cases: (protocol, tp, seconds to wait between posting a bucket and broadcasting it).
-SYNC_CASES = [("awake", 2, 0.0), ("awake", 2, 2.0), ("awake", 1, 2.0), ("verl", 2, 2.0)]
+SYNC_CASES = [("awake", 2, 0.0), ("verl", 2, 0.0), ("verl", 1, 0.0)]
 
 
 class _WeightSync:
@@ -144,7 +147,9 @@ class _WeightSync:
 
         self.prompt, self.protocol, self.out, self.tp, self.delay = prompt, protocol, out, tp, delay
         self.name = f"{protocol}_tp{tp}_delay{delay:g}"
-        self.group_name = f"smoke_{self.name}".replace(".", "_")
+        from rl_trace_observer.integrations.tokenspeed.weight_group import GROUP_PREFIX
+
+        self.group_name = f"{GROUP_PREFIX}smoke_{self.name}".replace(".", "_")
         self.server = Server(model_path, tp, out / f"weight_sync_{self.name}.log")
         port = _free_port()
         body = {
