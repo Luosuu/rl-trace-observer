@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 from collections.abc import Generator
+from datetime import timedelta
 from typing import Any
 
 import aiohttp
@@ -29,23 +30,17 @@ from .server import _free_port, server_name
 logger = logging.getLogger(__name__)
 
 GROUP_NAME = "rl_trace_observer_tokenspeed_{replica}"
+SYNC_TIMEOUT = timedelta(seconds=float(os.environ.get("RL_TRACE_TOKENSPEED_SYNC_TIMEOUT", "600")))
 
 
 def _join_group(master_address: str, master_port: int, world_size: int, group_name: str, backend: str):
     """Create the weight-update group as its rank 0, the way TokenSpeed's workers join it."""
-    from torch.distributed.distributed_c10d import (
-        Backend,
-        PrefixStore,
-        _new_process_group_helper,
-        _world,
-        default_pg_timeout,
-        rendezvous,
-    )
+    from torch.distributed.distributed_c10d import Backend, PrefixStore, _new_process_group_helper, _world, rendezvous
 
     store, rank, world_size = next(
-        rendezvous(f"tcp://{master_address}:{master_port}", 0, world_size, timeout=default_pg_timeout)
+        rendezvous(f"tcp://{master_address}:{master_port}", 0, world_size, timeout=SYNC_TIMEOUT)
     )
-    store.set_timeout(default_pg_timeout)
+    store.set_timeout(SYNC_TIMEOUT)
     group, _ = _new_process_group_helper(
         world_size,
         rank,
@@ -54,7 +49,7 @@ def _join_group(master_address: str, master_port: int, world_size: int, group_na
         PrefixStore(group_name, store),
         group_name=group_name,
         backend_options=None,
-        timeout=default_pg_timeout,
+        timeout=SYNC_TIMEOUT,
     )
     _world.pg_group_ranks[group] = {i: i for i in range(world_size)}
     return group
@@ -74,6 +69,9 @@ class TokenSpeedServerAdapter(BaseRollout):
         self.replica_rank = self.rank // self.replica_size if replica_rank == -1 else replica_rank
         self.is_leader_rank = self.rank % self.replica_size == 0
         self.backend = "nccl" if torch.cuda.is_available() else "gloo"
+        # The trainer's GPU. CUDA's current device is per thread, and the
+        # group is created and used from worker threads.
+        self.device = torch.cuda.current_device() if self.backend == "nccl" else None
         # The replica this rank sends weights to, if any (see the module docstring).
         self.target_replica = None
         if self.is_leader_rank:
@@ -127,9 +125,16 @@ class TokenSpeedServerAdapter(BaseRollout):
             "backend": self.backend,
         }
         joined = asyncio.create_task(self._post(replica, "/init_weights_update_group", body))
-        self._group = await asyncio.to_thread(_join_group, address, port, world_size, group_name, self.backend)
+        self._group = await asyncio.to_thread(
+            self._on_device, _join_group, address, port, world_size, group_name, self.backend
+        )
         await joined
-        logger.info("Rank %d sends weights to TokenSpeed replica %d (%s)", self.rank, replica, self.backend)
+        print(f"[rl-trace-observer] rank {self.rank} sends weights to TokenSpeed replica {replica} ({self.backend})")
+
+    def _on_device(self, function, *args):
+        if self.device is not None:
+            torch.cuda.set_device(self.device)
+        return function(*args)
 
     async def _send_bucket(self, replica: int, bucket: list[tuple[str, torch.Tensor]]) -> None:
         body = {
@@ -147,7 +152,7 @@ class TokenSpeedServerAdapter(BaseRollout):
             if self.backend == "nccl":
                 torch.cuda.synchronize()
 
-        await asyncio.to_thread(broadcast)
+        await asyncio.to_thread(self._on_device, broadcast)
         await received
 
     async def update_weights(
@@ -189,4 +194,4 @@ class TokenSpeedServerAdapter(BaseRollout):
             resp.raise_for_status()
         if global_steps is not None:
             await ray.get_actor(server_name(replica)).set_global_steps.remote(global_steps)
-        logger.info("Sent %d tensors to TokenSpeed replica %d (step %s)", count, replica, global_steps)
+        print(f"[rl-trace-observer] sent {count} tensors to TokenSpeed replica {replica} (step {global_steps})")
