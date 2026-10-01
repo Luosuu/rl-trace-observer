@@ -24,10 +24,10 @@ RUN_E0=${RUN_E0:-1}
 mkdir -p "$RESULTS_DIR" "$WORK_DIR"
 exec > >(tee -a "$RESULTS_DIR/job.log") 2>&1
 
-sync_results() { rsync -a --inplace --exclude 'artifacts/' "$WORK_DIR/out/" "$RESULTS_DIR/" 2>/dev/null || true; }
+sync_results() { rsync -a --inplace --inplace --exclude 'artifacts/' "$WORK_DIR/out/" "$RESULTS_DIR/" 2>/dev/null || true; }
 finish() {
   sync_results
-  rsync -a --inplace "$WORK_DIR/out/" "$RESULTS_DIR/" || true
+  rsync -a --inplace --inplace "$WORK_DIR/out/" "$RESULTS_DIR/" || true
   echo "=== results in $RESULTS_DIR"
 }
 trap finish EXIT

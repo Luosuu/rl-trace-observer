@@ -3,7 +3,7 @@
 # writing results under the object-storage mount $RESULTS_ROOT/$JOB_NAME.
 set -x
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq && apt-get install -y -qq git rsync curl ca-certificates build-essential libnuma1 libnuma-dev >/dev/null
+apt-get update -qq && apt-get install -y -qq git rsync curl ca-certificates build-essential libnuma1 libnuma-dev libnuma1 libnuma-dev >/dev/null
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH=$HOME/.local/bin:$PATH
 git clone -q https://github.com/Luosuu/rl-trace-observer /root/rl-trace-observer
