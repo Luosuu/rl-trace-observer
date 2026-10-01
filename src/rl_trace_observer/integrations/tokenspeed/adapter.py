@@ -98,7 +98,11 @@ class TokenSpeedServerAdapter(BaseRollout):
 
     async def _post(self, replica: int, path: str, body: dict | None = None) -> dict:
         if self._session is None:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=30))
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, sock_connect=30),
+                # The control server drops idle keep-alive connections; a reused one fails a later POST.
+                connector=aiohttp.TCPConnector(force_close=True),
+            )
         async with self._session.post(await self._url(replica, path), json=body or {}) as resp:
             payload = await resp.json(content_type=None)
             if resp.status != 200 or (isinstance(payload, dict) and payload.get("success") is False):
