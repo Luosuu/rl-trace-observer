@@ -2320,7 +2320,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "rl-insight", git = "https://github.com/Luosuu/rl-insight?rev=72763beecf2c9652ad182ba83ce9104417a70d1e" },
-    { name = "tokenspeed", marker = "sys_platform == 'linux' and extra == 'tokenspeed'", specifier = "==0.1.0.post20261001" },
+    { name = "tokenspeed", marker = "sys_platform == 'linux' and extra == 'tokenspeed'", specifier = "==0.1.0.post20260930" },
     { name = "verl", extras = ["verl-core"], specifier = ">=0.9.1" },
     { name = "viztracer", specifier = ">=0.16" },
 ]
@@ -2597,7 +2597,7 @@ wheels = [
 
 [[package]]
 name = "tokenspeed"
-version = "0.1.0.post20261001"
+version = "0.1.0.post20260930"
 source = { registry = "https://lightseek.org/whl/nightly" }
 dependencies = [
     { name = "aiohttp", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
@@ -2650,7 +2650,7 @@ dependencies = [
     { name = "xgrammar", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 wheels = [
-    { url = "https://github.com/lightseekorg/whl/releases/download/tokenspeed-nightly-v0.1.0.post20261001/tokenspeed-0.1.0.post20261001-py3-none-any.whl?sha256=794f1313d72926795fc2970d3edd91a46e6406f1e67e8339549b019fcca4a6e7", hash = "sha256:794f1313d72926795fc2970d3edd91a46e6406f1e67e8339549b019fcca4a6e7" },
+    { url = "https://github.com/lightseekorg/whl/releases/download/tokenspeed-nightly-v0.1.0.post20260930/tokenspeed-0.1.0.post20260930-py3-none-any.whl?sha256=53301fea9b0b887878ace6fc6fe1c73a0a6051c7b00965e555afdec8c830a67d", hash = "sha256:53301fea9b0b887878ace6fc6fe1c73a0a6051c7b00965e555afdec8c830a67d" },
 ]
 
 [[package]]
@@ -2767,7 +2767,7 @@ wheels = [
 
 [[package]]
 name = "tokenspeed-kernel"
-version = "0.1.3.post20261001"
+version = "0.1.3.post20260930"
 source = { registry = "https://lightseek.org/whl/nightly" }
 dependencies = [
     { name = "apache-tvm-ffi", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
@@ -2798,8 +2798,8 @@ dependencies = [
     { name = "wheel", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 wheels = [
-    { url = "https://github.com/lightseekorg/whl/releases/download/tokenspeed-kernel-nightly-v0.1.3.post20261001-cu130/tokenspeed_kernel-0.1.3.post20261001-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:692d15bece34b695bd08b218660493d327c9384b676ab461dbe9e85dccb718ea" },
-    { url = "https://github.com/lightseekorg/whl/releases/download/tokenspeed-kernel-nightly-v0.1.3.post20261001-cu130/tokenspeed_kernel-0.1.3.post20261001-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:e51d13a3b89b4d6d27d9bd2fb0b892c68e9b2b3471468316e1f76c0722093aa4" },
+    { url = "https://github.com/lightseekorg/whl/releases/download/tokenspeed-kernel-nightly-v0.1.3.post20260930-cu130/tokenspeed_kernel-0.1.3.post20260930-cp312-cp312-manylinux_2_28_aarch64.whl?sha256=3e67fed9b1048bdef2edb6a046c8dc42223d90755584f1644c13a0d66f6409ce", hash = "sha256:3e67fed9b1048bdef2edb6a046c8dc42223d90755584f1644c13a0d66f6409ce" },
+    { url = "https://github.com/lightseekorg/whl/releases/download/tokenspeed-kernel-nightly-v0.1.3.post20260930-cu130/tokenspeed_kernel-0.1.3.post20260930-cp312-cp312-manylinux_2_28_x86_64.whl?sha256=89e1da6e7766b82607c26279b9d6dbb6468a95d5d565e61468aa13d196e0a755", hash = "sha256:89e1da6e7766b82607c26279b9d6dbb6468a95d5d565e61468aa13d196e0a755" },
 ]
 
 [[package]]

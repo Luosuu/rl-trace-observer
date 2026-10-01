@@ -312,7 +312,7 @@ manifest
 - [x] CPU 上运行真实 `verl.trainer.main_ppo` 一个 PPO step（FSDP2 actor + 测试用 mock rollout，`tests/test_cpu_ppo.py`），actor 与 rollout 进程均写出 semantic artifact，合并后 RL-Insight 与 Torch 的 `actor_update` 在 Perfetto 中对齐；
 - [ ] 在真实 vLLM/SGLang/TokenSpeed rollout server 中确认 `*_generate` span（需 GPU）。
 
-已验证版本：`verl==0.9.1`、`tokenspeed==0.1.0.post20261001`（main 的 nightly，0.1.0 之后加入 VizTracer→Proton scope flow；配套的 `tokenspeed-kernel` nightly 要求 `torch==2.14.0`；`transformers` 覆盖为 5.12.0）、RL-Insight fork `72763be`（基于 0.3.0）。VERL 0.9 通过 `verl.plugins` entry point 在每个导入 verl 的进程中自动加载插件，并通过 `get_ppo_ray_runtime_env` 将 `VERL_RL_INSIGHT_ENABLE` 转发给所有 worker。两个版本的 `load_monitor_config` 都只允许环境变量覆盖 `server.url`，无法覆盖 `server.backend`，因此项目固定使用增加了 `RL_INSIGHT_SERVER_BACKEND` 的 fork。
+已验证版本：`verl==0.9.1`、`tokenspeed==0.1.0.post20260930`（main 的 nightly，0.1.0 之后加入 VizTracer→Proton scope flow；配套的 `tokenspeed-kernel` nightly 要求 `torch==2.14.0`；`transformers` 覆盖为 5.12.0）、RL-Insight fork `72763be`（基于 0.3.0）。VERL 0.9 通过 `verl.plugins` entry point 在每个导入 verl 的进程中自动加载插件，并通过 `get_ppo_ray_runtime_env` 将 `VERL_RL_INSIGHT_ENABLE` 转发给所有 worker。两个版本的 `load_monitor_config` 都只允许环境变量覆盖 `server.url`，无法覆盖 `server.backend`，因此项目固定使用增加了 `RL_INSIGHT_SERVER_BACKEND` 的 fork。
 
 完成标准：至少两个 Ray worker 的 `trace_state` 都产生本地 semantic artifact。
 

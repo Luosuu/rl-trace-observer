@@ -16,8 +16,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Kernel wheels exist only for Linux.
-tokenspeed = ["tokenspeed==0.1.0.post20261001; sys_platform == 'linux'"]
+# Kernel wheels exist only for Linux. post20261001 imports kernel functions its
+# same-date kernel nightly lacks.
+tokenspeed = ["tokenspeed==0.1.0.post20260930; sys_platform == 'linux'"]
 
 [dependency-groups]
 dev = ["perfetto", "pytest>=8", "pyyaml", "ruff>=0.12"]

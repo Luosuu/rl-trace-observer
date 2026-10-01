@@ -27,7 +27,7 @@ from the
 fork that adds `RL_INSIGHT_SERVER_BACKEND` until it lands upstream. TokenSpeed
 is the only extra (Linux only). It is pinned to a nightly build of
 [lightseekorg/tokenspeed](https://github.com/lightseekorg/tokenspeed) `main`
-(`0.1.0.post20261001`, from `https://lightseek.org/whl/nightly`), because the
+(`0.1.0.post20260930`, from `https://lightseek.org/whl/nightly`), because the
 0.1.0 release does not link VizTracer scopes to Proton. A git checkout of `main`
 does not work on its own: each nightly needs the `tokenspeed-kernel` nightly of
 the same date, and that kernel requires `torch==2.14.0`, so the extra moves the
