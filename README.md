@@ -116,9 +116,18 @@ in VERL or TokenSpeed is modified:
 - Weights go over TokenSpeed's NCCL weight-sync API (`/init_weights_update_group`, `/update_weights_from_distributed`).
   An NCCL group cannot hold two ranks on one GPU, so replica `k` receives from the first training rank of replica
   `k + 1`. This needs at least two replicas.
-- On profiled steps (`global_profiler.steps`), every replica records `VIZTRACER` and `PROTON` traces under
-  `$RL_TRACE_OUTPUT_DIR/rollout/replica<r>`, with profile id `<run_id>-step-<n>`. The server actor then registers each
-  scheduler rank's files. `rl-trace-merge --step <n>` shows each rank as a process of its own.
+- Since torch 2.14, a new NCCL group is split from the default process group when that group is bound to a device.
+  TokenSpeed binds its default group, so the group it joins for weight sync would be a split of its own world and
+  never reach the trainer. The first broadcast then hangs. Weight-update groups (`rl_trace_observer_tokenspeed_*`) are
+  therefore created without splitting, on both sides. On the TokenSpeed side this is done by a `sitecustomize` that
+  the server actor puts on `tokenspeed serve`'s `PYTHONPATH`.
+- On profiled steps (`global_profiler.steps`), every replica records `VIZTRACER` and `PROTON` traces into its own
+  directory, `$RL_TRACE_OUTPUT_DIR/rollout/replica<r>/<run_id>-step-<n>`. `tokenspeed serve` names the files after a
+  timestamp whatever `profile_id` it is sent, so the directory identifies the profile. The server actor then registers
+  each scheduler rank's files. `rl-trace-merge --step <n>` shows each rank as a process of its own.
+- Proton's trace mode cannot place kernels replayed from CUDA graphs: `/stop_profile` fails with "Cannot find CPU
+  scope event for kernel launch". Profile with `actor_rollout_ref.rollout.enforce_eager=True`. VizTracer alone works
+  either way (`RL_TRACE_TOKENSPEED_PROFILE_ACTIVITIES=VIZTRACER`).
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -126,6 +135,7 @@ in VERL or TokenSpeed is modified:
 | `RL_TRACE_TOKENSPEED_ARGS` | | extra `tokenspeed serve` arguments |
 | `RL_TRACE_TOKENSPEED_COMMAND` | `python -m tokenspeed.cli serve` | the server command (the CPU test points it at a fake server) |
 | `RL_TRACE_TOKENSPEED_STARTUP_TIMEOUT` | `1800` | seconds to wait for `/health` |
+| `RL_TRACE_TOKENSPEED_SYNC_TIMEOUT` | `600` | seconds before a weight-update group operation times out |
 
 `TOKENSPEED_KERNEL_PROFILE_DATA=trace` and `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace` are set for the
 server unless you set them. `tests/test_cpu_tokenspeed_ppo.py` runs the real `main_ppo` against a fake TokenSpeed

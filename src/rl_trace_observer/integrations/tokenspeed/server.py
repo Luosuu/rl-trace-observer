@@ -155,7 +155,11 @@ class TokenSpeedServer:
         self._process = subprocess.Popen(
             command, env=env, stdout=sys.stdout, stderr=sys.stderr, preexec_fn=_die_with_parent
         )
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=30))
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=30),
+            # The control server drops idle keep-alive connections; a reused one fails a later POST.
+            connector=aiohttp.TCPConnector(force_close=True),
+        )
 
         deadline = time.monotonic() + float(os.environ.get(STARTUP_TIMEOUT_ENV, "1800"))
         while True:
