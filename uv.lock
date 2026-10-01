@@ -2373,7 +2373,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "rl-insight", git = "https://github.com/Luosuu/rl-insight?rev=72763beecf2c9652ad182ba83ce9104417a70d1e" },
-    { name = "tokenspeed", marker = "extra == 'tokenspeed'" },
+    { name = "tokenspeed", marker = "extra == 'tokenspeed'", git = "https://github.com/lightseekorg/tokenspeed?subdirectory=python&rev=b403cf21ab57c74b7f39ddc895af8a3841525c1c" },
     { name = "verl", extras = ["verl-core"], specifier = ">=0.9.1" },
     { name = "viztracer", specifier = ">=0.16" },
 ]
@@ -2657,7 +2657,7 @@ wheels = [
 [[package]]
 name = "tokenspeed"
 version = "0.1.0"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/lightseekorg/tokenspeed?subdirectory=python&rev=b403cf21ab57c74b7f39ddc895af8a3841525c1c#b403cf21ab57c74b7f39ddc895af8a3841525c1c" }
 dependencies = [
     { name = "aiohttp" },
     { name = "compressed-tensors" },
@@ -2707,10 +2707,6 @@ dependencies = [
     { name = "uvloop" },
     { name = "viztracer" },
     { name = "xgrammar" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/a6/51/f4ef5987816a41f89a64462442f7dc9e01eb4becbbdb06bdbf18b4ccf4e4/tokenspeed-0.1.0.tar.gz", hash = "sha256:92512d9b2b71289dbf7e5cf40815744394f241778ae2837da3229e5a4bec9ed8", size = 1058234, upload-time = "2026-07-24T02:02:09.519Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/9a/4f/a142b34cbd8fa5709f1b8037a8489f86d0df282b8d29bf0d435a156bb775/tokenspeed-0.1.0-py3-none-any.whl", hash = "sha256:2649dfcb853bbba74a065fa10d3280513e5755da057b6a9cbf6b82ff47d70b2a", size = 1433440, upload-time = "2026-07-24T02:02:06.966Z" },
 ]
 
 [[package]]
@@ -2865,20 +2861,20 @@ wheels = [
 
 [[package]]
 name = "tokenspeed-scheduler"
-version = "0.1.23"
+version = "0.1.24"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9f/0a/42c8a375027da13a1566a535854452a25cbcf0082f1bcd37a11e22419480/tokenspeed_scheduler-0.1.23.tar.gz", hash = "sha256:c2b2fca997d75f291bb7342649ecd964446750b3f3df8bc747757076c40b8136", size = 276144, upload-time = "2026-09-26T06:13:47.774Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/24/83/d2a745ef17e280beba0dafb7d4b3d1067d7a927ef3669b8e8bc611c2514e/tokenspeed_scheduler-0.1.24.tar.gz", hash = "sha256:ceffecaa8c8d5c8485cda3a165aeb359269606755097b3d2f9c0026cc0ccc849", size = 276591, upload-time = "2026-10-01T03:44:35.715Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/15/80/bd0bbd32bb91ca04c1193481971775560a0adb6cd5265139b38db2392fb7/tokenspeed_scheduler-0.1.23-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ab9f085a855c1adf6ec094a62773d6ae94317c88167bc210b7a2e0426cd37eb5", size = 1838306, upload-time = "2026-09-26T06:13:41.355Z" },
-    { url = "https://files.pythonhosted.org/packages/33/c3/9b9dc5a60c55d40b4f14234fb3f59f8a7bbd80854e1c82e2af402c16becd/tokenspeed_scheduler-0.1.23-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:05589e84d275f505357fe2b836ac29c12e75701fbba22f3050f86cafb800cc13", size = 1957530, upload-time = "2026-09-26T06:13:43.079Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/3e/8944cd452fa128d1c5eb7b2b38f15c78f765ad1bebd0aad542cba8005888/tokenspeed_scheduler-0.1.24-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0e23012c33e4a0c08ab880ca555ed76eda8090834c0f37f7fd882cb12f475df6", size = 1838915, upload-time = "2026-10-01T03:44:30.011Z" },
+    { url = "https://files.pythonhosted.org/packages/b4/3f/fec349fb6944d0585ef60a226f8444ea65339d399fab5c87b8b675a11a53/tokenspeed_scheduler-0.1.24-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f5e6d515d087a1fd045f135c6b4652a82a0d3167594e2cceb797ca116c74df28", size = 1958126, upload-time = "2026-10-01T03:44:31.584Z" },
 ]
 
 [[package]]
 name = "tokenspeed-smg"
-version = "1.8.0.post20260720"
+version = "1.10.1.post20260920"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "grpcio" },
@@ -2886,28 +2882,28 @@ dependencies = [
     { name = "pyyaml" },
     { name = "setproctitle" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/10/d0/c2035ef408e435c69dd8d1c283b67d88d7ef1b36eaefa93b6cf1d7d49214/tokenspeed_smg-1.8.0.post20260720.tar.gz", hash = "sha256:76283b0bbf121d6e114582bb01cd504e29af457cfbf4fe8d908dcfc40daba2a2", size = 3069812, upload-time = "2026-07-20T23:02:39.844Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/03/23/b05afdd4bf821e7a547882f8c5267370c68da05531b34c6857e817afc579/tokenspeed_smg-1.10.1.post20260920.tar.gz", hash = "sha256:29494d2ee2f8df5a11e3ab55b1d29fe89ee059c6c84ccb4d26df5c4c8004070a", size = 4562057, upload-time = "2026-09-20T00:31:18.696Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f4/a9/650ba3be3d4b4b114c4c6976143fb1cb0df34a0f9e0d48d7b9c6b4e9110c/tokenspeed_smg-1.8.0.post20260720-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:b84e00f5eb841b2e5e2444a0081284b0f78e617d6d52628f7d0ad6cb56a81bda", size = 32130624, upload-time = "2026-07-20T23:02:32.909Z" },
-    { url = "https://files.pythonhosted.org/packages/69/9c/7c3cdc1c0dae9f8f991e955c79a4fb610b81132ade2595262a045e1a960f/tokenspeed_smg-1.8.0.post20260720-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:580f926d95c5748b613c3dc2f14bcf463c8855e37c03e8ca840b6ba93b6b63dd", size = 30572283, upload-time = "2026-07-20T23:02:37.044Z" },
+    { url = "https://files.pythonhosted.org/packages/86/be/93d51567068a08232eef6e431ea0b5f57547cf016544cf6f15018e995c4f/tokenspeed_smg-1.10.1.post20260920-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c3717abf1cf174214fc91e55ce9c04ee54b65fcfe4a38461c7929f426ea6a837", size = 35396908, upload-time = "2026-09-20T00:31:13.111Z" },
+    { url = "https://files.pythonhosted.org/packages/60/4b/e5816bdc6f6b048c977c11fc43dc16fe5018b7305f8b17dcd8030f75c394/tokenspeed_smg-1.10.1.post20260920-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:efd99c4bf52eb0e1a0288b933345dc98d853da0a7f04eac86b9cab108d60ec41", size = 33641150, upload-time = "2026-09-20T00:31:16.151Z" },
 ]
 
 [[package]]
 name = "tokenspeed-smg-grpc-proto"
-version = "0.4.14.post20260720"
+version = "0.4.18.post20260920"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "grpcio" },
     { name = "protobuf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/46/b5/4402676549a93f2f3547335511c109d7ade73af65908bf43a4e1a525c6f9/tokenspeed_smg_grpc_proto-0.4.14.post20260720.tar.gz", hash = "sha256:18fa1921a6d08a6d4c0710e5b1a22f98594b9a6ee4319ad3f74de9d8b7bf84ac", size = 28807, upload-time = "2026-07-20T22:41:59.922Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/18/c4/9aa73bbc6e5970b2fd4f3fd1458d4f605aa3e38fcfdfab6f3707a4a392a2/tokenspeed_smg_grpc_proto-0.4.18.post20260920.tar.gz", hash = "sha256:5df1e8324e2e2a31b73040d5d50bf3cbfc9d0d605ca0ec5252b47f034559fa74", size = 29685, upload-time = "2026-09-20T00:04:27.585Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/de/3d/8c0dee748656a1a34533b3008e8b9564b725e329a07a74cfa166dfcba00f/tokenspeed_smg_grpc_proto-0.4.14.post20260720-py3-none-any.whl", hash = "sha256:438fb8899bd4cb280bf7b569f1b06e4a989372d9d67c019030c474e57a5e45f3", size = 97080, upload-time = "2026-07-20T22:41:58.641Z" },
+    { url = "https://files.pythonhosted.org/packages/62/2c/da97cb74e0c29fa3105a95a96cc645e8eee1644dc7d5e53d1c63a6224d5c/tokenspeed_smg_grpc_proto-0.4.18.post20260920-py3-none-any.whl", hash = "sha256:e65f70fe02798b22234b2b57e9de4cc3d6fa23556c2d34ad333db057e3ccab18", size = 98744, upload-time = "2026-09-20T00:04:26.161Z" },
 ]
 
 [[package]]
 name = "tokenspeed-smg-grpc-servicer"
-version = "0.7.0.post20260720"
+version = "0.9.1.post20260920"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "grpcio" },
@@ -2915,9 +2911,9 @@ dependencies = [
     { name = "grpcio-reflection" },
     { name = "tokenspeed-smg-grpc-proto" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/91/3c/a28716749d1478b028912fdf19256372999c1ff504b296cfaddf3b570ce5/tokenspeed_smg_grpc_servicer-0.7.0.post20260720.tar.gz", hash = "sha256:f611fa4bbb9684a3b9428ac9ff2f0f410183192b85d554561af6afe2bb1df04f", size = 110523, upload-time = "2026-07-20T22:41:47.211Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/16/63/ce9d77ce5a9677400b390980dede1cb188e523e1a928d1ed1cc86f539e09/tokenspeed_smg_grpc_servicer-0.9.1.post20260920.tar.gz", hash = "sha256:98f109334be50cc054b8397af25791ee0366d5bfbe5e287d981dae02102e4b69", size = 131945, upload-time = "2026-09-20T00:04:09.5Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/3a/e03b87f75e804d04e8f851321590427a9be73ca94149b8878fe9258e094a/tokenspeed_smg_grpc_servicer-0.7.0.post20260720-py3-none-any.whl", hash = "sha256:5294b348354b876c9dd4a3c58cee9ede4cce57d70cc233f49e57fd9375153541", size = 113630, upload-time = "2026-07-20T22:41:45.835Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/25/b758cb147e5d5a423d06206f5009a1dc6dc125acdc7061463f240333d695/tokenspeed_smg_grpc_servicer-0.9.1.post20260920-py3-none-any.whl", hash = "sha256:8553822d3eaa13842dc770adf8290f024eb6e4cffac91c22b3ffd14d12b9eea7", size = 124379, upload-time = "2026-09-20T00:04:08.293Z" },
 ]
 
 [[package]]
@@ -3403,7 +3399,7 @@ wheels = [
 
 [[package]]
 name = "xgrammar"
-version = "0.2.2"
+version = "0.2.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -3414,13 +3410,13 @@ dependencies = [
     { name = "triton", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fe/b7/86178b241be0b29ce9ee991a44d4b7eddb0f0c98310c0067fe83afc897d1/xgrammar-0.2.2.tar.gz", hash = "sha256:42bcc5c4187ff9cb6edc44ff5f56030d8b69d62c7576f674a5a074f71b68b1fa", size = 2430492, upload-time = "2026-06-11T19:02:49.624Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/81/f4/e71693d8cec60b7e36dab660784ecc5a6aa51e478a83b556011645c58c87/xgrammar-0.2.3.tar.gz", hash = "sha256:f76423630ae3ac4e090cb38ce1e30e7bcc69b3dee4d22d94353944386a4c6f18", size = 2447704, upload-time = "2026-06-27T04:45:24.759Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/31/48/c50e00cb390702153a740d6eb163efb6771c2c18087401160132b1be1bdb/xgrammar-0.2.2-cp312-cp312-macosx_10_14_x86_64.whl", hash = "sha256:f457e20099768203f313dfc4bdfcb80ebdd98040b8df7a4f25adf5b0ddaa2cd4", size = 23292820, upload-time = "2026-06-11T19:01:40.152Z" },
-    { url = "https://files.pythonhosted.org/packages/93/b9/d6004ab97588bf680fc5524a7a07b9e6c58caecd5de303c9e74d6b70267d/xgrammar-0.2.2-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:c4e46e6c62c534c8e539447008fc1f77b592d92d304a92961852e9540aa8f0cc", size = 23236355, upload-time = "2026-06-11T19:01:42.817Z" },
-    { url = "https://files.pythonhosted.org/packages/d5/20/84f3d71964cf2142c3470025731c0ccb3fb8c54b192c1435f10b79d72d31/xgrammar-0.2.2-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:5432dee479702807e0af956b3804d4c5b7ddafb61b1d97d437574be6837a4e15", size = 44091972, upload-time = "2026-06-11T19:01:45.96Z" },
-    { url = "https://files.pythonhosted.org/packages/b1/40/eb28b7343b019350a83cde47fe876a79f3ee19e412c1af451200b6351fe8/xgrammar-0.2.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d3f0195ffc978bc2b44e4d5b682ff3a5ee86c378e8934b0f8582ddd0b00c24f0", size = 44588349, upload-time = "2026-06-11T19:01:49.062Z" },
-    { url = "https://files.pythonhosted.org/packages/d4/c6/01182ac2d0cf3943f8c990824027cb13b914867c32990c5e648a09f2d8fa/xgrammar-0.2.2-cp312-cp312-win_amd64.whl", hash = "sha256:2560d07b6b194334dd612a937c5a27b04e34f5b73aba8aea5d6860f758bcdff8", size = 7436669, upload-time = "2026-06-11T19:01:51.674Z" },
+    { url = "https://files.pythonhosted.org/packages/51/1c/0cdb22fc799e6d158b3243eeb895ae2e086825487b57767838c98d4864ee/xgrammar-0.2.3-cp312-cp312-macosx_10_14_x86_64.whl", hash = "sha256:173e167d43a5cf4171eee2be86097decff8803b0a0853d7baaf446c732a7d3a9", size = 23284489, upload-time = "2026-06-27T04:44:23.927Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/bc/994dc6f222189174840c29a1f5b4c175e69dfe13ed2e25b6dbbe9f200a29/xgrammar-0.2.3-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:aa35f24835a59c822e249ecc80912eea4de03fc8b04afb2f82c8b950a56be6ef", size = 23240027, upload-time = "2026-06-27T04:44:26.255Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/79/0bb37937bf847c738c64b64dc50ddc12e7c526b34c5ab82cebe58da5ec8f/xgrammar-0.2.3-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:11255f184971489fc72b948b096e2917f482ba2dca975177f5411562cedb9c6d", size = 44314481, upload-time = "2026-06-27T04:44:28.875Z" },
+    { url = "https://files.pythonhosted.org/packages/d4/fd/5ebd5d14b8993cb225151bbb8f2011742fc7a7d94a3bdbc3ec3954b9b62d/xgrammar-0.2.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fdf081fab29694302d41d61dcf52fad7d253879a718bc6afc68db0a0dabd7f19", size = 44855110, upload-time = "2026-06-27T04:44:31.586Z" },
+    { url = "https://files.pythonhosted.org/packages/17/66/67239f43b0244f65aec4639f51ab95905db42eb66e532ee2a4e5cdce32de/xgrammar-0.2.3-cp312-cp312-win_amd64.whl", hash = "sha256:e7787dd8321a04f86116b756aa3dadd622e3607a3559b1e986cc5f77da00d68e", size = 15780277, upload-time = "2026-06-27T04:44:34.081Z" },
 ]
 
 [[package]]

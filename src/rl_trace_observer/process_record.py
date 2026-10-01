@@ -2,7 +2,8 @@
 
 Every process that writes an artifact also writes one record,
 ``rl-trace-process-<host>-pid-<pid>.json``, describing who it is and which files
-it wrote. The merger joins records with artifacts to build the session manifest:
+it wrote or requested from a server it drives (TokenSpeed scheduler profiles).
+The merger joins records with artifacts to build the session manifest:
 records give Torch and VizTracer traces, whose filenames carry only a pid, the
 host and Ray identity of the process that wrote them, and let it report
 artifacts that a process registered but that never arrived.
@@ -124,15 +125,23 @@ def _update(output_dir: Path, entry: dict[str, Any] | None = None, process_role:
 
 
 def register_artifact(
-    output_dir: Path, kind: str, path: Path, *, global_step: int | None = None, role: str | None = None
+    output_dir: Path,
+    kind: str,
+    path: Path,
+    *,
+    global_step: int | None = None,
+    role: str | None = None,
+    rank_tag: str | None = None,
 ) -> Path:
-    """Record that this process wrote ``path``; the merger links the artifact through it.
+    """Record that this process owns ``path``; the merger links the artifact through it.
 
     Args:
         global_step: The training step the artifact covers, when it covers one.
         role: What the artifact records, e.g. ``"actor_train"``.
+        rank_tag: The TokenSpeed scheduler rank that wrote the artifact, e.g.
+            ``"TP0"``, when this process requested it from a TokenSpeed server.
     """
-    entry = {"kind": kind, "file": str(path), "global_step": global_step, "role": role}
+    entry = {"kind": kind, "file": str(path), "global_step": global_step, "role": role, "rank_tag": rank_tag}
     return _update(output_dir, {key: value for key, value in entry.items() if value is not None})
 
 
