@@ -205,3 +205,25 @@ def test_viztracer_main_process_is_named_after_its_source(tmp_path):
     assert [e["args"]["name"] for e in result.trace["traceEvents"] if e["name"] == "process_name"] == [
         "VizTracer e2e step 3 rank 0 pid 42"
     ]
+
+
+def test_a_flow_id_starting_several_flows_becomes_one_id_per_flow(tmp_path):
+    # Proton starts one launch->kernel flow per kernel with the launch's id.
+    events = [
+        {"ph": "X", "name": "launch", "pid": 1234, "tid": 1234, "ts": 1.0, "dur": 1.0},
+        {"ph": "X", "name": "kernel_a", "pid": 0, "tid": 7, "ts": 3.0, "dur": 1.0},
+        {"ph": "X", "name": "kernel_b", "pid": 0, "tid": 7, "ts": 5.0, "dur": 1.0},
+        {"ph": "s", "name": "launch->kernel", "pid": 1234, "tid": 1234, "ts": 1.0, "id": 9},
+        {"ph": "s", "name": "launch->kernel", "pid": 1234, "tid": 1234, "ts": 1.0, "id": 9},
+        {"ph": "f", "name": "launch->kernel", "pid": 0, "tid": 7, "ts": 5.0, "id": 9, "bp": "e"},
+        {"ph": "f", "name": "launch->kernel", "pid": 0, "tid": 7, "ts": 3.0, "id": 9, "bp": "e"},
+    ]
+    _write_torch(tmp_path / TORCH_NAME.format(pid=1234), events)
+
+    result = merge_sources(read_source(kind, path) for kind, path in discover([tmp_path]))
+    flows = {}
+    for event in result.trace["traceEvents"]:
+        if event["ph"] in "sf":
+            flows.setdefault(event["id"], []).append((event["ph"], event["ts"]))
+
+    assert sorted(sorted(flow) for flow in flows.values()) == [[("f", 2.0), ("s", 0.0)], [("f", 4.0), ("s", 0.0)]]

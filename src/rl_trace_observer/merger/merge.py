@@ -12,13 +12,17 @@ Kineto also emits device indices and strings such as ``"Spans"`` as pids.
   and Proton trace, named after the server actor that registered them.
 * Threads get trace-wide unique synthetic tids, named with their source kind.
 * Flow and async event ids are renumbered per source so they cannot connect
-  events of unrelated processes. The one exception links a TokenSpeed rank's
+  events of unrelated processes. A flow id that starts several flows in one
+  source (Proton starts one launch->kernel flow per kernel with the launch's
+  id) becomes one id per flow, its k-th start paired with its k-th end in
+  time order. The one exception to per-source ids links a TokenSpeed rank's
   two files: its VizTracer report starts a flow at every Python scope whose id
   is the Proton CPU scope's ``scope_id``, and the merger ends it on that scope,
   as ``tokenspeed merge-traces`` does.
 """
 
 import itertools
+from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -43,6 +47,7 @@ _SCOPE_ID_ARG = "scope_id"
 # Chrome flow (s/t/f) and async (b/n/e, legacy S/T/F) phases carry an id that
 # links events; ids are only unique within the file that produced them.
 _ID_PHASES = frozenset("stfbneSTF")
+_FLOW_PHASES = frozenset("stf")
 
 
 class EmptyTraceError(ValueError):
@@ -111,6 +116,7 @@ class _SourceRemapper:
         self._ids: dict[str, int] = {}
         self._process_names: dict[str, str] = {}
         self._thread_names: dict[tuple[str, str], str] = {}
+        self._flow_chains = _reused_flow_chains(source.events)
         for event in source.events:
             if event.get("ph") != "M" or not (name := event.get("args", {}).get("name")):
                 continue
@@ -164,15 +170,46 @@ class _SourceRemapper:
             self._tids[key] = self._namespace.new_tid(self.pid(original_pid), name)
         return self._tids[key]
 
-    def flow_id(self, original: object) -> int:
+    def flow_id(self, event: dict[str, Any]) -> int:
+        original = event["id"]
         if isinstance(original, tuple):
             # A scope flow from _link_scope_flows, shared with the partner file.
             ids, key = self._namespace.shared_flow_ids, (self._source.pair, original)
+        elif (chain := self._flow_chains.get(id(event))) is not None:
+            ids, key = self._ids, f"{original}#{chain}"
         else:
             ids, key = self._ids, str(original)
         if key not in ids:
             ids[key] = next(self._next_id)
         return ids[key]
+
+
+def _reused_flow_chains(events: list[dict[str, Any]]) -> dict[int, int]:
+    """For each flow id that starts several flows, which of them each of its events belongs to.
+
+    Keyed by ``id()`` of the event. In time order, a start opens a new flow,
+    and a step or end continues the oldest open one (an end closes it).
+    """
+    by_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in events:
+        if event.get("ph") in _FLOW_PHASES and "id" in event and isinstance(event.get("ts"), int | float):
+            by_id[str(event["id"])].append(event)
+    chains: dict[int, int] = {}
+    for flow in by_id.values():
+        if sum(event["ph"] == "s" for event in flow) < 2:
+            continue
+        open_flows: deque[int] = deque()
+        started = 0
+        for event in sorted(flow, key=lambda event: (event["ts"], event["ph"] != "s")):
+            if event["ph"] == "s":
+                open_flows.append(started)
+                chains[id(event)] = started
+                started += 1
+            elif open_flows:
+                chains[id(event)] = open_flows[0]
+                if event["ph"] == "f":
+                    open_flows.popleft()
+    return chains
 
 
 def _is_scope_flow_start(event: dict[str, Any]) -> bool:
@@ -248,7 +285,7 @@ def merge_sources(sources: Iterable[TraceSource], processes: Mapping[str, Proces
             merged["tid"] = remapper.tid(event.get("pid"), event.get("tid"))
             merged["ts"] = round(offset_us + float(event["ts"]), 3)
             if event.get("ph") in _ID_PHASES and "id" in event:
-                merged["id"] = remapper.flow_id(event["id"])
+                merged["id"] = remapper.flow_id(event)
             events.append(merged)
         if dropped:
             warnings.append(f"{source.path.name}: dropped {dropped} events without a timestamp or with negative dur")
