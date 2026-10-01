@@ -42,7 +42,7 @@ def _free_port() -> int:
 
 
 class Server:
-    def __init__(self, model: str, tp: int, log: Path):
+    def __init__(self, model: str, tp: int, log: Path, extra_args: tuple[str, ...] = ()):
         self.port, self.control_port = _free_port(), _free_port()
         env = {
             **os.environ,
@@ -55,7 +55,7 @@ class Server:
             sys.executable, "-m", "tokenspeed.cli", "serve",
             "--model", model, "--tp", str(tp),
             "--host", "127.0.0.1", "--port", str(self.port), "--control-port", str(self.control_port),
-            "--gpu-memory-utilization", "0.5", "--enable-output-logprobs", "--enable-memory-saver",
+            "--gpu-memory-utilization", "0.5", "--enable-output-logprobs", "--enable-memory-saver", *extra_args,
         ]  # fmt: skip
         print("launching:", " ".join(command), flush=True)
         self.log = log.open("w")
@@ -233,6 +233,76 @@ def weight_sync(model_path: str, tp: int, out: Path, prompt: list[int], checks: 
     return report
 
 
+def check_server(model, tp, out, variant, extra_args, prompt_ids, tokenizer) -> dict:
+    """Generation, a VIZTRACER+PROTON profile and sleep/wake on one server configuration."""
+    result: dict = {"checks": {}}
+    checks = result["checks"]
+    server = Server(model, tp, out / f"tokenspeed_serve_{variant}.log", extra_args)
+
+    def generate(ids):
+        body = {
+            "input_ids": list(ids),
+            "sampling_params": {"max_new_tokens": 64, "temperature": 1.0},
+            "return_logprob": True,
+        }
+        return server.post("/generate", body)
+
+    try:
+        # 1. token-in, token-out generation with log probs
+        output = generate(prompt_ids[0])
+        result["generate_example"] = output
+        token_ids = output.get("output_ids") or []
+        logprobs = (output.get("meta_info") or {}).get("output_token_logprobs") or []
+        checks["generate_logprobs"] = bool(token_ids) and len(token_ids) == len(logprobs)
+        result["generate_text"] = tokenizer.decode(token_ids)
+
+        # 2. profile concurrent requests
+        profile_dir = out / f"profile_{variant}"
+        start = time.time()
+        result["start_profile"] = server.post(
+            "/start_profile",
+            {"output_dir": str(profile_dir), "activities": ["VIZTRACER", "PROTON"], "profile_id": "e0"},
+        )
+        with concurrent.futures.ThreadPoolExecutor(16) as pool:
+            outputs = list(pool.map(generate, prompt_ids))
+        try:
+            result["stop_profile"] = server.post("/stop_profile")
+        except RuntimeError as error:
+            result["stop_profile_error"] = str(error)
+        result["profile_seconds"] = time.time() - start
+        checks["profiled_requests"] = all(o.get("output_ids") for o in outputs)
+        expected = {
+            f"e0-TP{rank}.{suffix}" for rank in range(tp) for suffix in ("viztracer.json", "proton.chrome_trace")
+        }
+        deadline = time.monotonic() + 60
+        while not expected <= {p.name for p in profile_dir.glob("*")} and time.monotonic() < deadline:
+            time.sleep(1)
+        files = sorted(p.name for p in profile_dir.glob("*"))
+        result["profile_files"] = {name: (profile_dir / name).stat().st_size for name in files}
+        checks["profile_files"] = expected <= set(files)
+        anchors = {}
+        for name in sorted(expected & set(files)):
+            data = json.loads((profile_dir / name).read_text())
+            anchor = data.get("viztracer_metadata", {}).get("baseTimeNanoseconds") or data.get("baseTimeNanoseconds")
+            events = data.get("traceEvents", [])
+            anchors[name] = {
+                "baseTimeNanoseconds": anchor,
+                "events": len(events),
+                "flows": sum(1 for e in events if e.get("ph") in ("s", "f")),
+                "scope_ids": sum(1 for e in events if isinstance(e.get("args"), dict) and "scope_id" in e["args"]),
+            }
+        result["profile_anchors"] = anchors
+        checks["profile_anchors"] = bool(anchors) and all(a["baseTimeNanoseconds"] for a in anchors.values())
+
+        # 3. sleep and wake
+        result["release"] = server.post("/release_memory_occupation", {"tags": ["kv_cache", "weights"]})
+        result["resume"] = server.post("/resume_memory_occupation", {"tags": ["kv_cache", "weights"]})
+        checks["generate_after_wake"] = bool(generate(prompt_ids[1]).get("output_ids"))
+    finally:
+        server.close()
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -253,70 +323,18 @@ def main():
         for p in prompts
     ]
 
-    server = Server(args.model, args.tp, out / "tokenspeed_serve.log")
-
-    def generate(ids):
-        body = {
-            "input_ids": list(ids),
-            "sampling_params": {"max_new_tokens": 64, "temperature": 1.0},
-            "return_logprob": True,
-        }
-        return server.post("/generate", body)
-
-    try:
-        # 1. token-in, token-out generation with log probs
-        output = generate(prompt_ids[0])
-        summary["generate_example"] = output
-        token_ids = output.get("output_ids") or []
-        logprobs = (output.get("meta_info") or {}).get("output_token_logprobs") or []
-        checks["generate_logprobs"] = bool(token_ids) and len(token_ids) == len(logprobs)
-        summary["generate_text"] = tokenizer.decode(token_ids)
-
-        # 2. profile concurrent requests
-        profile_dir = out / "profile"
-        start = time.time()
-        summary["start_profile"] = server.post(
-            "/start_profile",
-            {"output_dir": str(profile_dir), "activities": ["VIZTRACER", "PROTON"], "profile_id": "e0"},
-        )
-        with concurrent.futures.ThreadPoolExecutor(16) as pool:
-            outputs = list(pool.map(generate, prompt_ids))
-        summary["stop_profile"] = server.post("/stop_profile")
-        summary["profile_seconds"] = time.time() - start
-        checks["profiled_requests"] = all(o.get("output_ids") for o in outputs)
-        deadline = time.monotonic() + 120
-        expected = {
-            f"e0-TP{rank}.{suffix}" for rank in range(args.tp) for suffix in ("viztracer.json", "proton.chrome_trace")
-        }
-        while not expected <= {p.name for p in profile_dir.glob("*")} and time.monotonic() < deadline:
-            time.sleep(1)
-        files = sorted(p.name for p in profile_dir.glob("*"))
-        summary["profile_files"] = {name: (profile_dir / name).stat().st_size for name in files}
-        checks["profile_files"] = expected <= set(files)
-        anchors = {}
-        for name in sorted(expected & set(files)):
-            data = json.loads((profile_dir / name).read_text())
-            anchor = data.get("viztracer_metadata", {}).get("baseTimeNanoseconds") or data.get("baseTimeNanoseconds")
-            flows = sum(1 for e in data.get("traceEvents", []) if e.get("ph") in ("s", "f"))
-            scopes = sum(
-                1 for e in data.get("traceEvents", []) if isinstance(e.get("args"), dict) and "scope_id" in e["args"]
-            )
-            anchors[name] = {
-                "baseTimeNanoseconds": anchor,
-                "events": len(data.get("traceEvents", [])),
-                "flows": flows,
-                "scope_ids": scopes,
-            }
-        summary["profile_anchors"] = anchors
-        checks["profile_anchors"] = bool(anchors) and all(a["baseTimeNanoseconds"] for a in anchors.values())
-
-        # 3. sleep and wake
-        for tags in (["kv_cache", "weights"],):
-            summary["release"] = server.post("/release_memory_occupation", {"tags": tags})
-            summary["resume"] = server.post("/resume_memory_occupation", {"tags": tags})
-        checks["generate_after_wake"] = bool(generate(prompt_ids[1]).get("output_ids"))
-    finally:
-        server.close()
+    # 1-3 per server configuration: Proton's trace mode may not cover kernels
+    # launched by CUDA graph replays, so profiling is also tried without graphs.
+    profiled = []
+    for variant, extra_args in (("default", ()), ("eager", ("--enforce-eager",))):
+        try:
+            result = check_server(args.model, args.tp, out, variant, extra_args, prompt_ids, tokenizer)
+        except Exception as error:
+            result = {"error": repr(error), "checks": {}}
+        summary[variant] = result
+        checks.update({f"{variant}_{name}": ok for name, ok in result["checks"].items()})
+        if result["checks"].get("profile_files"):
+            profiled.append(variant)
 
     # 4. weight sync
     try:
@@ -325,38 +343,51 @@ def main():
         summary["weight_sync_error"] = repr(error)
         checks.setdefault("weight_sync", False)
 
-    # 5. merge
-    ours = subprocess.run(
-        [sys.executable, "-m", "rl_trace_observer.merger.cli", str(out / "profile"), "-o", str(out / "e0_merged.json")],
-        capture_output=True,
-        text=True,
-    )
-    summary["rl_trace_merge"] = {"returncode": ours.returncode, "log": ours.stderr[-4000:]}
-    checks["rl_trace_merge"] = ours.returncode == 0
-    ranks = []
-    for rank in range(args.tp):
-        ranks += [
-            "--rank",
-            str(rank),
-            str(out / f"profile/e0-TP{rank}.viztracer.json"),
-            str(out / f"profile/e0-TP{rank}.proton.chrome_trace"),
-        ]
-    official = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "tokenspeed.cli",
-            "merge-traces",
-            "--all-ranks",
-            *ranks,
-            "-o",
-            str(out / "e0_official.json"),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    summary["official_merge"] = {"returncode": official.returncode, "log": (official.stdout + official.stderr)[-4000:]}
-    checks["official_merge"] = official.returncode == 0
+    # 5. merge every complete profile both ways
+    checks["some_profile_complete"] = bool(profiled)
+    for variant in profiled:
+        profile_dir = out / f"profile_{variant}"
+        ours = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "rl_trace_observer.merger.cli",
+                str(profile_dir),
+                "-o",
+                str(out / f"e0_{variant}_merged.json"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        summary[variant]["rl_trace_merge"] = {"returncode": ours.returncode, "log": ours.stderr[-4000:]}
+        checks[f"{variant}_rl_trace_merge"] = ours.returncode == 0
+        ranks = []
+        for rank in range(args.tp):
+            ranks += [
+                "--rank",
+                str(rank),
+                str(profile_dir / f"e0-TP{rank}.viztracer.json"),
+                str(profile_dir / f"e0-TP{rank}.proton.chrome_trace"),
+            ]
+        official = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "tokenspeed.cli",
+                "merge-traces",
+                "--all-ranks",
+                *ranks,
+                "-o",
+                str(out / f"e0_{variant}_official.json"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        summary[variant]["official_merge"] = {
+            "returncode": official.returncode,
+            "log": (official.stdout + official.stderr)[-4000:],
+        }
+        checks[f"{variant}_official_merge"] = official.returncode == 0
 
     (out / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     print(json.dumps(checks, indent=2))
