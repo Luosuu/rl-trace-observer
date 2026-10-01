@@ -24,10 +24,10 @@ RUN_E0=${RUN_E0:-1}
 mkdir -p "$RESULTS_DIR" "$WORK_DIR"
 exec > >(tee -a "$RESULTS_DIR/job.log") 2>&1
 
-sync_results() { rsync -a --exclude 'artifacts/' "$WORK_DIR/out/" "$RESULTS_DIR/" 2>/dev/null || true; }
+sync_results() { rsync -a --inplace --exclude 'artifacts/' "$WORK_DIR/out/" "$RESULTS_DIR/" 2>/dev/null || true; }
 finish() {
   sync_results
-  rsync -a "$WORK_DIR/out/" "$RESULTS_DIR/" || true
+  rsync -a --inplace "$WORK_DIR/out/" "$RESULTS_DIR/" || true
   echo "=== results in $RESULTS_DIR"
 }
 trap finish EXIT
@@ -76,6 +76,7 @@ $PY -m verl.trainer.main_ppo \
   data.max_response_length=512 \
   data.filter_overlong_prompts=True \
   actor_rollout_ref.model.path="$MODEL_DIR" \
+  +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
   actor_rollout_ref.actor.strategy=fsdp2 \
   actor_rollout_ref.ref.strategy=fsdp2 \
   actor_rollout_ref.actor.optim.lr=1e-6 \
