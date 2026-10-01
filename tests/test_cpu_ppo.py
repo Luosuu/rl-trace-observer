@@ -27,7 +27,10 @@ MIN_GENERATE_US = 50_000
 TOLERANCE_NS = 5_000_000
 
 
-def _run_main_ppo(assets: dict[str, Path], output_dir: Path, log: Path) -> subprocess.CompletedProcess:
+def run_main_ppo(
+    assets: dict[str, Path], output_dir: Path, log: Path, rollout: str = "mock", env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
+    extra_env = env or {}
     env = {
         **os.environ,
         "PYTHONPATH": os.pathsep.join(filter(None, [str(TESTS_DIR), os.environ.get("PYTHONPATH")])),
@@ -37,6 +40,7 @@ def _run_main_ppo(assets: dict[str, Path], output_dir: Path, log: Path) -> subpr
         "RL_INSIGHT_SERVER_URL": "local://rl-trace-observer",
         "TOKENIZERS_PARALLELISM": "false",
         "HYDRA_FULL_ERROR": "1",
+        **extra_env,
     }
     overrides = [
         "algorithm.adv_estimator=grpo",
@@ -55,7 +59,7 @@ def _run_main_ppo(assets: dict[str, Path], output_dir: Path, log: Path) -> subpr
         "actor_rollout_ref.actor.ppo_mini_batch_size=4",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.actor.use_kl_loss=False",
-        "actor_rollout_ref.rollout.name=mock",
+        f"actor_rollout_ref.rollout.name={rollout}",
         f"actor_rollout_ref.rollout.n={ROLLOUT_N}",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
@@ -100,7 +104,7 @@ def _run_main_ppo(assets: dict[str, Path], output_dir: Path, log: Path) -> subpr
         )
 
 
-def _failure_report(log: Path) -> str:
+def failure_report(log: Path) -> str:
     # Ray interleaves worker output, and a C++ stack trace easily pushes the
     # actual error out of the tail; list the error lines first.
     lines = log.read_text(errors="replace").splitlines()
@@ -109,7 +113,7 @@ def _failure_report(log: Path) -> str:
     return "\n".join(["--- error lines ---", *errors[:80], "--- log tail ---", *lines[-60:]])
 
 
-def _rl_insight_spans(output_dir: Path) -> list[dict]:
+def rl_insight_spans(output_dir: Path) -> list[dict]:
     return [
         event
         for path in output_dir.glob("rl-insight-*.chrome.jsonl")
@@ -122,10 +126,10 @@ def test_one_ppo_step_on_cpu_produces_aligned_traces(tmp_path, load_in_perfetto)
     output_dir = tmp_path / "artifacts"
     log = tmp_path / "main_ppo.log"
 
-    result = _run_main_ppo(assets, output_dir, log)
-    assert result.returncode == 0, _failure_report(log)
+    result = run_main_ppo(assets, output_dir, log)
+    assert result.returncode == 0, failure_report(log)
 
-    spans = _rl_insight_spans(output_dir)
+    spans = rl_insight_spans(output_dir)
     lanes = defaultdict(set)
     for span in spans:
         lanes[span["tid"]].add(span["name"])
