@@ -2,7 +2,9 @@
 
 Every process that writes an artifact registers it in its process record
 (``rl-trace-process-<host>-pid-<pid>.json``): RL-Insight JSONL and VizTracer
-reports when they are created, VERL's Torch traces when they are exported. The
+reports when they are created, VERL's Torch traces when they are exported, and
+the TokenSpeed scheduler profiles a rollout server stopped, under the server
+actor that requested them with the scheduler's ``rank_tag``. The
 record is the only source of ownership: an artifact belongs to the process
 that registered it, with the step and role it registered. Nothing is inferred
 from filenames, pids or ranks.
@@ -59,7 +61,7 @@ class Process:
     run_id: str | None = None
     role: str | None = None
     versions: dict[str, str] = field(default_factory=dict)
-    # Registered artifact path -> its record entry (kind, file, global_step, role).
+    # Registered artifact path -> its record entry (kind, file, global_step, role, rank_tag).
     artifacts: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
@@ -84,6 +86,7 @@ class Artifact:
     global_step: int | None = None
     profile_session_id: str | None = None
     role: str | None = None
+    rank_tag: str | None = None
     # False when the artifact is outside the chosen run or steps.
     selected: bool = True
 
@@ -152,7 +155,7 @@ _RECORD_FIELDS: dict[str, type] = {
     "versions": dict,
     "artifacts": list,
 }
-_ENTRY_FIELDS: dict[str, type] = {"kind": str, "file": str, "global_step": int, "role": str}
+_ENTRY_FIELDS: dict[str, type] = {"kind": str, "file": str, "global_step": int, "role": str, "rank_tag": str}
 
 
 def _check_types(data: object, fields: dict[str, type], what: str) -> None:
@@ -264,9 +267,11 @@ def build_manifest(inputs: Iterable[Path]) -> tuple[SessionManifest, list[TraceS
             source.process, source.host = process.key, process.host
             source.global_step = entry.get("global_step")
             source.role = entry.get("role") or process.role
+            source.rank_tag = entry.get("rank_tag") or source.rank_tag
             artifact.process, artifact.run_id = process.key, process.run_id
             artifact.global_step, artifact.role = source.global_step, source.role
             artifact.profile_session_id = profile_session_id(artifact.run_id, artifact.global_step)
+        artifact.rank_tag = source.rank_tag
         sources.append(source)
 
     found_paths = {str(path) for _, path in found}
