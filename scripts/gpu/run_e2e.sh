@@ -8,8 +8,8 @@
 #       RL-Insight), then `rl-trace-merge --strict --step N`.
 #
 # Run from the repository root. Results go to $RESULTS_DIR (default ./gpu-results/<time>);
-# artifacts are written to local disk and copied there, since object-storage
-# mounts handle appends and renames poorly.
+# everything is written to local disk and copied there once at the end, since
+# object-storage mounts cannot overwrite or rename files.
 set -uo pipefail
 
 REPO_DIR=$(pwd)
@@ -22,17 +22,14 @@ N_GPUS=${N_GPUS:-4}
 ROLLOUT_TP=${ROLLOUT_TP:-2}
 RUN_E0=${RUN_E0:-1}
 mkdir -p "$RESULTS_DIR" "$WORK_DIR"
-exec > >(tee -a "$RESULTS_DIR/job.log") 2>&1
+mkdir -p "$WORK_DIR/out"
+exec > >(tee -a "$WORK_DIR/out/job.log") 2>&1
 
-sync_results() { rsync -a --inplace --inplace --exclude 'artifacts/' "$WORK_DIR/out/" "$RESULTS_DIR/" 2>/dev/null || true; }
 finish() {
-  sync_results
-  rsync -a --inplace --inplace "$WORK_DIR/out/" "$RESULTS_DIR/" || true
-  echo "=== results in $RESULTS_DIR"
+  echo "=== copying results to $RESULTS_DIR"
+  cp -r "$WORK_DIR/out/." "$RESULTS_DIR/" || true
 }
 trap finish EXIT
-mkdir -p "$WORK_DIR/out"
-( while sleep 60; do sync_results; done ) &
 
 echo "=== $(date -u) commit $(git rev-parse HEAD 2>/dev/null)"
 nvidia-smi || true
@@ -42,6 +39,8 @@ export UV_PROJECT_ENVIRONMENT=$WORK_DIR/venv UV_HTTP_TIMEOUT=600
 command -v uv >/dev/null || pip install -q uv || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH=$HOME/.local/bin:$PATH
 uv sync --locked --extra tokenspeed || exit 1
+# JIT builds (flashinfer) run the venv's ninja.
+export PATH=$UV_PROJECT_ENVIRONMENT/bin:$PATH
 PY=$UV_PROJECT_ENVIRONMENT/bin/python
 $PY -c "import torch, tokenspeed; print('torch', torch.__version__, 'cuda', torch.version.cuda, torch.cuda.device_count(), 'gpus')"
 $PY -m tokenspeed.cli env > "$WORK_DIR/out/tokenspeed_env.txt" 2>&1 || true
@@ -54,7 +53,6 @@ if [ "$RUN_E0" = 1 ]; then
   echo "=== E0: TokenSpeed alone"
   CUDA_VISIBLE_DEVICES=0,1 $PY scripts/gpu/tokenspeed_smoke.py --model "$MODEL_DIR" --out "$WORK_DIR/out/e0" --tp 2
   echo "E0 exit $?"
-  sync_results
 fi
 
 echo "=== E2: VERL GRPO with TokenSpeed rollout"
