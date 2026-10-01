@@ -7,7 +7,12 @@ Launches ``tokenspeed serve`` (TP=2 by default), then checks and records:
    VizTracer report and one Proton Chrome trace per TP rank, each with its
    ``baseTimeNanoseconds`` anchor;
 3. releasing and resuming weights and KV cache keeps generation working;
-4. ``rl-trace-merge`` and ``tokenspeed merge-traces --all-ranks`` both merge
+4. weights sent the way the VERL rollout sends them (released, weights resumed,
+   NCCL group from a "trainer" on the next GPU, buckets broadcast with
+   ``/update_weights_from_distributed``) are loaded: zeroing the final norm
+   changes greedy output and sending the original weights restores it, with
+   and without ``/pause_generation`` around the update;
+5. ``rl-trace-merge`` and ``tokenspeed merge-traces --all-ranks`` both merge
    the profile.
 
     python scripts/gpu/tokenspeed_smoke.py --model PATH --out DIR [--tp 2]
@@ -22,6 +27,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -40,6 +46,8 @@ class Server:
         self.port, self.control_port = _free_port(), _free_port()
         env = {
             **os.environ,
+            # The server takes the first tp GPUs; the "trainer" uses the next one.
+            "CUDA_VISIBLE_DEVICES": ",".join(os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2").split(",")[:tp]),
             "TOKENSPEED_KERNEL_PROFILE_DATA": "trace",
             "TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT": "chrome_trace",
         }
@@ -74,6 +82,15 @@ class Server:
             raise RuntimeError(f"POST {path}: {response.status_code} {response.text[:2000]}")
         return response.json() if response.text else {}
 
+    def dump_stacks(self, path: Path) -> None:
+        """py-spy stacks of every server process, for a hang."""
+        import psutil
+
+        with path.open("a") as file:
+            for proc in [psutil.Process(self.process.pid), *psutil.Process(self.process.pid).children(recursive=True)]:
+                result = subprocess.run(["py-spy", "dump", "--pid", str(proc.pid)], capture_output=True, text=True)
+                file.write(f"=== pid {proc.pid} {' '.join(proc.cmdline())[:200]}\n{result.stdout}{result.stderr}\n")
+
     def close(self):
         self.process.terminate()
         try:
@@ -81,6 +98,139 @@ class Server:
         except subprocess.TimeoutExpired:
             self.process.kill()
         self.log.close()
+
+
+def _run(function, timeout: float, name: str, on_timeout=None):
+    """Run ``function`` in a thread; raise if it does not finish in time."""
+    result: dict = {}
+
+    def target():
+        try:
+            result["value"] = function()
+        except BaseException as error:
+            result["error"] = error
+
+    thread = threading.Thread(target=target, daemon=True)
+    start = time.time()
+    thread.start()
+    thread.join(timeout)
+    print(f"  {name}: {time.time() - start:.1f}s", flush=True)
+    if thread.is_alive():
+        if on_timeout:
+            on_timeout()
+        raise TimeoutError(f"{name} did not finish in {timeout}s")
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
+class _WeightSync:
+    """One server receiving weights from a "trainer" rank on the next GPU, like TokenSpeedServerAdapter."""
+
+    def __init__(self, model_path: str, tp: int, out: Path, prompt: list[int], pause: bool):
+        import torch
+
+        from rl_trace_observer.integrations.tokenspeed.adapter import _join_group
+
+        self.prompt, self.pause, self.out = prompt, pause, out
+        self.device = torch.device("cuda", tp)
+        self.group_name = f"smoke_{int(pause)}"
+        self.server = Server(model_path, tp, out / f"weight_sync_server_pause{int(pause)}.log")
+        port = _free_port()
+        body = {
+            "master_address": "127.0.0.1",
+            "master_port": port,
+            "rank_offset": 1,
+            "world_size": 1 + tp,
+            "group_name": self.group_name,
+            "backend": "nccl",
+        }
+        self.server.post("/release_memory_occupation", {"tags": ["kv_cache", "weights"]})
+        self.server.post("/resume_memory_occupation", {"tags": ["weights"]})
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            joined = pool.submit(self.server.post, "/init_weights_update_group", body, 300)
+            self.group = _run(
+                lambda: self._on_device(_join_group, "127.0.0.1", port, 1 + tp, self.group_name, "nccl"),
+                300,
+                "join",
+                self.dump,
+            )
+            joined.result(timeout=300)
+        self.server.post("/resume_memory_occupation", {"tags": ["kv_cache"]})
+
+    def _on_device(self, function, *args):
+        import torch
+
+        torch.cuda.set_device(self.device)
+        return function(*args)
+
+    def dump(self):
+        self.server.dump_stacks(self.out / "weight_sync_stacks.txt")
+
+    def greedy(self) -> list[int]:
+        body = {"input_ids": list(self.prompt), "sampling_params": {"max_new_tokens": 32, "temperature": 0.0}}
+        return self.server.post("/generate", body, timeout=120)["output_ids"]
+
+    def _send(self, named: dict) -> None:
+        import torch
+
+        names = list(named)
+        for start in range(0, len(names), 64):
+            bucket = names[start : start + 64]
+            body = {
+                "names": bucket,
+                "dtypes": [str(named[n].dtype).removeprefix("torch.") for n in bucket],
+                "shapes": [list(named[n].shape) for n in bucket],
+                "group_name": self.group_name,
+                "flush_cache": False,
+            }
+            with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                received = pool.submit(self.server.post, "/update_weights_from_distributed", body, 300)
+                for n in bucket:
+                    torch.distributed.broadcast(named[n], src=0, group=self.group)
+                torch.cuda.synchronize()
+                received.result(timeout=300)
+
+    def sync(self, named: dict) -> None:
+        """Sleep, wake the weights, send them and wake the KV cache, as in a VERL step."""
+        self.server.post("/release_memory_occupation", {"tags": ["kv_cache", "weights"]})
+        self.server.post("/resume_memory_occupation", {"tags": ["weights"]})
+        if self.pause:
+            self.server.post("/pause_generation")
+        _run(lambda: self._on_device(self._send, named), 300, f"send pause={self.pause}", self.dump)
+        if self.pause:
+            self.server.post("/continue_generation")
+        self.server.post("/resume_memory_occupation", {"tags": ["kv_cache"]})
+        requests.get(self.server.url("/flush_cache"), timeout=60)
+
+
+def weight_sync(model_path: str, tp: int, out: Path, prompt: list[int], checks: dict) -> dict:
+    """Zero the final norm, then restore it, through the weight-sync API; see the module docstring."""
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16).to(torch.device("cuda", tp))
+    weights = {name: tensor.detach().contiguous() for name, tensor in model.state_dict().items()}
+    zeroed = {**weights, "model.norm.weight": torch.zeros_like(weights["model.norm.weight"])}
+    report = {}
+    for pause in (False, True):
+        sync = None
+        try:
+            sync = _WeightSync(model_path, tp, out, prompt, pause)
+            before = sync.greedy()
+            sync.sync(zeroed)
+            changed = sync.greedy()
+            sync.sync(weights)
+            after = sync.greedy()
+            report[f"pause={pause}"] = {"changed": changed != before, "restored": after == before}
+            checks[f"weight_sync_pause{int(pause)}"] = changed != before and after == before
+        except Exception as error:
+            report[f"pause={pause}"] = {"error": repr(error)}
+            checks[f"weight_sync_pause{int(pause)}"] = False
+        finally:
+            if sync is not None:
+                sync.server.close()
+    return report
 
 
 def main():
@@ -97,7 +247,9 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     prompts = [f"What is {a} + {b}? Answer briefly." for a, b in zip(range(1, 33), range(100, 132), strict=True)]
     prompt_ids = [
-        tokenizer.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, tokenize=True)
+        tokenizer.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, tokenize=True)[
+            "input_ids"
+        ]
         for p in prompts
     ]
 
@@ -166,7 +318,14 @@ def main():
     finally:
         server.close()
 
-    # 4. merge
+    # 4. weight sync
+    try:
+        summary["weight_sync"] = weight_sync(args.model, args.tp, out, prompt_ids[2], checks)
+    except Exception as error:  # recorded, so the merge checks still run
+        summary["weight_sync_error"] = repr(error)
+        checks.setdefault("weight_sync", False)
+
+    # 5. merge
     ours = subprocess.run(
         [sys.executable, "-m", "rl_trace_observer.merger.cli", str(out / "profile"), "-o", str(out / "e0_merged.json")],
         capture_output=True,

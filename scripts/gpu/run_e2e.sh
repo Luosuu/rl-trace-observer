@@ -21,6 +21,7 @@ PROFILE_STEPS=${PROFILE_STEPS:-[3,4]}
 N_GPUS=${N_GPUS:-4}
 ROLLOUT_TP=${ROLLOUT_TP:-2}
 RUN_E0=${RUN_E0:-1}
+RUN_E2=${RUN_E2:-1}
 mkdir -p "$RESULTS_DIR" "$WORK_DIR"
 mkdir -p "$WORK_DIR/out"
 exec > >(tee -a "$WORK_DIR/out/job.log") 2>&1
@@ -51,10 +52,11 @@ MODEL_DIR=$WORK_DIR/models/$(basename "$MODEL")
 
 if [ "$RUN_E0" = 1 ]; then
   echo "=== E0: TokenSpeed alone"
-  CUDA_VISIBLE_DEVICES=0,1 $PY scripts/gpu/tokenspeed_smoke.py --model "$MODEL_DIR" --out "$WORK_DIR/out/e0" --tp 2
+  CUDA_VISIBLE_DEVICES=0,1,2 $PY scripts/gpu/tokenspeed_smoke.py --model "$MODEL_DIR" --out "$WORK_DIR/out/e0" --tp 2
   echo "E0 exit $?"
 fi
 
+[ "$RUN_E2" = 1 ] || exit 0
 echo "=== E2: VERL GRPO with TokenSpeed rollout"
 E2=$WORK_DIR/out/e2
 mkdir -p "$E2"
@@ -104,8 +106,8 @@ $PY -m verl.trainer.main_ppo \
   trainer.project_name=rl_trace_observer \
   trainer.experiment_name=tokenspeed_e2e \
   hydra.run.dir="$E2/hydra" \
-  > "$E2/main_ppo.log" 2>&1
-status=$?
+  2>&1 | tee "$E2/main_ppo.log" | grep --line-buffered -E "step:[0-9]+ |Traceback|Error|Sent [0-9]+ tensors|TokenSpeed ready"
+status=${PIPESTATUS[0]}
 echo "E2 main_ppo exit $status after $(( $(date +%s) - start ))s"
 grep -E "step:[0-9]+ " "$E2/main_ppo.log" | tail -n "$STEPS" > "$E2/metrics.txt" || true
 tar czf "$E2/ray_logs.tgz" -C /tmp/ray/session_latest logs 2>/dev/null || true
