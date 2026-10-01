@@ -26,31 +26,35 @@ from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.utils import ensure_async_iterator
 
 from .server import _free_port, server_name
+from .weight_group import GROUP_PREFIX, standalone
 
 logger = logging.getLogger(__name__)
 
-GROUP_NAME = "rl_trace_observer_tokenspeed_{replica}"
+GROUP_NAME = GROUP_PREFIX + "{replica}"
 SYNC_TIMEOUT = timedelta(seconds=float(os.environ.get("RL_TRACE_TOKENSPEED_SYNC_TIMEOUT", "600")))
 
 
 def _join_group(master_address: str, master_port: int, world_size: int, group_name: str, backend: str):
     """Create the weight-update group as its rank 0, the way TokenSpeed's workers join it."""
+    from torch.distributed import distributed_c10d as c10d
     from torch.distributed.distributed_c10d import Backend, PrefixStore, _new_process_group_helper, _world, rendezvous
 
     store, rank, world_size = next(
         rendezvous(f"tcp://{master_address}:{master_port}", 0, world_size, timeout=SYNC_TIMEOUT)
     )
     store.set_timeout(SYNC_TIMEOUT)
-    group, _ = _new_process_group_helper(
-        world_size,
-        rank,
-        [],
-        Backend(backend),
-        PrefixStore(group_name, store),
-        group_name=group_name,
-        backend_options=None,
-        timeout=SYNC_TIMEOUT,
-    )
+    # Not a split of the trainer's own world (see .weight_group).
+    with standalone(c10d):
+        group, _ = _new_process_group_helper(
+            world_size,
+            rank,
+            [],
+            Backend(backend),
+            PrefixStore(group_name, store),
+            group_name=group_name,
+            backend_options=None,
+            timeout=SYNC_TIMEOUT,
+        )
     _world.pg_group_ranks[group] = {i: i for i in range(world_size)}
     return group
 

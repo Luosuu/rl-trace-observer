@@ -133,7 +133,11 @@ class TokenSpeedServer:
         return command + args + shlex.split(os.environ.get(EXTRA_ARGS_ENV, ""))
 
     async def launch_server(self) -> None:
+        from .weight_group import SITE_DIR
+
         env = {**os.environ, "CUDA_VISIBLE_DEVICES": self.cuda_visible_devices}
+        # Weight-update groups must not split from TokenSpeed's own world (see .weight_group).
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(SITE_DIR), env.get("PYTHONPATH")]))
         for key, value in PROTON_ENV_DEFAULTS.items():
             env.setdefault(key, value)
         command = self._command()
