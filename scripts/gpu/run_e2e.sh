@@ -52,7 +52,7 @@ MODEL_DIR=$WORK_DIR/models/$(basename "$MODEL")
 
 if [ "$RUN_E0" = 1 ]; then
   echo "=== E0: TokenSpeed alone"
-  CUDA_VISIBLE_DEVICES=0,1,2 $PY scripts/gpu/tokenspeed_smoke.py --model "$MODEL_DIR" --out "$WORK_DIR/out/e0" --tp 2
+  NCCL_DEBUG=${E0_NCCL_DEBUG:-INFO} CUDA_VISIBLE_DEVICES=0,1,2 $PY scripts/gpu/tokenspeed_smoke.py --model "$MODEL_DIR" --out "$WORK_DIR/out/e0" --tp 2
   echo "E0 exit $?"
 fi
 

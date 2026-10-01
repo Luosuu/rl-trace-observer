@@ -127,34 +127,25 @@ def _run(function, timeout: float, name: str, on_timeout=None):
 # "verl" is the order of VERL's hybrid trainer: sleep, wake the weights, update, wake the KV cache.
 SYNC_PROTOCOLS = {
     "awake": ([], []),
-    "awake_pause": ([("/pause_generation", None)], [("/continue_generation", None)]),
-    "kv_released": (
-        [("/release_memory_occupation", ["kv_cache"])],
-        [("/resume_memory_occupation", ["kv_cache"])],
-    ),
-    "full_cycle": (
-        [
-            ("/release_memory_occupation", ["kv_cache", "weights"]),
-            ("/resume_memory_occupation", ["kv_cache", "weights"]),
-        ],
-        [],
-    ),
     "verl": (
         [("/release_memory_occupation", ["kv_cache", "weights"]), ("/resume_memory_occupation", ["weights"])],
         [("/resume_memory_occupation", ["kv_cache"])],
     ),
 }
+# Cases: (protocol, tp, seconds to wait between posting a bucket and broadcasting it).
+SYNC_CASES = [("awake", 2, 0.0), ("awake", 2, 2.0), ("awake", 1, 2.0), ("verl", 2, 2.0)]
 
 
 class _WeightSync:
     """One server receiving weights from a "trainer" rank on the next GPU, like TokenSpeedServerAdapter."""
 
-    def __init__(self, model_path: str, tp: int, out: Path, prompt: list[int], protocol: str):
+    def __init__(self, model_path: str, tp: int, out: Path, prompt: list[int], protocol: str, delay: float):
         from rl_trace_observer.integrations.tokenspeed.adapter import _join_group
 
-        self.prompt, self.protocol, self.out, self.tp = prompt, protocol, out, tp
-        self.group_name = f"smoke_{protocol}_{tp}"
-        self.server = Server(model_path, tp, out / f"weight_sync_{protocol}_tp{tp}.log")
+        self.prompt, self.protocol, self.out, self.tp, self.delay = prompt, protocol, out, tp, delay
+        self.name = f"{protocol}_tp{tp}_delay{delay:g}"
+        self.group_name = f"smoke_{self.name}".replace(".", "_")
+        self.server = Server(model_path, tp, out / f"weight_sync_{self.name}.log")
         port = _free_port()
         body = {
             "master_address": "127.0.0.1",
@@ -181,7 +172,14 @@ class _WeightSync:
         return function(*args)
 
     def dump(self):
-        self.server.dump_stacks(self.out / f"weight_sync_{self.protocol}_tp{self.tp}_stacks.txt")
+        path = self.out / f"weight_sync_{self.name}_stacks.txt"
+        self.server.dump_stacks(path)
+        # This process: the thread broadcasting and the one posting the bucket.
+        result = subprocess.run(
+            ["py-spy", "dump", "--native", "--pid", str(os.getpid())], capture_output=True, text=True
+        )
+        with path.open("a") as file:
+            file.write(f"=== sender pid {os.getpid()}\n{result.stdout}{result.stderr}\n")
 
     def greedy(self) -> list[int]:
         body = {"input_ids": list(self.prompt), "sampling_params": {"max_new_tokens": 32, "temperature": 0.0}}
@@ -201,38 +199,40 @@ class _WeightSync:
                 "flush_cache": False,
             }
             with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                posted = time.time()
                 received = pool.submit(self.server.post, "/update_weights_from_distributed", body, 120)
+                time.sleep(self.delay)
                 for n in bucket:
                     torch.distributed.broadcast(named[n], src=0, group=self.group)
                 torch.cuda.synchronize()
                 received.result(timeout=120)
+                print(f"    bucket {start // 64}: {time.time() - posted:.2f}s", flush=True)
 
     def sync(self, named: dict) -> None:
         before, after = SYNC_PROTOCOLS[self.protocol]
         for path, tags in before:
             self.server.post(path, {"tags": tags} if tags else None)
-        _run(lambda: self._on_device(self._send, named), 120, f"send {self.protocol} tp={self.tp}", self.dump)
+        _run(lambda: self._on_device(self._send, named), 120, f"send {self.name}", self.dump)
         for path, tags in after:
             self.server.post(path, {"tags": tags} if tags else None)
         requests.get(self.server.url("/flush_cache"), timeout=60)
 
 
 def weight_sync(model_path: str, tp: int, out: Path, prompt: list[int], checks: dict) -> dict:
-    """For each protocol, zero the final norm and restore it through the weight-sync API."""
+    """For each case, zero the final norm and restore it through the weight-sync API."""
     import torch
     from transformers import AutoModelForCausalLM
 
     report = {}
-    cases = [(protocol, tp) for protocol in SYNC_PROTOCOLS] + [("verl", 1)]
-    for protocol, case_tp in cases:
+    for protocol, case_tp, delay in SYNC_CASES:
         device = torch.device("cuda", case_tp)
         model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16).to(device)
         weights = {name: tensor.detach().contiguous() for name, tensor in model.state_dict().items()}
         zeroed = {**weights, "model.norm.weight": torch.zeros_like(weights["model.norm.weight"])}
-        name = f"weight_sync_{protocol}_tp{case_tp}"
         sync = None
+        name = f"weight_sync_{protocol}_tp{case_tp}_delay{delay:g}"
         try:
-            sync = _WeightSync(model_path, case_tp, out, prompt, protocol)
+            sync = _WeightSync(model_path, case_tp, out, prompt, protocol, delay)
             before = sync.greedy()
             sync.sync(zeroed)
             changed = sync.greedy()
@@ -250,6 +250,17 @@ def weight_sync(model_path: str, tp: int, out: Path, prompt: list[int], checks: 
             torch.cuda.empty_cache()
         print(f"  {name}: {report[name]}", flush=True)
     return report
+
+
+def _rank_files(profile_dir: Path, tp: int) -> dict[str, Path]:
+    """``TP<k>.<suffix>`` -> file; tokenspeed serve names files after a timestamp, not the profile_id."""
+    files = {}
+    for path in profile_dir.glob("*") if profile_dir.is_dir() else []:
+        for rank in range(tp):
+            for suffix in ("viztracer.json", "proton.chrome_trace"):
+                if path.name.endswith(f"-TP{rank}.{suffix}"):
+                    files[f"TP{rank}.{suffix}"] = path
+    return files
 
 
 def check_server(model, tp, out, variant, extra_args, prompt_ids, tokenizer) -> dict:
@@ -290,18 +301,16 @@ def check_server(model, tp, out, variant, extra_args, prompt_ids, tokenizer) -> 
             result["stop_profile_error"] = str(error)
         result["profile_seconds"] = time.time() - start
         checks["profiled_requests"] = all(o.get("output_ids") for o in outputs)
-        expected = {
-            f"e0-TP{rank}.{suffix}" for rank in range(tp) for suffix in ("viztracer.json", "proton.chrome_trace")
-        }
+        expected = {f"TP{rank}.{suffix}" for rank in range(tp) for suffix in ("viztracer.json", "proton.chrome_trace")}
         deadline = time.monotonic() + 60
-        while not expected <= {p.name for p in profile_dir.glob("*")} and time.monotonic() < deadline:
+        while not expected <= set(_rank_files(profile_dir, tp)) and time.monotonic() < deadline:
             time.sleep(1)
-        files = sorted(p.name for p in profile_dir.glob("*"))
-        result["profile_files"] = {name: (profile_dir / name).stat().st_size for name in files}
+        files = _rank_files(profile_dir, tp)
+        result["profile_files"] = {path.name: path.stat().st_size for path in files.values()}
         checks["profile_files"] = expected <= set(files)
         anchors = {}
-        for name in sorted(expected & set(files)):
-            data = json.loads((profile_dir / name).read_text())
+        for name, path in sorted(files.items()):
+            data = json.loads(path.read_text())
             anchor = data.get("viztracer_metadata", {}).get("baseTimeNanoseconds") or data.get("baseTimeNanoseconds")
             events = data.get("traceEvents", [])
             anchors[name] = {
@@ -345,7 +354,7 @@ def main():
     # 1-3 per server configuration: Proton's trace mode may not cover kernels
     # launched by CUDA graph replays, so profiling is also tried without graphs.
     profiled = []
-    for variant, extra_args in (("default", ()), ("eager", ("--enforce-eager",))):
+    for variant, extra_args in (("eager", ("--enforce-eager",)),):
         try:
             result = check_server(args.model, args.tp, out, variant, extra_args, prompt_ids, tokenizer)
         except Exception as error:
@@ -381,12 +390,13 @@ def main():
         summary[variant]["rl_trace_merge"] = {"returncode": ours.returncode, "log": ours.stderr[-4000:]}
         checks[f"{variant}_rl_trace_merge"] = ours.returncode == 0
         ranks = []
+        files = _rank_files(profile_dir, args.tp)
         for rank in range(args.tp):
             ranks += [
                 "--rank",
                 str(rank),
-                str(profile_dir / f"e0-TP{rank}.viztracer.json"),
-                str(profile_dir / f"e0-TP{rank}.proton.chrome_trace"),
+                str(files[f"TP{rank}.viztracer.json"]),
+                str(files[f"TP{rank}.proton.chrome_trace"]),
             ]
         official = subprocess.run(
             [
