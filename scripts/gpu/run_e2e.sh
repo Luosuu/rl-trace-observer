@@ -110,7 +110,7 @@ $PY -m verl.trainer.main_ppo \
 status=$?
 echo "E2 main_ppo exit $status after $(( $(date +%s) - start ))s"
 grep -E "step:[0-9]+ " "$E2/main_ppo.log" | tail -n "$STEPS" > "$E2/metrics.txt" || true
-cp -r /tmp/ray/session_latest/logs "$E2/ray_logs" 2>/dev/null || true
+tar czf "$E2/ray_logs.tgz" -C /tmp/ray/session_latest logs 2>/dev/null || true
 
 echo "=== merge"
 for step in $(echo "$PROFILE_STEPS" | tr -d '[] ' | tr , ' '); do
