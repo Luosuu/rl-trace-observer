@@ -118,8 +118,8 @@ tar czf "$E2/ray_logs.tgz" -C /tmp/ray/session_latest logs 2>/dev/null || true
 
 echo "=== merge"
 for step in $(echo "$PROFILE_STEPS" | tr -d '[] ' | tr , ' '); do
-  $PY -m rl_trace_observer.merger.cli "$RL_TRACE_OUTPUT_DIR" -o "$E2/step$step.json" --strict --step "$step"
+  $PY -m rl_trace_observer.merger.cli "$RL_TRACE_OUTPUT_DIR" -o "$E2/step$step.json.gz" --strict --step "$step"
   echo "merge step $step exit $?"
 done
-$PY -m rl_trace_observer.merger.cli "$RL_TRACE_OUTPUT_DIR" -o "$E2/all_steps.json"
+$PY -m rl_trace_observer.merger.cli "$RL_TRACE_OUTPUT_DIR" -o "$E2/all_steps.json.gz"
 exit $status
