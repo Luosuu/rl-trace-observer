@@ -22,6 +22,9 @@ N_GPUS=${N_GPUS:-4}
 ROLLOUT_TP=${ROLLOUT_TP:-2}
 RUN_E0=${RUN_E0:-1}
 RUN_E2=${RUN_E2:-1}
+# Proton's trace mode cannot attribute kernels replayed from CUDA graphs, so
+# profiled TokenSpeed runs disable them.
+ROLLOUT_EAGER=${ROLLOUT_EAGER:-True}
 mkdir -p "$RESULTS_DIR" "$WORK_DIR"
 mkdir -p "$WORK_DIR/out"
 exec > >(tee -a "$WORK_DIR/out/job.log") 2>&1
@@ -87,6 +90,7 @@ $PY -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.n=4 \
   actor_rollout_ref.rollout.tensor_model_parallel_size="$ROLLOUT_TP" \
   actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+  actor_rollout_ref.rollout.enforce_eager="$ROLLOUT_EAGER" \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
   actor_rollout_ref.rollout.disable_log_stats=False \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
