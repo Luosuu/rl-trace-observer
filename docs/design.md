@@ -144,7 +144,7 @@ VERL 插件注册 `rollout.name=tokenspeed`，包括 `TokenSpeedReplica` 和 `To
 - **profile**：
   - driver 把正在 profile 的 step 传给 `start_profile`。
   - 每个 replica 请求 `{"activities": ["VIZTRACER", "PROTON"], "output_dir": "<RL_TRACE_OUTPUT_DIR>/rollout/replica<r>/<run_id>-step-<n>"}`。`tokenspeed serve` 不使用 `profile_id`，文件名是时间戳，因此由目录标识这一次 profile。
-  - Proton trace 模式需要关闭 CUDA graph（`enforce_eager`）。
+  - Proton 只有在 graph capture 时 session 已激活，才能把 graph 回放的 kernel 归到对应节点。`tokenspeed serve` 启动时 capture，却在每次 `/start_profile` 新建 session。因此不开 `enforce_eager` 时，`sitecustomize` 会在 capture 之前为每个 scheduler 建立一个常驻 session（`proton_graphs.py`）：`/start_profile` 让它进入新的 data phase 并激活；`/stop_profile` 结束该 phase，由 periodic flushing 写出，再改名为 TokenSpeed 原本的文件名。
   - `/stop_profile` 返回后，server actor 把每个 rank 的文件连同 `rank_tag` 登记到自己的进程记录。
 
 TokenSpeed 在 VizTracer 中为每个 Python scope 写 flow 起点，在 Proton 的 CPU scope 上写 `scope_id`。merger 在同一 rank 的文件对内把两者连接起来，并负责多 rank 的时间对齐和 PID/flow-ID 隔离。
@@ -337,7 +337,7 @@ manifest
 - [x] 注册 TokenSpeed `ServerAdapter`；权重同步走 NCCL，由跨 GPU 的训练 rank 发送；
 - [x] 转换 VERL profiling context（driver 传入 step，按 run 和 step 分目录）；
 - [x] 调用 `/start_profile` 和 `/stop_profile`；
-- [x] 启用 `VIZTRACER + PROTON`（需要 `enforce_eager`）；
+- [x] 启用 `VIZTRACER + PROTON`（eager 与 CUDA graph 均可）；
 - [x] 将各 rank artifact 写入 manifest（带 `rank_tag`）；
 - [ ] standalone 部署（异步 trainer）与 colocated 显存管理之外的形态。
 

@@ -125,9 +125,14 @@ in VERL or TokenSpeed is modified:
   directory, `$RL_TRACE_OUTPUT_DIR/rollout/replica<r>/<run_id>-step-<n>`. `tokenspeed serve` names the files after a
   timestamp whatever `profile_id` it is sent, so the directory identifies the profile. The server actor then registers
   each scheduler rank's files. `rl-trace-merge --step <n>` shows each rank as a process of its own.
-- Proton's trace mode cannot place kernels replayed from CUDA graphs: `/stop_profile` fails with "Cannot find CPU
-  scope event for kernel launch". Profile with `actor_rollout_ref.rollout.enforce_eager=True`. VizTracer alone works
-  either way (`RL_TRACE_TOKENSPEED_PROFILE_ACTIVITIES=VIZTRACER`).
+- Proton places kernels replayed from CUDA graphs only if its session was active while the graphs were captured.
+  `tokenspeed serve` captures at startup but opens a new session on every `/start_profile`, so on its own
+  `/stop_profile` fails with "Cannot find CPU scope event for kernel launch" unless the server runs eagerly. Without
+  `enforce_eager`, the same `sitecustomize` therefore keeps one Proton session per scheduler from before capture
+  (`integrations/tokenspeed/proton_graphs.py`). `/start_profile` activates it in a new data phase, and
+  `/stop_profile` has Proton's periodic flushing write that phase to the file TokenSpeed would have written. Replayed
+  kernels then appear under a `<captured_at>` frame with the name they were captured with. With
+  `enforce_eager=True`, TokenSpeed profiles as it does on its own.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -136,6 +141,7 @@ in VERL or TokenSpeed is modified:
 | `RL_TRACE_TOKENSPEED_COMMAND` | `python -m tokenspeed.cli serve` | the server command (the CPU test points it at a fake server) |
 | `RL_TRACE_TOKENSPEED_STARTUP_TIMEOUT` | `1800` | seconds to wait for `/health` |
 | `RL_TRACE_TOKENSPEED_SYNC_TIMEOUT` | `600` | seconds before a weight-update group operation times out |
+| `RL_TRACE_TOKENSPEED_PROTON_FLUSH_TIMEOUT` | `300` | seconds `/stop_profile` waits for Proton to write a profile under CUDA graphs |
 
 `TOKENSPEED_KERNEL_PROFILE_DATA=trace` and `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace` are set for the
 server unless you set them. `tests/test_cpu_tokenspeed_ppo.py` runs the real `main_ppo` against a fake TokenSpeed

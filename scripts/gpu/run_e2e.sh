@@ -22,9 +22,9 @@ N_GPUS=${N_GPUS:-4}
 ROLLOUT_TP=${ROLLOUT_TP:-2}
 RUN_E0=${RUN_E0:-1}
 RUN_E2=${RUN_E2:-1}
-# Proton's trace mode cannot attribute kernels replayed from CUDA graphs, so
-# profiled TokenSpeed runs disable them.
-ROLLOUT_EAGER=${ROLLOUT_EAGER:-True}
+# With CUDA graphs (False), Proton profiles come from the session that
+# integrations/tokenspeed/proton_graphs.py keeps from before capture.
+ROLLOUT_EAGER=${ROLLOUT_EAGER:-False}
 mkdir -p "$RESULTS_DIR" "$WORK_DIR"
 mkdir -p "$WORK_DIR/out"
 exec > >(tee -a "$WORK_DIR/out/job.log") 2>&1
