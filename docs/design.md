@@ -135,7 +135,9 @@ Actor 继续使用 VERL 原生 Torch Profiler。collector 根据 session manifes
 
 VERL 插件注册 `rollout.name=tokenspeed`，包括 `TokenSpeedReplica` 和 `TokenSpeedServerAdapter`，不修改 VERL trainer，也不修改 TokenSpeed。
 
-- **部署形态**：VERL 0.9.1 的同步 trainer 只构建 hybrid replica，所以 TokenSpeed 与 actor 共用 GPU。
+- **部署形态**：VERL 0.9.1 的同步 trainer 只构建 hybrid replica，所以 TokenSpeed 与 actor 共用 GPU，生成与训练轮流进行。one-step-off-policy trainer（`hybrid_engine=False`）构建 standalone replica，TokenSpeed 在单独的 GPU 上与训练并行。
+  - standalone 的权重同步走 `checkpoint_engine.backend=tokenspeed`：VERL 其他 backend 的最后一跳是 CUDA IPC，TokenSpeed 没有；这个 backend 由训练 rank 0 与所有 TokenSpeed rank 建一个权重组，每个 bucket 只广播一次。
+  - VERL 不对这个 trainer 的 rollout 做 profile；插件在 profile 的 step 里对同时进行的那次生成（下一步的数据）做 profile，并为每一步记录 `global_step` 窗口。
   - server actor 在 replica 所在的 GPU 上启动 `tokenspeed serve`，并通过 control port 驱动它。
   - 训练期间 TokenSpeed 释放权重和 KV cache（`--enable-memory-saver`），生成前恢复。
 - **权重同步**：走 TokenSpeed 的 NCCL 接口（`/init_weights_update_group`、`/update_weights_from_distributed`）。
@@ -339,7 +341,8 @@ manifest
 - [x] 调用 `/start_profile` 和 `/stop_profile`；
 - [x] 启用 `VIZTRACER + PROTON`（eager 与 CUDA graph 均可）；
 - [x] 将各 rank artifact 写入 manifest（带 `rank_tag`）；
-- [ ] standalone 部署（异步 trainer）与 colocated 显存管理之外的形态。
+- [x] standalone 部署：one-step-off-policy trainer（见 [2026-10-02 记录](experiments/2026-10-02-tokenspeed-one-step-off.md)）；
+- [ ] fully-async trainer（rollouter 与 trainer 解耦、部分 rollout）。
 
 完成标准：不修改 VERL core，两个 TokenSpeed rank 能产生匹配的 VizTracer/Proton artifact。已在 8×H100 上验证，见 `docs/experiments/2026-10-01-tokenspeed-grpo.md`。
 
