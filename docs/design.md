@@ -133,18 +133,23 @@ Actor 继续使用 VERL 原生 Torch Profiler。collector 根据 session manifes
 
 ### 6.3 TokenSpeed rollout profiler
 
-独立项目通过 VERL external module 注册 TokenSpeed `RolloutReplica` 和 `ServerAdapter`，不修改 VERL trainer。
+VERL 插件注册 `rollout.name=tokenspeed`，包括 `TokenSpeedReplica` 和 `TokenSpeedServerAdapter`，不修改 VERL trainer，也不修改 TokenSpeed。
 
-在现有 `start_profile(profile_step=...)` 调用中生成确定性的 session context，并请求 TokenSpeed：
+- **部署形态**：VERL 0.9.1 的同步 trainer 只构建 hybrid replica，所以 TokenSpeed 与 actor 共用 GPU，生成与训练轮流进行。one-step-off-policy trainer（`hybrid_engine=False`）构建 standalone replica，TokenSpeed 在单独的 GPU 上与训练并行。
+  - standalone 的权重同步走 `checkpoint_engine.backend=tokenspeed`：VERL 其他 backend 的最后一跳是 CUDA IPC，TokenSpeed 没有；这个 backend 由训练 rank 0 与所有 TokenSpeed rank 建一个权重组，每个 bucket 只广播一次。
+  - VERL 不对这个 trainer 的 rollout 做 profile；插件在 profile 的 step 里对同时进行的那次生成（下一步的数据）做 profile，并为每一步记录 `global_step` 窗口。
+  - server actor 在 replica 所在的 GPU 上启动 `tokenspeed serve`，并通过 control port 驱动它。
+  - 训练期间 TokenSpeed 释放权重和 KV cache（`--enable-memory-saver`），生成前恢复。
+- **权重同步**：走 TokenSpeed 的 NCCL 接口（`/init_weights_update_group`、`/update_weights_from_distributed`）。
+  - TokenSpeed 没有 CUDA-IPC 接收路径，而 NCCL 不允许同一张 GPU 上的两个 rank 在同一个组里，所以 replica `k` 由 replica `k+1` 的第一个训练 rank 发送，至少需要 2 个 replica。
+  - 从 torch 2.14 开始，只要默认进程组绑定了设备，新建的 NCCL 组就会从默认组 split 出来。因此双方都以独立方式创建权重组；TokenSpeed 一侧通过 `PYTHONPATH` 上的 `sitecustomize` 实现。
+- **profile**：
+  - driver 把正在 profile 的 step 传给 `start_profile`。
+  - 每个 replica 请求 `{"activities": ["VIZTRACER", "PROTON"], "output_dir": "<RL_TRACE_OUTPUT_DIR>/rollout/replica<r>/<run_id>-step-<n>"}`。`tokenspeed serve` 不使用 `profile_id`，文件名是时间戳，因此由目录标识这一次 profile。
+  - Proton 只有在 graph capture 时 session 已激活，才能把 graph 回放的 kernel 归到对应节点。`tokenspeed serve` 启动时 capture，却在每次 `/start_profile` 新建 session。因此不开 `enforce_eager` 时，`sitecustomize` 会在 capture 之前为每个 scheduler 建立一个常驻 session（`proton_graphs.py`）：`/start_profile` 让它进入新的 data phase 并激活；`/stop_profile` 结束该 phase，由 periodic flushing 写出，再改名为 TokenSpeed 原本的文件名。
+  - `/stop_profile` 返回后，server actor 把每个 rank 的文件连同 `rank_tag` 登记到自己的进程记录。
 
-```json
-{
-  "activities": ["VIZTRACER", "PROTON"],
-  "output_dir": "<session>/rollout/<replica>/<rank>"
-}
-```
-
-TokenSpeed 内部负责每个 rank 的 Python scope → Proton scope 连接。多 rank 的时间对齐、PID/flow-ID 隔离仍由 merger 完成。
+TokenSpeed 在 VizTracer 中为每个 Python scope 写 flow 起点，在 Proton 的 CPU scope 上写 `scope_id`。merger 在同一 rank 的文件对内把两者连接起来，并负责多 rank 的时间对齐和 PID/flow-ID 隔离。
 
 ### 6.4 TraceContext
 
@@ -330,14 +335,16 @@ manifest
 
 ### P2：TokenSpeed external rollout integration
 
-- [ ] 注册 TokenSpeed `RolloutReplica`；
-- [ ] 注册 TokenSpeed `ServerAdapter`；
-- [ ] 转换 VERL profiling context；
-- [ ] 调用 `/start_profile` 和 `/stop_profile`；
-- [ ] 启用 `VIZTRACER + PROTON`；
-- [ ] 将各 rank artifact 写入 manifest。
+- [x] 注册 TokenSpeed `RolloutReplica`（hybrid）；
+- [x] 注册 TokenSpeed `ServerAdapter`；权重同步走 NCCL，由跨 GPU 的训练 rank 发送；
+- [x] 转换 VERL profiling context（driver 传入 step，按 run 和 step 分目录）；
+- [x] 调用 `/start_profile` 和 `/stop_profile`；
+- [x] 启用 `VIZTRACER + PROTON`（eager 与 CUDA graph 均可）；
+- [x] 将各 rank artifact 写入 manifest（带 `rank_tag`）；
+- [x] standalone 部署：one-step-off-policy trainer（见 [2026-10-02 记录](experiments/2026-10-02-tokenspeed-one-step-off.md)）；
+- [ ] fully-async trainer（rollouter 与 trainer 解耦、部分 rollout）。
 
-完成标准：不修改 VERL core，两个 TokenSpeed rank 能产生匹配的 VizTracer/Proton artifact。
+完成标准：不修改 VERL core，两个 TokenSpeed rank 能产生匹配的 VizTracer/Proton artifact。已在 8×H100 上验证，见 `docs/experiments/2026-10-01-tokenspeed-grpo.md`。
 
 ### P3：Session-level global merger
 
