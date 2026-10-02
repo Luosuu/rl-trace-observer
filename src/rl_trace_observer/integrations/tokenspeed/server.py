@@ -48,13 +48,16 @@ PROTON_ENV_DEFAULTS = {
     "TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT": "chrome_trace",
 }
 _ACTIVITY_KINDS = {"VIZTRACER": TOKENSPEED_VIZTRACER, "PROTON": TOKENSPEED_PROTON}
-# TokenSpeed saves each rank's VizTracer report after the ranks synchronize in
-# /stop_profile, so other ranks may still be writing when it returns.
-ARTIFACT_WAIT_SECONDS = 120.0
+# TokenSpeed's ranks write their files after /stop_profile returns (see
+# .profile_saving); registration waits for them in the background.
+ARTIFACT_WAIT_SECONDS = 1800.0
+
+
+SERVER_NAME_PREFIX = "tokenspeed_server_"
 
 
 def server_name(replica_rank: int, name_suffix: str = "") -> str:
-    return f"tokenspeed_server_{replica_rank}{name_suffix}"
+    return f"{SERVER_NAME_PREFIX}{replica_rank}{name_suffix}"
 
 
 def _free_port() -> int:
@@ -74,12 +77,28 @@ def _die_with_parent() -> None:
         ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
 
 
-def _readable_json(path: Path) -> bool:
-    try:
-        json.loads(path.read_text(encoding="utf-8"))
-        return True
-    except (OSError, ValueError):
-        return False
+def _complete_files(output_dir: Path, kinds: set[str], sizes: dict[Path, int]) -> dict[Path, tuple[str, str, str]]:
+    """Profile files of ``kinds`` that hold a whole JSON object and stopped growing since ``sizes``.
+
+    Cheap enough for files of hundreds of MB: it reads the last bytes only.
+    ``sizes`` is updated for the next call.
+    """
+    files = {}
+    for path in sorted(output_dir.iterdir()) if output_dir.is_dir() else []:
+        parsed = tokenspeed_profile_file(path)
+        if not parsed or parsed[0] not in kinds:
+            continue
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as file:
+                file.seek(max(0, size - 16))
+                ends_object = file.read().rstrip().endswith(b"}")
+        except OSError:
+            continue
+        if size > 0 and ends_object and sizes.get(path) == size:
+            files[path] = parsed
+        sizes[path] = size
+    return files
 
 
 class TokenSpeedServer:
@@ -114,6 +133,10 @@ class TokenSpeedServer:
         self._busy_slots: set[int] = set()
         # (profile_id, global_step, output_dir) of the profile in progress.
         self._profile: tuple[str, int | None, Path] | None = None
+        # Keeps /start_profile and /stop_profile in order when callers do not wait.
+        self._profile_lock = asyncio.Lock()
+        # Registrations of stopped profiles whose files are still being written.
+        self._registrations: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------ #
     # Process lifecycle
@@ -353,6 +376,10 @@ class TokenSpeedServer:
 
     async def start_profile(self, global_step: int | None = None, **kwargs: Any) -> None:
         """Start a TokenSpeed profile for ``global_step``; a failure is logged, never raised."""
+        async with self._profile_lock:
+            await self._start_profile(global_step)
+
+    async def _start_profile(self, global_step: int | None) -> None:
         activities = self._activities()
         if not activities or self._profile is not None:
             return
@@ -374,17 +401,30 @@ class TokenSpeedServer:
         self._profile = (profile_id, global_step, output_dir)
 
     async def stop_profile(self) -> None:
-        """Stop the profile in progress and register each rank's files."""
-        if self._profile is None:
-            return
-        profile_id, global_step, output_dir = self._profile
-        self._profile = None
-        try:
-            await self._post("/stop_profile", timeout=600)
-        except Exception as error:
-            # Whatever was written is still registered below, and reported
-            # missing or incomplete by the merger.
-            logger.warning("TokenSpeed /stop_profile failed for %s: %s", profile_id, error)
+        """Stop the profile in progress; each rank's files are registered once written, in the background."""
+        async with self._profile_lock:
+            if self._profile is None:
+                return
+            profile_id, global_step, output_dir = self._profile
+            self._profile = None
+            try:
+                await self._post("/stop_profile", timeout=600)
+            except Exception as error:
+                # Whatever is written is still registered, and reported
+                # missing or incomplete by the merger.
+                logger.warning("TokenSpeed /stop_profile failed for %s: %s", profile_id, error)
+            task = asyncio.create_task(self._register_profile_logged(profile_id, global_step, output_dir))
+            self._registrations.add(task)
+            task.add_done_callback(self._registrations.discard)
+
+    async def wait_for_profiles(self) -> None:
+        """Wait until every stopped profile's files are written and registered."""
+        # A stop submitted earlier but still running creates its registration under the lock.
+        async with self._profile_lock:
+            registrations = list(self._registrations)
+        await asyncio.gather(*registrations)
+
+    async def _register_profile_logged(self, profile_id: str, global_step: int | None, output_dir: Path) -> None:
         try:
             await self._register_profile(profile_id, global_step, output_dir)
         except Exception:
@@ -397,15 +437,13 @@ class TokenSpeedServer:
         kinds = {_ACTIVITY_KINDS[a] for a in self._activities() if a in _ACTIVITY_KINDS}
         expected = len(kinds) * self.world_size
         deadline = time.monotonic() + ARTIFACT_WAIT_SECONDS
+        sizes: dict[Path, int] = {}
         while True:
-            files = {}
-            for path in sorted(output_dir.iterdir()) if output_dir.is_dir() else []:
-                parsed = tokenspeed_profile_file(path)
-                if parsed and parsed[0] in kinds and _readable_json(path):
-                    files[path] = parsed
+            # Off the event loop, which keeps serving generation requests.
+            files = await asyncio.to_thread(_complete_files, output_dir, kinds, sizes)
             if len(files) >= expected or time.monotonic() > deadline:
                 break
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.0)
         if len(files) < expected:
             logger.warning("TokenSpeed profile %s: found %d of %d files", profile_id, len(files), expected)
         root = trace_output_dir()

@@ -16,7 +16,9 @@ keeps one Proton session per scheduler for the life of the process instead:
 - ``/start_profile`` moves it to a new data phase and activates it;
 - ``/stop_profile`` completes that phase, which makes Proton's periodic flushing
   write it as ``<session>.part_<phase>.chrome_trace``, deactivates the session,
-  and moves the file to the name ``/stop_profile`` would have written.
+  and moves the file to the name ``/stop_profile`` would have written. The
+  writing runs in the background (see ``profile_saving``, which routes
+  TokenSpeed's Proton calls here).
 
 Proton completes a phase only when a later phase receives a kernel, so each
 completion launches one tiny kernel. TokenSpeed itself is not modified.
@@ -25,7 +27,6 @@ completion launches one tiny kernel. TokenSpeed itself is not modified.
 import functools
 import os
 import shutil
-import sys
 import time
 from pathlib import Path
 from types import ModuleType
@@ -62,10 +63,21 @@ class Session:
         self.phase = self.proton.data.advance_phase(self.id)
         self.proton.activate(self.id)
 
-    def end(self, output: str) -> Path:
-        """Write the profiled phase to ``<output>.chrome_trace``."""
+    def stop(self) -> int:
+        """End the profiled phase; returns it for :meth:`write`.
+
+        Kernels keep landing in the next phase, which is discarded, until
+        :meth:`write` deactivates the session.
+        """
         phase, self.phase = self.phase, None
         self.proton.data.advance_phase(self.id)
+        return phase
+
+    def write(self, phase: int, output: str) -> Path:
+        """Write a stopped ``phase`` to ``<output>.chrome_trace``; may run on another thread.
+
+        The next :meth:`begin` must wait for it.
+        """
         part = self._complete(phase)
         target = Path(f"{output}.{FORMAT}")
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -151,42 +163,11 @@ def _patch_event_loop(module: ModuleType) -> None:
 
     setattr(init, _PATCHED, True)
     module.EventLoop.__init__ = init
-    # event_loop imports request_handler, which calls TokenSpeed's Proton helpers.
-    _patch_request_handler(sys.modules["tokenspeed.runtime.engine.request_handler"])
 
 
-def _patch_request_handler(module: ModuleType) -> None:
-    """Route TokenSpeed's Proton start/stop to the long-lived session."""
-    if getattr(module.start_profiling, _PATCHED, False):
-        return
-    original_start, original_stop = module.start_profiling, module.stop_profiling
-
-    @functools.wraps(original_start)
-    def start_profiling(config=None):
-        from tokenspeed_kernel.profiling import ProfilingState
-
-        state = ProfilingState.get()
-        if _session is None or config is None or state.active:
-            return original_start(config)
-        _session.begin()
-        # kernel_scope() records CPU scopes only while this state is active.
-        state._config, state._session, state.enabled = config, _session.id, True
-        return _session.id
-
-    @functools.wraps(original_stop)
-    def stop_profiling():
-        from tokenspeed_kernel.profiling import ProfilingState
-
-        state = ProfilingState.get()
-        if _session is None or _session.phase is None or state._session != _session.id:
-            return original_stop()
-        output = state._config.output
-        state._config, state._session, state.enabled = None, None, False
-        _session.end(output)
-
-    for function in (start_profiling, stop_profiling):
-        setattr(function, _PATCHED, True)
-    module.start_profiling, module.stop_profiling = start_profiling, stop_profiling
+def session() -> Session | None:
+    """This scheduler's long-lived session, once it is built; ``profile_saving`` drives it."""
+    return _session
 
 
 def install() -> None:

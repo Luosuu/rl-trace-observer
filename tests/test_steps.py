@@ -23,6 +23,8 @@ def trainer_module(tmp_path, monkeypatch):
         "    def step(self, metrics, timing_raw):\n"
         "        metrics['ran'] = True\n"
         "        return 'batch'\n"
+        "    def fit(self, agent_loop_manager):\n"
+        "        return 'trained'\n"
         "    def _rollout_server_managers(self):\n"
         "        return self.managers\n"
         "    def _start_rollout_profiling(self):\n"
@@ -31,6 +33,7 @@ def trainer_module(tmp_path, monkeypatch):
         "class Config:\n"
         "    def __init__(self, rollout):\n"
         "        self.actor_rollout_ref = type('R', (), {'rollout': type('N', (), {'name': rollout})})\n"
+        "        self.global_profiler = {'steps': [3]}\n"
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     yield "fake_trainer_base"
@@ -123,3 +126,14 @@ def test_tokenspeed_rollout_profiling_is_told_the_step(trainer_module, spans, ro
     module.PPOTrainer(rollout, [manager])._start_rollout_profiling()
 
     assert manager.calls == [kwargs]
+
+
+def test_fit_waits_for_profiles_written_in_the_background(trainer_module, spans, monkeypatch):
+    waited = []
+    monkeypatch.setattr(steps, "_wait_for_profiles", waited.append)
+    when_imported(trainer_module, steps.patch_trainer)
+    module = importlib.import_module(trainer_module)
+    trainer = module.PPOTrainer()
+
+    assert trainer.fit(None) == "trained"
+    assert waited == [trainer]
