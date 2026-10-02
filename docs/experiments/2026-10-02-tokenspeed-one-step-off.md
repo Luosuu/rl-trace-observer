@@ -53,6 +53,35 @@
 
 下一批的生成几乎全部落在本步 actor 训练期间。第 3、4 步的窗口比 step 时长长出 20 多秒，原因是 VERL 在 step 计时之外停止 actor 的 Torch profiler 并导出 trace，而我们的 `global_step` 窗口覆盖整个 `fit_step`。
 
+## 后台保存 profile（commit `9eded46`，8×H100）
+
+上面第 4、5 步的等待，以及第 3、4 步窗口比 step 长出的 20 多秒，都来自保存 profile。现在所有保存都在后台进行：
+
+- **TokenSpeed**：
+  - `/stop_profile` 只停止记录，VizTracer 和 Proton 的文件改由后台线程写出；
+  - server actor 在后台等文件写完再登记，检查方式只读文件末尾，不再完整解析 JSON；
+  - 下一次 `/start_profile` 会先等上一次写完。
+- **driver**：不再等 rollout 的 `stop_profile`。
+- **actor**：Torch trace 在后台线程导出。如果配置了 VERL 的 finish hook，它会先等导出完成。
+- **训练结束**：`fit` 结束前等待所有进程把文件写完并登记，以免 Ray 回收进程时丢文件。
+
+配置同上，机器换成 H100（H200 当时没有容量）：
+
+| step | step 时长 (s) | 等待数据 (s) | actor 训练 (s) | `stop_profile` (s) | `global_step` 窗口 (s) | profile |
+|---|---|---|---|---|---|---|
+| 1 | 21.0 | 10.5 | 10.3 | 0 | 21.0 | |
+| 2 | 4.3 | 0.0 | 4.1 | 0 | 4.3 | |
+| 3 | 4.8 | 0.0 | 4.4 | 6.0 | 10.8 | ✓ |
+| 4 | 6.6 | 0.0 | 6.2 | 6.1 | 12.7 | ✓ |
+| 5 | 8.0 | 0.0 | 7.6 | 0 | 8.0 | |
+
+- **等待数据**：第 2–5 步都是 0，profile 的步不再拖慢下一步（之前第 4、5 步各等 5.4 s、5.7 s）。
+- **profile 步的窗口**：从 27.9 s / 35.8 s 降到 10.8 s / 12.7 s。剩下约 6 s 是 VERL 在 actor 上调用 `stop_profile`，导出已经移到后台，这部分应是 Torch profiler 停止时收集和整理 CUDA activity 的时间。它只影响 actor 和等待它的 driver，rollout 的生成不受影响。
+- **重叠**：第 3、4 步中，下一批的 128 个请求在 0.4–2.7 s 内完成，都落在 `actor_update` 期间。
+- **完整性**：第 3、4 步的 `--strict` 合并都成功，manifest 无问题。每一步都有全部 19 个产物：7 个 RL-Insight、4 个 Torch、4 个 Proton、4 个 VizTracer。
+
+产物：`s3://bench-artifacts-e00wpqevpr0037mwj6dvm8/rl-trace-observer/rl-trace-asyncsave-20261002-164929-9eded46/`。
+
 ## 产物
 
 `s3://bench-artifacts-e00wpqevpr0037mwj6dvm8/rl-trace-observer/rl-trace-onestep-20261002-151244-e8eb599/`：`e2/step3.json.gz`、`e2/step4.json.gz`、`e2/artifacts/`、`e2/metrics.txt`。
@@ -60,5 +89,5 @@
 ## 尚未完成
 
 - fully-async trainer（rollouter 与 trainer 通过消息队列解耦、partial rollout）。
-- 停止 profile 时，TokenSpeed 写文件的时间会推迟下一步：可以把 `/stop_profile` 改为不阻塞生成任务的完成，或者在登记文件时再等待写完。
+- actor 上 Torch profiler 停止时约 6 s 的收集时间仍在 step 内（VERL 的 profiler 实现）。
 - 等资源对照：例如同步 trainer 用 8 卡 hybrid，对比 one-step-off 的 4+4。
