@@ -204,6 +204,10 @@ class TokenSpeedServer:
         if self._process is not None and self._process.poll() is None:
             self._process.terminate()
 
+    def get_world_size(self) -> int:
+        """The number of TokenSpeed ranks, which all join a weight-update group."""
+        return self.world_size
+
     def get_server_address(self) -> tuple[str, int]:
         """The control port: ``/generate`` and the RL control routes."""
         return self._address, self._control_port

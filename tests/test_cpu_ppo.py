@@ -28,8 +28,15 @@ TOLERANCE_NS = 5_000_000
 
 
 def run_main_ppo(
-    assets: dict[str, Path], output_dir: Path, log: Path, rollout: str = "mock", env: dict[str, str] | None = None
+    assets: dict[str, Path],
+    output_dir: Path,
+    log: Path,
+    rollout: str = "mock",
+    env: dict[str, str] | None = None,
+    entry: str = "verl.trainer.main_ppo",
+    overrides: dict[str, object] | None = None,
 ) -> subprocess.CompletedProcess:
+    """Run a VERL entry point on CPU; ``overrides`` replaces or adds Hydra overrides by key."""
     extra_env = env or {}
     env = {
         **os.environ,
@@ -42,7 +49,7 @@ def run_main_ppo(
         "HYDRA_FULL_ERROR": "1",
         **extra_env,
     }
-    overrides = [
+    arguments = [
         "algorithm.adv_estimator=grpo",
         "algorithm.use_kl_in_reward=False",
         f"data.train_files={assets['train']}",
@@ -92,9 +99,13 @@ def run_main_ppo(
         # Keep Hydra's run directory out of the checkout.
         f"hydra.run.dir={log.parent / 'hydra'}",
     ]
+    replaced = overrides or {}
+    keys = {key.lstrip("+") for key in replaced}
+    arguments = [o for o in arguments if o.split("=", 1)[0].lstrip("+") not in keys]
+    arguments += [f"{key}={value}" for key, value in replaced.items()]
     with log.open("w") as output:
         return subprocess.run(
-            [sys.executable, "-m", "verl.trainer.main_ppo", *overrides],
+            [sys.executable, "-m", entry, *arguments],
             env=env,
             cwd=log.parent,
             stdout=output,

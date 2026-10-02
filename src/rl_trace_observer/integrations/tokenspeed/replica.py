@@ -3,7 +3,11 @@
 In VERL's synchronous trainer the replica is hybrid: its TokenSpeed server runs
 on the GPUs of ``world_size`` training workers, sleeps (releases weights and KV
 cache) while they train, and receives new weights from them after every step
-(see :mod:`.adapter`). One replica runs on one node.
+(see :mod:`.adapter`). In VERL's asynchronous trainers (``hybrid_engine=False``)
+it is standalone: the server runs on the GPUs of the replica's own
+checkpoint-engine workers, generates while the trainer trains, and receives
+weights through the ``tokenspeed`` checkpoint engine (see :mod:`.checkpoint_engine`).
+One replica runs on one node.
 """
 
 import asyncio
@@ -21,8 +25,14 @@ class TokenSpeedReplica(RolloutReplica):
     async def launch_servers(self):
         if self.nnodes != 1:
             raise NotImplementedError("A TokenSpeed replica must fit on one node")
-        if self.rollout_mode != RolloutMode.HYBRID:
-            raise NotImplementedError(f"TokenSpeed rollout supports hybrid mode only, got {self.rollout_mode}")
+        if self.rollout_mode not in (RolloutMode.HYBRID, RolloutMode.STANDALONE):
+            raise NotImplementedError(f"TokenSpeed rollout supports hybrid or standalone mode, not {self.rollout_mode}")
+        if self.rollout_mode == RolloutMode.STANDALONE and self.config.checkpoint_engine.backend != "tokenspeed":
+            raise ValueError(
+                "Standalone TokenSpeed replicas receive weights only through "
+                "actor_rollout_ref.rollout.checkpoint_engine.backend=tokenspeed, "
+                f"not {self.config.checkpoint_engine.backend!r}"
+            )
         assert len(self.workers) == self.world_size, f"{len(self.workers)} workers for world size {self.world_size}"
 
         keyword = get_visible_devices_keyword()

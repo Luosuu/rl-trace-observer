@@ -6,6 +6,10 @@
 #       FSDP2 actor on 4 GPUs, 2 hybrid TokenSpeed replicas x TP=2, 5 steps,
 #       steps 3 and 4 profiled (actor Torch cpu+cuda, TokenSpeed VizTracer+Proton,
 #       RL-Insight), then `rl-trace-merge --strict --step N`.
+#       TRAINER=one_step_off runs VERL's one-step-off-policy trainer instead: the
+#       actor on GPUs 0-3 and 2 standalone TokenSpeed replicas x TP=2 on GPUs 4-7,
+#       weights through checkpoint_engine.backend=tokenspeed. Step n trains while
+#       the replicas generate the batch of step n + 1.
 #
 # Run from the repository root. Results go to $RESULTS_DIR (default ./gpu-results/<time>);
 # everything is written to local disk and copied there once at the end, since
@@ -22,6 +26,7 @@ N_GPUS=${N_GPUS:-4}
 ROLLOUT_TP=${ROLLOUT_TP:-2}
 RUN_E0=${RUN_E0:-1}
 RUN_E2=${RUN_E2:-1}
+TRAINER=${TRAINER:-sync}
 # With CUDA graphs (False), Proton profiles come from the session that
 # integrations/tokenspeed/proton_graphs.py keeps from before capture.
 ROLLOUT_EAGER=${ROLLOUT_EAGER:-False}
@@ -67,9 +72,24 @@ export RL_TRACE_OUTPUT_DIR=$E2/artifacts
 export RL_INSIGHT_SERVER_URL=local://rl-trace-observer
 export VERL_RL_INSIGHT_ENABLE=1
 export TOKENIZERS_PARALLELISM=false HYDRA_FULL_ERROR=1
-export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((N_GPUS - 1)))
+ENTRY=verl.trainer.main_ppo
+TRAINER_ARGS=()
+GPUS=$N_GPUS
+if [ "$TRAINER" = one_step_off ]; then
+  ENTRY=verl.experimental.one_step_off_policy.main_ppo
+  GPUS=$((N_GPUS * 2))
+  TRAINER_ARGS=(
+    # Its config extends ppo_trainer through a path relative to a VERL checkout.
+    'hydra.searchpath=[pkg://verl.trainer.config]'
+    actor_rollout_ref.hybrid_engine=False
+    actor_rollout_ref.rollout.checkpoint_engine.backend=tokenspeed
+    rollout.nnodes=1
+    rollout.n_gpus_per_node="$N_GPUS"
+  )
+fi
+export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((GPUS - 1)))
 start=$(date +%s)
-$PY -m verl.trainer.main_ppo \
+$PY -m $ENTRY "${TRAINER_ARGS[@]}" \
   algorithm.adv_estimator=grpo \
   algorithm.use_kl_in_reward=False \
   data.train_files="$WORK_DIR/data/train.parquet" \
@@ -110,7 +130,7 @@ $PY -m verl.trainer.main_ppo \
   trainer.project_name=rl_trace_observer \
   trainer.experiment_name=tokenspeed_e2e \
   hydra.run.dir="$E2/hydra" \
-  2>&1 | tee "$E2/main_ppo.log" | grep --line-buffered -E "step:[0-9]+ |Traceback|Error|Sent [0-9]+ tensors|TokenSpeed ready"
+  2>&1 | tee "$E2/main_ppo.log" | grep --line-buffered -E "step:[0-9]+ |Traceback|Error|sent [0-9]+ tensors|TokenSpeed ready"
 status=${PIPESTATUS[0]}
 echo "E2 main_ppo exit $status after $(( $(date +%s) - start ))s"
 grep -E "step:[0-9]+ " "$E2/main_ppo.log" | tail -n "$STEPS" > "$E2/metrics.txt" || true
