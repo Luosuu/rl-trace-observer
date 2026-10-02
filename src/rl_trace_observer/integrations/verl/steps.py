@@ -12,11 +12,17 @@ batch generated during step ``n - 1`` while it generates the batch of step
 ``n + 1``; the generation that runs during a profiled step is profiled as part
 of that step, so its trace shows rollout and training side by side.
 
+Profiles are written in the background (``torch_traces`` in the training
+workers, ``tokenspeed.profile_saving`` in TokenSpeed), so no step waits for
+them; when ``fit`` ends, the driver waits for every pending one, before Ray
+tears the processes down.
+
 The trainers live in heavy modules that the plugin must not import itself, so
 the patches are applied when VERL imports them.
 """
 
 import functools
+import inspect
 import logging
 import time
 from types import ModuleType
@@ -57,6 +63,62 @@ def _emit_step_span(trainer: object, start_time_ns: int, end_time_ns: int, globa
         logger.exception("Failed to record the trainer role")
 
 
+def _wait_for_exports(_actor) -> None:
+    from rl_trace_observer.integrations.verl.torch_traces import wait_for_exports
+
+    wait_for_exports()
+
+
+def _wait_for_profiles(trainer: object) -> None:
+    """Wait until every training worker and TokenSpeed server has written and registered its profiles."""
+    import ray
+    from verl.single_controller.ray.base import RayWorkerGroup
+
+    from rl_trace_observer.integrations.tokenspeed.server import SERVER_NAME_PREFIX
+
+    refs, seen = [], set()
+    for value in vars(trainer).values():
+        if isinstance(value, RayWorkerGroup) and id(value) not in seen:
+            seen.add(id(value))
+            refs += [worker.__ray_call__.remote(_wait_for_exports) for worker in value.workers]
+    for name in ray.util.list_named_actors():
+        if name.startswith(SERVER_NAME_PREFIX):
+            refs.append(ray.get_actor(name).wait_for_profiles.remote())
+    ray.get(refs)
+
+
+def _wait_after(original):
+    """Wrap a trainer's ``fit`` (sync or async) to wait for pending profiles when it ends."""
+
+    def finish(trainer):
+        if not trainer.config.global_profiler.get("steps"):
+            return
+        try:
+            _wait_for_profiles(trainer)
+        except Exception:
+            logger.exception("Failed to wait for pending profiles")
+
+    if inspect.iscoroutinefunction(original):
+
+        @functools.wraps(original)
+        async def fit(self, *args, **kwargs):
+            try:
+                return await original(self, *args, **kwargs)
+            finally:
+                finish(self)
+
+    else:
+
+        @functools.wraps(original)
+        def fit(self, *args, **kwargs):
+            try:
+                return original(self, *args, **kwargs)
+            finally:
+                finish(self)
+
+    return fit
+
+
 def patch_trainer(module: ModuleType) -> bool:
     """Wrap ``module.PPOTrainer.step``; returns ``False`` if already wrapped."""
     trainer_class = module.PPOTrainer
@@ -87,6 +149,7 @@ def patch_trainer(module: ModuleType) -> bool:
     setattr(step, _PATCHED, True)
     trainer_class.step = step
     trainer_class._start_rollout_profiling = _start_rollout_profiling
+    trainer_class.fit = _wait_after(trainer_class.fit)
     return True
 
 
@@ -136,11 +199,15 @@ def patch_one_step_off_trainer(module: ModuleType) -> bool:
             return await original_generate(self, *args, **kwargs)
         finally:
             if profile:
-                await self.llm_server_manager.stop_profile()
+                # Not awaited: the servers stop and save on their own, in order
+                # with the next start, and the batch goes to training now.
+                for server in servers:
+                    server.stop_profile.remote()
 
     setattr(fit_step, _PATCHED, True)
     trainer_class.fit_step = fit_step
     trainer_class._async_gen_next_batch = _async_gen_next_batch
+    trainer_class.fit = _wait_after(trainer_class.fit)
     return True
 
 
