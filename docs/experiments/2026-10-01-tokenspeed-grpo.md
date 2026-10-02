@@ -18,7 +18,7 @@ Luosuu/rl-trace-observer#10 中 E0 和 E2 的首次结果。复现方式：`scri
 - `/generate`（token 进、token 出，带 logprob）、显存 release/resume 后再生成：通过。
 - `VIZTRACER+PROTON` profile：
   - 开 `--enforce-eager` 时，每个 TP rank 各产出一个 VizTracer 报告和一个 Proton Chrome trace，都带 `baseTimeNanoseconds`；
-  - 有 CUDA graph 时，Proton finalize 失败（"Cannot find CPU scope event for kernel launch"）。
+  - 有 CUDA graph 时，Proton finalize 失败（"Cannot find CPU scope event for kernel launch"）。后来通过常驻 session 解决，见 [2026-10-02 的记录](2026-10-02-tokenspeed-cuda-graph-proton.md)。
 - 每个 rank 的 VizTracer 中有 5904 个 `viztracer->proton` 起点，对应 Proton 中 5904 个带 `scope_id` 的 CPU scope。
 - `rl-trace-merge` 与 `tokenspeed merge-traces --all-ranks` 都能合并。两者的 Perfetto 统计相同，都有 3552 个 `flow_duplicate_id` 和 1076 个 `slice_spill_overlapping_complete_event`，这些都来自 Proton 原始数据。merger 修正后（同一 id 的多个 flow 拆开编号），`flow_duplicate_id` 为 0。
 - 权重同步：一个“trainer”进程在另一张卡上，通过 `/init_weights_update_group` + `/update_weights_from_distributed` 广播。测试方法是先把 `model.norm.weight` 置零（贪心输出随之改变），再发回原权重（贪心输出完全恢复）。TP=2（唤醒状态，以及 VERL 的睡眠→恢复权重→更新→恢复 KV 时序）和 TP=1 均通过。首次同步 1.1 s（含 NCCL 初始化），之后 0.1 s。
@@ -69,7 +69,7 @@ Luosuu/rl-trace-observer#10 中 E0 和 E2 的首次结果。复现方式：`scri
 
 1. **torch 2.14 自动 split NCCL 组**：默认进程组绑定了设备时，torch 2.14 会把新建的 NCCL 组从默认组 split 出来。TokenSpeed 加入的权重组于是只是它自身 1-rank 世界的一个 split，trainer 永远连不上，首次广播就卡死（py-spy 与 `NCCL_DEBUG` 确认，现象为 `ncclCommSplit … nranks 1`）。现在双方都以独立方式创建这个组，TokenSpeed 一侧通过 `PYTHONPATH` 上的 `sitecustomize` 实现。
 2. **profile_id 被忽略**：`tokenspeed serve` 不使用请求中的 `profile_id`，文件名是时间戳。现在每个 profile 写入单独的目录。
-3. **Proton 与 CUDA graph 不兼容**：Proton trace 模式无法处理 CUDA graph 回放的 kernel。开 profile 时需要 `rollout.enforce_eager=True`。
+3. **Proton 与 CUDA graph**：本次 profile 时用 `rollout.enforce_eager=True`。原因是 TokenSpeed 的 Proton session 建在 graph capture 之后；此问题已在 [2026-10-02](2026-10-02-tokenspeed-cuda-graph-proton.md) 解决。
 4. **连接被关闭**：control server 会关闭空闲的 keep-alive 连接，之后复用连接的 POST 会报 `ServerDisconnectedError`。现在每个请求新建连接。
 5. **nightly 不配套**：tokenspeed nightly 20261001 引用了同日 kernel nightly 中没有的函数，因此固定为 20260930。
 
