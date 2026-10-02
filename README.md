@@ -109,7 +109,17 @@ Profiler traces and TokenSpeed VizTracer/Proton traces.
 [TokenSpeed](https://github.com/lightseekorg/tokenspeed). The plugin registers it in every VERL process, and nothing
 in VERL or TokenSpeed is modified:
 
-- Each replica is hybrid. A Ray actor launches `tokenspeed serve` on the GPUs of `tensor_model_parallel_size`
+- With VERL's synchronous trainer (`verl.trainer.main_ppo`) each replica is hybrid: it shares the training GPUs, and
+  rollout and training take turns. With the one-step-off-policy trainer
+  (`verl.experimental.one_step_off_policy.main_ppo`, `actor_rollout_ref.hybrid_engine=False`) replicas are standalone
+  on GPUs of their own, and step `n` trains while they generate the batch of step `n + 1`. Standalone replicas need
+  `actor_rollout_ref.rollout.checkpoint_engine.backend=tokenspeed`: VERL's other backends hand weights to the server
+  over CUDA IPC, which TokenSpeed lacks, so this one has training rank 0 broadcast every bucket once to all TokenSpeed
+  ranks over TokenSpeed's weight-sync API. VERL does not profile that trainer's rollout; the plugin profiles the
+  generation that runs during a profiled step, so the step's trace shows it beside the actor update. Its config
+  extends `ppo_trainer` through a path relative to a VERL checkout, so outside one add
+  `'hydra.searchpath=[pkg://verl.trainer.config]'`.
+- A hybrid replica works as follows. A Ray actor launches `tokenspeed serve` on the GPUs of `tensor_model_parallel_size`
   training workers and drives it through TokenSpeed's control port: SGLang-style `/generate` with log probs,
   `/release_memory_occupation` while the workers train, and `/resume_memory_occupation` before generating. Every
   request is a `tokenspeed_generate` RL-Insight span on a `replica_<r>/slot_<k>` lane.
