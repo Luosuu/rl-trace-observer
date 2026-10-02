@@ -10,8 +10,10 @@ Profiling: each profiled step asks TokenSpeed for ``VIZTRACER`` and ``PROTON``
 traces (``RL_TRACE_TOKENSPEED_PROFILE_ACTIVITIES``) in a directory of its own,
 ``<RL_TRACE_OUTPUT_DIR>/rollout/replica<r>/<run_id>-step-<n>``. The directory,
 not the file name, identifies the profile: ``tokenspeed serve`` names the files
-after a timestamp whatever ``profile_id`` is sent. The scheduler processes
-never load this package, so once ``/stop_profile`` returns this actor registers
+after a timestamp whatever ``profile_id`` is sent. Without ``enforce_eager``,
+Proton profiles come from one session per scheduler that sees the CUDA-graph
+captures (see ``.proton_graphs``). The scheduler processes do not register
+artifacts, so once ``/stop_profile`` returns this actor registers
 each rank's files in its own process record, with the step and the scheduler's
 ``rank_tag``.
 """
@@ -149,6 +151,18 @@ class TokenSpeedServer:
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(SITE_DIR), env.get("PYTHONPATH")]))
         for key, value in PROTON_ENV_DEFAULTS.items():
             env.setdefault(key, value)
+        if "PROTON" in self._activities() and not self.config.enforce_eager:
+            # Proton must see the CUDA-graph captures at startup (see .proton_graphs).
+            from rl_trace_observer.output import trace_output_dir
+
+            from .proton_graphs import ENV as PROTON_SESSION_ENV
+
+            try:
+                session_dir = trace_output_dir() / "rollout" / f"replica{self.replica_rank}" / "proton-session"
+            except ValueError as error:
+                logger.warning("TokenSpeed Proton profiles need --enforce-eager: %s", error)
+            else:
+                env.setdefault(PROTON_SESSION_ENV, str(session_dir))
         command = self._command()
         logger.info("Replica %d: launching %s", self.replica_rank, shlex.join(command))
         # Output goes to this actor's Ray log.
@@ -328,10 +342,14 @@ class TokenSpeedServer:
     # Profiling
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _activities() -> list[str]:
+        activities = os.environ.get(ACTIVITIES_ENV, DEFAULT_ACTIVITIES).upper().split(",")
+        return [activity.strip() for activity in activities if activity.strip()]
+
     async def start_profile(self, global_step: int | None = None, **kwargs: Any) -> None:
         """Start a TokenSpeed profile for ``global_step``; a failure is logged, never raised."""
-        activities = [a.strip().upper() for a in os.environ.get(ACTIVITIES_ENV, DEFAULT_ACTIVITIES).split(",")]
-        activities = [activity for activity in activities if activity]
+        activities = self._activities()
         if not activities or self._profile is not None:
             return
         run_id = current_run_id() or "run"
@@ -372,8 +390,7 @@ class TokenSpeedServer:
         from rl_trace_observer.output import trace_output_dir
         from rl_trace_observer.process_record import register_artifact
 
-        activities = os.environ.get(ACTIVITIES_ENV, DEFAULT_ACTIVITIES).upper().split(",")
-        kinds = {_ACTIVITY_KINDS[a.strip()] for a in activities if a.strip() in _ACTIVITY_KINDS}
+        kinds = {_ACTIVITY_KINDS[a] for a in self._activities() if a in _ACTIVITY_KINDS}
         expected = len(kinds) * self.world_size
         deadline = time.monotonic() + ARTIFACT_WAIT_SECONDS
         while True:
