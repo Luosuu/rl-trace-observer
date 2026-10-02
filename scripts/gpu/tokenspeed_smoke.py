@@ -146,7 +146,7 @@ class _WeightSync:
     """One server receiving weights from a "trainer" rank on the next GPU, like TokenSpeedServerAdapter."""
 
     def __init__(self, model_path: str, tp: int, out: Path, prompt: list[int], protocol: str, delay: float):
-        from rl_trace_observer.integrations.tokenspeed.adapter import _join_group
+        from rl_trace_observer.integrations.tokenspeed.weight_sync import _join_group
 
         self.prompt, self.protocol, self.out, self.tp, self.delay = prompt, protocol, out, tp, delay
         self.name = f"{protocol}_tp{tp}_delay{delay:g}"

@@ -7,7 +7,7 @@ arguments, it serves on ``--control-port`` the routes the integration uses:
 * ``/release_memory_occupation`` / ``/resume_memory_occupation``, enforced:
   generating without KV cache or loading weights while they are released fails;
 * ``/init_weights_update_group`` / ``/update_weights_from_distributed``: joins
-  the trainer's group as rank 1 and receives every broadcast tensor;
+  the trainer's group at ``rank_offset`` and receives every broadcast tensor;
 * ``/start_profile`` / ``/stop_profile``: writes a VizTracer report and a
   Proton Chrome trace named and anchored like TokenSpeed's, rank 0 after a
   delay, as TokenSpeed saves VizTracer reports after replying.
@@ -59,9 +59,14 @@ def _join_group(body):
         rendezvous,
     )
 
-    assert body["world_size"] == 2 and body["rank_offset"] == 1, body
+    assert 1 <= body["rank_offset"] < body["world_size"], body
     store, rank, world_size = next(
-        rendezvous(f"tcp://{body['master_address']}:{body['master_port']}", 1, 2, timeout=default_pg_timeout)
+        rendezvous(
+            f"tcp://{body['master_address']}:{body['master_port']}",
+            body["rank_offset"],
+            body["world_size"],
+            timeout=default_pg_timeout,
+        )
     )
     group, _ = _new_process_group_helper(
         world_size,
@@ -183,7 +188,13 @@ def make_handler(state: State, tp: int):
 
         def route_init_weights_update_group(self, body):
             state.group = _join_group(body)
-            state.log(event="init_group", backend=body["backend"], group_name=body["group_name"])
+            state.log(
+                event="init_group",
+                backend=body["backend"],
+                group_name=body["group_name"],
+                rank_offset=body["rank_offset"],
+                world_size=body["world_size"],
+            )
             self._reply({"success": True, "message": "joined"})
 
         def route_update_weights_from_distributed(self, body):
