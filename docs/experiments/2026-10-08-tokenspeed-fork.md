@@ -41,3 +41,11 @@ TokenSpeed 不再通过 `sitecustomize` 打补丁，改为从我们的 fork 安�
 - fork 单元测试 20 个全部通过；
 - E0 的 32 项检查全部通过，`/stop_profile` 在 0.14–0.32 s 内返回，约 3 s 后文件写完；
 - E2 的 5 步全部完成，第 2–5 步等待数据均为 0 s，第 3、4 步的 strict 合并没有问题，每步 19 个产物。actor 的 `stop_profile` 仍约 6 s。
+
+## 复测：review 修复之后（fork `58cdfadc`）
+
+修复 PR #12 review 中确认的问题（失败路径上的长时间等待、weight sync 错误被掩盖、scheduled Torch profiler 的导出竞争、server 命名冲突等），fork 改为把 profile 文件写完后再改名到位，写失败时留下 `.failed` 标记。在 8×H100 上重跑（commit `da209ab`，job `rl-trace-review-20261009-085444-da209ab`）：
+
+- fork 单元测试 22 个全部通过；
+- E0 的 32 项检查全部通过；
+- E2 的 5 步全部完成，第 2–5 步等待数据均为 0 s，第 3、4 步的 strict 合并没有问题，每步 19 个产物。
