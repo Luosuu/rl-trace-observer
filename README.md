@@ -21,17 +21,20 @@ actor-side VizTracer call stacks are needed.
 ## Setup
 
 The project is managed with [uv](https://docs.astral.sh/uv/) on Python 3.12.
-`uv.lock` pins every dependency: VERL (>= 0.9.1), VizTracer, and RL-Insight
+`uv.lock` pins every dependency: VERL (exactly 0.9.1, whose private trainer and profiler methods the plugin
+patches; it fails at import with a clear error on another release), VizTracer, and RL-Insight
 from [verl-project/rl-insight](https://github.com/verl-project/rl-insight)
 `main`, the first version with `RL_INSIGHT_SERVER_BACKEND` (no release has it
-yet). TokenSpeed
-is the only extra (Linux only). It is pinned to a nightly build of
-[lightseekorg/tokenspeed](https://github.com/lightseekorg/tokenspeed) `main`
-(`0.1.0.post20260930`, from `https://lightseek.org/whl/nightly`), because the
-0.1.0 release does not link VizTracer scopes to Proton. A git checkout of `main`
-does not work on its own: each nightly needs the `tokenspeed-kernel` nightly of
-the same date, and that kernel requires `torch==2.14.0`, so the extra moves the
-environment to torch 2.14.
+yet). TokenSpeed is the only extra (Linux only). It comes from our fork,
+[Luosuu/tokenspeed](https://github.com/Luosuu/tokenspeed/tree/tianle/rl-trace)
+`tianle/rl-trace`: upstream `main` at the commit of the `0.1.0.post20260930`
+nightly (the 0.1.0 release does not link VizTracer scopes to Proton), plus what
+the rollout needs until it lands upstream: Proton profiles under CUDA graphs,
+profile files written in the background, and weight-update groups under torch
+2.14. Its Python package needs the `tokenspeed-kernel` nightly built from the
+same upstream commit (`0.1.3.post20260930`, from
+`https://lightseek.org/whl/nightly`), which requires `torch==2.14.0`, so the
+extra moves the environment to torch 2.14.
 
 ```bash
 uv sync --extra tokenspeed
@@ -102,6 +105,69 @@ Each process incrementally writes:
 Incremental JSONL output avoids relying on graceful Ray worker shutdown. The
 final merger can combine these absolute-time state events with actor Torch
 Profiler traces and TokenSpeed VizTracer/Proton traces.
+
+## TokenSpeed rollout
+
+`actor_rollout_ref.rollout.name=tokenspeed` runs VERL's rollout on
+[TokenSpeed](https://github.com/lightseekorg/tokenspeed). The plugin registers it in every VERL process, and nothing
+in VERL or TokenSpeed is modified:
+
+- With VERL's synchronous trainer (`verl.trainer.main_ppo`) each replica is hybrid: it shares the training GPUs, and
+  rollout and training take turns. With the one-step-off-policy trainer
+  (`verl.experimental.one_step_off_policy.main_ppo`, `actor_rollout_ref.hybrid_engine=False`) replicas are standalone
+  on GPUs of their own, and step `n` trains while they generate the batch of step `n + 1`. Standalone replicas need
+  `actor_rollout_ref.rollout.checkpoint_engine.backend=tokenspeed`: VERL's other backends hand weights to the server
+  over CUDA IPC, which TokenSpeed lacks, so this one has training rank 0 broadcast every bucket once to all TokenSpeed
+  ranks over TokenSpeed's weight-sync API. Hybrid replicas reject this backend at startup, since VERL's synchronous
+  trainer never runs it. VERL does not profile that trainer's rollout; the plugin profiles the
+  generation that runs during a profiled step, so the step's trace shows it beside the actor update. Its config
+  extends `ppo_trainer` through a path relative to a VERL checkout, so outside one add
+  `'hydra.searchpath=[pkg://verl.trainer.config]'`.
+- A hybrid replica works as follows. A Ray actor launches `tokenspeed serve` on the GPUs of `tensor_model_parallel_size`
+  training workers and drives it through TokenSpeed's control port: SGLang-style `/generate` with log probs,
+  `/release_memory_occupation` while the workers train, and `/resume_memory_occupation` before generating. Every
+  request is a `tokenspeed_generate` RL-Insight span on a `replica_<r>/slot_<k>` lane.
+- Weights go over TokenSpeed's NCCL weight-sync API (`/init_weights_update_group`, `/update_weights_from_distributed`).
+  An NCCL group cannot hold two ranks on one GPU, so replica `k` receives from the first training rank of replica
+  `k + 1`. This needs at least two replicas.
+- Since torch 2.14, a new NCCL group is split from the default process group when that group is bound to a device.
+  TokenSpeed binds its default group, so the group it joins for weight sync would be a split of its own world and
+  never reach the trainer. The first broadcast then hangs. Weight-update groups are therefore created without
+  splitting, on both sides: by `integrations/tokenspeed/weight_group.py` on the trainer side and by our TokenSpeed
+  fork on the server side.
+- On profiled steps (`global_profiler.steps`), every replica records `VIZTRACER` and `PROTON` traces into its own
+  directory, `$RL_TRACE_OUTPUT_DIR/rollout/replica<r>/<run_id>-step-<n>`. `tokenspeed serve` names the files after a
+  timestamp whatever `profile_id` it is sent, so the directory identifies the profile. The server actor then registers
+  each scheduler rank's files. `rl-trace-merge --step <n>` shows each rank as a process of its own.
+- Proton places kernels replayed from CUDA graphs only if its session was active while the graphs were captured.
+  `tokenspeed serve` captures at startup but opens a new session on every `/start_profile`, so on its own
+  `/stop_profile` fails with "Cannot find CPU scope event for kernel launch" unless the server runs eagerly. The
+  server actor therefore sets `TOKENSPEED_PROTON_SESSION_DIR`, with which our TokenSpeed fork keeps one Proton session
+  per scheduler from before capture. `/start_profile` activates it in a new data phase, and `/stop_profile` has
+  Proton's periodic flushing write that phase to the file TokenSpeed would have written. Replayed kernels then appear
+  under a `<captured_at>` frame with the name they were captured with. The same path serves eager servers.
+- In our TokenSpeed fork, `/stop_profile` replies once recording stops, and each scheduler writes its files on
+  threads, so a profiled step holds up neither the scheduler nor the trainer. Each file is renamed into place once
+  complete, and a failed write leaves `<file>.failed`. The server actor registers each file once it is complete; it
+  stops waiting when every file is complete or failed, when the server exits, or when no file appears or grows for
+  `RL_TRACE_TOKENSPEED_PROFILE_STALL_TIMEOUT`. The trainer waits for them before `fit` returns.
+- Reward and teacher models served by TokenSpeed get server actors and output directories of their own
+  (`tokenspeed_server_<role>_<replica>`, `<role>/replica<r>`); weights only go to the policy's `rollout` servers.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RL_TRACE_TOKENSPEED_PROFILE_ACTIVITIES` | `VIZTRACER,PROTON` | `/start_profile` activities; empty disables rollout profiling |
+| `RL_TRACE_TOKENSPEED_ARGS` | | extra `tokenspeed serve` arguments |
+| `RL_TRACE_TOKENSPEED_COMMAND` | `python -m tokenspeed.cli serve` | the server command (the CPU test points it at a fake server) |
+| `RL_TRACE_TOKENSPEED_STARTUP_TIMEOUT` | `1800` | seconds to wait for `/health` |
+| `RL_TRACE_TOKENSPEED_SYNC_TIMEOUT` | `600` | seconds before a weight-update group operation times out |
+| `RL_TRACE_TOKENSPEED_PROFILE_STALL_TIMEOUT` | `300` | seconds without a new or growing profile file before registration gives up |
+| `RL_TRACE_PROFILE_WAIT_TIMEOUT` | `1800` | seconds the driver waits for pending profiles when `fit` ends |
+
+`TOKENSPEED_KERNEL_PROFILE_DATA=trace`, `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace` and, with `PROTON`,
+`TOKENSPEED_PROTON_SESSION_DIR` are set for the server unless you set them. `tests/test_cpu_tokenspeed_ppo.py` runs the real `main_ppo` against a fake TokenSpeed
+server on CPU, sending weights over gloo. `scripts/gpu/run_e2e.sh` runs the GPU experiments on one 8-GPU node, and
+`scripts/gpu/submit_nebius.sh` submits it as a Nebius AI job.
 
 ## Merge into one Perfetto trace
 

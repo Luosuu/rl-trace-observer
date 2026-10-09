@@ -17,9 +17,23 @@ def trainer_module(tmp_path, monkeypatch):
     (tmp_path / "fake_trainer_base.py").write_text(
         "class PPOTrainer:\n"
         "    global_steps = 3\n"
+        "    def __init__(self, rollout='vllm', managers=()):\n"
+        "        self.config = Config(rollout)\n"
+        "        self.managers = list(managers)\n"
         "    def step(self, metrics, timing_raw):\n"
         "        metrics['ran'] = True\n"
         "        return 'batch'\n"
+        "    def fit(self, agent_loop_manager):\n"
+        "        return 'trained'\n"
+        "    def _rollout_server_managers(self):\n"
+        "        return self.managers\n"
+        "    def _start_rollout_profiling(self):\n"
+        "        for manager in self.managers:\n"
+        "            manager.start_profile()\n"
+        "class Config:\n"
+        "    def __init__(self, rollout):\n"
+        "        self.actor_rollout_ref = type('R', (), {'rollout': type('N', (), {'name': rollout})})\n"
+        "        self.global_profiler = {'steps': [3]}\n"
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     yield "fake_trainer_base"
@@ -93,3 +107,97 @@ def test_patched_module_keeps_its_source(trainer_module, spans):
 
     # Tracebacks and inspect read the source through the module's loader.
     assert "class PPOTrainer" in module.__loader__.get_source(trainer_module)
+
+
+class _Manager:
+    def __init__(self):
+        self.calls = []
+
+    def start_profile(self, **kwargs):
+        self.calls.append(kwargs)
+
+
+@pytest.mark.parametrize(("rollout", "kwargs"), [("tokenspeed", {"global_step": 3}), ("vllm", {})])
+def test_tokenspeed_rollout_profiling_is_told_the_step(trainer_module, spans, rollout, kwargs):
+    when_imported(trainer_module, steps.patch_trainer)
+    module = importlib.import_module(trainer_module)
+    manager = _Manager()
+
+    module.PPOTrainer(rollout, [manager])._start_rollout_profiling()
+
+    assert manager.calls == [kwargs]
+
+
+def test_fit_waits_for_profiles_written_in_the_background(trainer_module, spans, monkeypatch):
+    waited = []
+    monkeypatch.setattr(steps, "_wait_for_profiles", waited.append)
+    when_imported(trainer_module, steps.patch_trainer)
+    module = importlib.import_module(trainer_module)
+    trainer = module.PPOTrainer()
+
+    assert trainer.fit(None) == "trained"
+    assert waited == [trainer]
+
+
+def test_a_missing_verl_method_fails_clearly():
+    module = types.ModuleType("fake_trainer_base_old")
+    module.PPOTrainer = type("PPOTrainer", (), {"step": lambda self: None, "fit": lambda self: None})
+
+    with pytest.raises(RuntimeError, match="supports verl 0.9.1.*_start_rollout_profiling"):
+        steps.patch_trainer(module)
+
+
+def test_one_step_off_starts_a_profile_only_after_the_previous_stop(spans, monkeypatch):
+    import asyncio
+
+    import ray
+
+    gets = []
+    monkeypatch.setattr(ray, "get", lambda refs: gets.append(list(refs)))
+
+    class Remote:
+        def __init__(self, name):
+            self.name = name
+
+        def remote(self, **kwargs):
+            return (self.name, kwargs.get("global_step"))
+
+    server = types.SimpleNamespace(start_profile=Remote("start"), stop_profile=Remote("stop"))
+
+    class Trainer:
+        global_steps = 2
+
+        def __init__(self):
+            self.config = types.SimpleNamespace(
+                actor_rollout_ref=types.SimpleNamespace(rollout=types.SimpleNamespace(name="tokenspeed")),
+                global_profiler={"steps": [2, 3]},
+            )
+            self.llm_server_manager = types.SimpleNamespace(
+                get_replicas=lambda: [types.SimpleNamespace(servers=[server])]
+            )
+
+        async def fit(self):
+            pass
+
+        async def fit_step(self):
+            task = asyncio.create_task(self._async_gen_next_batch())
+            await asyncio.sleep(0)
+            await task
+            self.global_steps += 1
+
+        async def _async_gen_next_batch(self):
+            return "batch"
+
+    module = types.ModuleType("fake_one_step_off")
+    module.OneStepOffRayTrainer = Trainer
+    assert steps.patch_one_step_off_trainer(module)
+    trainer = Trainer()
+
+    async def two_steps():
+        await trainer.fit_step()
+        await trainer.fit_step()
+
+    asyncio.run(two_steps())
+
+    # Step 3's start waits for step 2's stop, which was not awaited.
+    assert gets == [[], [("start", 2)], [("stop", None)], [("start", 3)]]

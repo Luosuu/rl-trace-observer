@@ -1,6 +1,8 @@
 """``rl-trace-merge``: merge per-process artifacts into one Perfetto trace."""
 
 import argparse
+import functools
+import gzip
 import json
 import logging
 import os
@@ -22,10 +24,12 @@ def _default_manifest_path(output: Path) -> Path:
 
 
 def _write_json_atomically(path: Path, data: Any, **dump_kwargs: Any) -> None:
+    """Write ``path`` (gzip-compressed when it ends in ``.gz``) through a temporary file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
+    opener = functools.partial(gzip.open, compresslevel=6) if path.suffix == ".gz" else open
     try:
-        with temporary.open("w", encoding="utf-8") as file:
+        with opener(temporary, "wt", encoding="utf-8") as file:
             json.dump(data, file, **dump_kwargs)
         os.replace(temporary, path)
     finally:
@@ -38,7 +42,9 @@ def main(argv: list[str] | None = None) -> int:
         description="Merge RL-Insight JSONL, Torch Profiler and VizTracer artifacts into one Chrome Trace.",
     )
     parser.add_argument("inputs", nargs="+", type=Path, help="artifact files or directories (searched recursively)")
-    parser.add_argument("-o", "--output", type=Path, required=True, help="merged Chrome Trace JSON to write")
+    parser.add_argument(
+        "-o", "--output", type=Path, required=True, help="merged Chrome Trace JSON to write (.json.gz compresses it)"
+    )
     parser.add_argument(
         "--manifest", type=Path, help="session manifest to write (default: <output stem>.manifest.json)"
     )

@@ -10,15 +10,20 @@ requires-python = "==3.12.*"
 dependencies = [
     # 0.9 adds verl.plugins entry point discovery and the RL-Insight hooks used here.
     # verl-core holds what running verl.trainer.main_ppo needs (TransferQueue, ...).
-    "verl[verl-core]>=0.9.1",
+    # Exact: the plugin patches private trainer and profiler methods of this release.
+    "verl[verl-core]==0.9.1",
     "rl-insight",
     "viztracer>=0.16",
 ]
 
 [project.optional-dependencies]
-# Kernel wheels exist only for Linux. post20261001 imports kernel functions its
-# same-date kernel nightly lacks.
-tokenspeed = ["tokenspeed==0.1.0.post20260930; sys_platform == 'linux'"]
+# Kernel wheels exist only for Linux. TokenSpeed comes from our fork (see
+# [tool.uv.sources]); its python package needs the kernel nightly built from
+# the same upstream commit.
+tokenspeed = [
+    "tokenspeed; sys_platform == 'linux'",
+    "tokenspeed-kernel==0.1.3.post20260930; sys_platform == 'linux'",
+]
 
 [dependency-groups]
 dev = ["perfetto", "pytest>=8", "pyyaml", "ruff>=0.12"]
@@ -33,11 +38,15 @@ rl-trace-observer = "rl_trace_observer.integrations.verl.register"
 # RL_INSIGHT_SERVER_BACKEND is on main (verl-project/rl-insight#190) but in no
 # release yet; uv.lock pins the commit.
 rl-insight = { git = "https://github.com/verl-project/rl-insight", branch = "main" }
+# Fork of TokenSpeed main at 76fc28f (the 0.1.0.post20260930 nightly) with
+# Proton profiles under CUDA graphs, background profile writes and the torch
+# 2.14 weight-update group fix, until they land upstream. Never force-push this
+# branch: uv.lock pins its commit.
+tokenspeed = { git = "https://github.com/Luosuu/tokenspeed", branch = "tianle/rl-trace", subdirectory = "python" }
 
-# TokenSpeed nightly builds of main: its VizTracer reports carry the scope-entry
-# flows that link Python slices to Proton CPU scopes, which the 0.1.0 release
-# lacks. Each nightly needs the tokenspeed-kernel nightly of the same date, which
-# needs further tokenspeed-* nightlies; the index holds only tokenspeed packages.
+# TokenSpeed kernel nightlies (and nightlies of the other tokenspeed-* packages
+# they need); main's VizTracer reports carry the scope-entry flows that link
+# Python slices to Proton CPU scopes, which the 0.1.0 release lacks.
 [[tool.uv.index]]
 name = "tokenspeed-nightly"
 url = "https://lightseek.org/whl/nightly"

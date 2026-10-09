@@ -134,3 +134,17 @@ def test_the_cli_refuses_a_manifest_at_the_output_path(tmp_path):
     with pytest.raises(SystemExit):
         main([str(tmp_path), "-o", str(output), "--manifest", str(tmp_path / "out" / ".." / "out" / "merged.json")])
     assert not output.exists()
+
+
+def test_gz_output_is_compressed(tmp_path):
+    import gzip
+
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    TracedProcess(inputs).jsonl()
+    output = tmp_path / "merged.json.gz"
+
+    assert main([str(inputs), "-o", str(output)]) == 0
+    with gzip.open(output, "rt") as file:
+        assert json.load(file)["traceEvents"]
+    assert (tmp_path / "merged.manifest.json").is_file()
