@@ -4,15 +4,17 @@
 of its replica and implements the server-actor interface VERL's agent loop and
 replicas call (``generate``, ``sleep``, ``start_profile``, ...). Everything goes
 through TokenSpeed's control port, which serves SGLang-style ``/generate`` and
-the RL control routes; TokenSpeed itself is not modified.
+the RL control routes. It needs our TokenSpeed fork (``Luosuu/tokenspeed``,
+branch ``tianle/rl-trace``) for Proton under CUDA graphs, background profile
+writes and weight-update groups under torch 2.14.
 
 Profiling: each profiled step asks TokenSpeed for ``VIZTRACER`` and ``PROTON``
 traces (``RL_TRACE_TOKENSPEED_PROFILE_ACTIVITIES``) in a directory of its own,
 ``<RL_TRACE_OUTPUT_DIR>/rollout/replica<r>/<run_id>-step-<n>``. The directory,
 not the file name, identifies the profile: ``tokenspeed serve`` names the files
-after a timestamp whatever ``profile_id`` is sent. Without ``enforce_eager``,
-Proton profiles come from one session per scheduler that sees the CUDA-graph
-captures (see ``.proton_graphs``). The scheduler processes do not register
+after a timestamp whatever ``profile_id`` is sent. Proton profiles come from
+one session per scheduler that sees the CUDA-graph captures
+(``TOKENSPEED_PROTON_SESSION_DIR``). The scheduler processes do not register
 artifacts, so once ``/stop_profile`` returns this actor registers
 each rank's files in its own process record, with the step and the scheduler's
 ``rank_tag``.
@@ -42,14 +44,18 @@ EXTRA_ARGS_ENV = "RL_TRACE_TOKENSPEED_ARGS"
 ACTIVITIES_ENV = "RL_TRACE_TOKENSPEED_PROFILE_ACTIVITIES"
 STARTUP_TIMEOUT_ENV = "RL_TRACE_TOKENSPEED_STARTUP_TIMEOUT"
 DEFAULT_ACTIVITIES = "VIZTRACER,PROTON"
-# Proton writes a mergeable timeline only as a Chrome trace of trace-mode data.
-PROTON_ENV_DEFAULTS = {
+TOKENSPEED_ENV_DEFAULTS = {
+    # Proton writes a mergeable timeline only as a Chrome trace of trace-mode data.
     "TOKENSPEED_KERNEL_PROFILE_DATA": "trace",
     "TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT": "chrome_trace",
+    # /stop_profile only stops recording; the scheduler writes the files on threads.
+    "TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND": "1",
 }
+# Each scheduler keeps one Proton session from before its CUDA-graph captures.
+PROTON_SESSION_ENV = "TOKENSPEED_PROTON_SESSION_DIR"
 _ACTIVITY_KINDS = {"VIZTRACER": TOKENSPEED_VIZTRACER, "PROTON": TOKENSPEED_PROTON}
-# TokenSpeed's ranks write their files after /stop_profile returns (see
-# .profile_saving); registration waits for them in the background.
+# TokenSpeed's ranks write their files after /stop_profile returns
+# (TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND); registration waits for them in the background.
 ARTIFACT_WAIT_SECONDS = 1800.0
 
 
@@ -167,18 +173,12 @@ class TokenSpeedServer:
         return command + args + shlex.split(os.environ.get(EXTRA_ARGS_ENV, ""))
 
     async def launch_server(self) -> None:
-        from .weight_group import SITE_DIR
-
         env = {**os.environ, "CUDA_VISIBLE_DEVICES": self.cuda_visible_devices}
-        # Weight-update groups must not split from TokenSpeed's own world (see .weight_group).
-        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(SITE_DIR), env.get("PYTHONPATH")]))
-        for key, value in PROTON_ENV_DEFAULTS.items():
+        for key, value in TOKENSPEED_ENV_DEFAULTS.items():
             env.setdefault(key, value)
-        if "PROTON" in self._activities() and not self.config.enforce_eager:
-            # Proton must see the CUDA-graph captures at startup (see .proton_graphs).
+        if "PROTON" in self._activities():
+            # One Proton session per scheduler from startup, which sees the CUDA-graph captures.
             from rl_trace_observer.output import trace_output_dir
-
-            from .proton_graphs import ENV as PROTON_SESSION_ENV
 
             try:
                 session_dir = trace_output_dir() / "rollout" / f"replica{self.replica_rank}" / "proton-session"

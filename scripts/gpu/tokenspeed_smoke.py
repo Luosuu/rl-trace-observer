@@ -5,9 +5,10 @@ Launches ``tokenspeed serve`` (TP=2 by default), then checks and records:
 1. ``/generate`` with ``input_ids`` returns token ids with one log prob each;
 2. a ``VIZTRACER`` + ``PROTON`` profile over concurrent requests writes one
    VizTracer report and one Proton Chrome trace per TP rank, each with its
-   ``baseTimeNanoseconds`` anchor. Once with ``--enforce-eager``, and once with
-   CUDA graphs and the long-lived Proton session of
-   ``integrations/tokenspeed/proton_graphs.py``, profiling twice;
+   ``baseTimeNanoseconds`` anchor. Once with ``--enforce-eager`` and once with
+   CUDA graphs, profiling twice; both use our TokenSpeed fork's long-lived
+   Proton session (``TOKENSPEED_PROTON_SESSION_DIR``) and background writes
+   (``TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND``), as the VERL rollout does;
 3. releasing and resuming weights and KV cache keeps generation working;
 4. weights broadcast from a "trainer" on the next GPU through
    ``/update_weights_from_distributed`` are loaded, for each way of wrapping
@@ -45,15 +46,13 @@ def _free_port() -> int:
 class Server:
     def __init__(self, model: str, tp: int, log: Path, extra_args: tuple[str, ...] = (), env: dict | None = None):
         self.port, self.control_port = _free_port(), _free_port()
-        from rl_trace_observer.integrations.tokenspeed.weight_group import SITE_DIR
+        from rl_trace_observer.integrations.tokenspeed.server import TOKENSPEED_ENV_DEFAULTS
 
         env = {
             **os.environ,
-            "PYTHONPATH": os.pathsep.join(filter(None, [str(SITE_DIR), os.environ.get("PYTHONPATH")])),
             # The server takes the first tp GPUs; the "trainer" uses the next one.
             "CUDA_VISIBLE_DEVICES": ",".join(os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2").split(",")[:tp]),
-            "TOKENSPEED_KERNEL_PROFILE_DATA": "trace",
-            "TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT": "chrome_trace",
+            **TOKENSPEED_ENV_DEFAULTS,
             **(env or {}),
         }
         command = [
@@ -271,6 +270,18 @@ def _rank_files(profile_dir: Path, tp: int) -> dict[str, Path]:
     return files
 
 
+def _whole_json(path: Path) -> bool:
+    size = path.stat().st_size
+    if size == 0:
+        return False
+    with path.open("rb") as file:
+        file.seek(max(0, size - 16))
+        if not file.read().rstrip().endswith(b"}"):
+            return False
+    time.sleep(0.5)
+    return path.stat().st_size == size
+
+
 def _profile(server, generate, prompt_ids, profile_dir: Path, tp: int) -> tuple[dict, dict]:
     """One VIZTRACER+PROTON profile over concurrent requests: (result, checks)."""
     result: dict = {}
@@ -282,16 +293,23 @@ def _profile(server, generate, prompt_ids, profile_dir: Path, tp: int) -> tuple[
     )
     with concurrent.futures.ThreadPoolExecutor(16) as pool:
         outputs = list(pool.map(generate, prompt_ids))
+    stop = time.time()
     try:
         result["stop_profile"] = server.post("/stop_profile")
     except RuntimeError as error:
         result["stop_profile_error"] = str(error)
+    result["stop_profile_seconds"] = time.time() - stop
     result["profile_seconds"] = time.time() - start
     checks["profiled_requests"] = all(o.get("output_ids") for o in outputs)
     expected = {f"TP{rank}.{suffix}" for rank in range(tp) for suffix in ("viztracer.json", "proton.chrome_trace")}
-    deadline = time.monotonic() + 60
-    while not expected <= set(_rank_files(profile_dir, tp)) and time.monotonic() < deadline:
+    # Files are written after /stop_profile replies: wait until each one is whole.
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        files = _rank_files(profile_dir, tp)
+        if expected <= set(files) and all(_whole_json(path) for path in files.values()):
+            break
         time.sleep(1)
+    result["files_written_seconds"] = time.time() - stop
     files = _rank_files(profile_dir, tp)
     result["profile_files"] = {path.name: path.stat().st_size for path in files.values()}
     checks["profile_files"] = expected <= set(files)
@@ -377,13 +395,13 @@ def main():
         for p in prompts
     ]
 
-    # 1-3 per server configuration. With CUDA graphs, Proton needs a session
-    # that sees the captures (proton_graphs); it must survive two profiles.
-    from rl_trace_observer.integrations.tokenspeed.proton_graphs import ENV as PROTON_SESSION_ENV
+    # 1-3 per server configuration. The Proton session lives from startup
+    # (it sees the CUDA-graph captures) and must survive two profiles.
+    from rl_trace_observer.integrations.tokenspeed.server import PROTON_SESSION_ENV
 
     variants = (
-        ("eager", ("--enforce-eager",), 1, None),
-        ("graph", (), 2, {PROTON_SESSION_ENV: str(out / "proton_session")}),
+        ("eager", ("--enforce-eager",), 2, {PROTON_SESSION_ENV: str(out / "proton_session_eager")}),
+        ("graph", (), 2, {PROTON_SESSION_ENV: str(out / "proton_session_graph")}),
     )
     profiled = []
     for variant, extra_args, profiles, env in variants:

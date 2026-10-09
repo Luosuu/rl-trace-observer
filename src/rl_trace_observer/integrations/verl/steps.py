@@ -13,7 +13,7 @@ batch generated during step ``n - 1`` while it generates the batch of step
 of that step, so its trace shows rollout and training side by side.
 
 Profiles are written in the background (``torch_traces`` in the training
-workers, ``tokenspeed.profile_saving`` in TokenSpeed), so no step waits for
+workers, ``TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND`` in TokenSpeed), so no step waits for
 them; when ``fit`` ends, the driver waits for every pending one, before Ray
 tears the processes down.
 

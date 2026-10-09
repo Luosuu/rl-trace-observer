@@ -9,8 +9,9 @@ arguments, it serves on ``--control-port`` the routes the integration uses:
 * ``/init_weights_update_group`` / ``/update_weights_from_distributed``: joins
   the trainer's group at ``rank_offset`` and receives every broadcast tensor;
 * ``/start_profile`` / ``/stop_profile``: writes a VizTracer report and a
-  Proton Chrome trace named and anchored like TokenSpeed's, rank 0 after a
-  delay, as TokenSpeed saves VizTracer reports after replying.
+  Proton Chrome trace named and anchored like TokenSpeed's; with
+  ``TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND``, after a delay, as our TokenSpeed
+  fork writes them after replying.
 
 Every request is appended to ``$FAKE_TOKENSPEED_LOG_DIR/fake-tokenspeed-<port>.jsonl``.
 """
@@ -222,10 +223,12 @@ def make_handler(state: State, tp: int):
                 return self._fail("Profiling is not in progress")
             output_dir, profile_id, start_ns = state.profile
             state.profile = None
-            for rank in range(1, tp):
-                _write_profile(Path(output_dir), profile_id, start_ns, rank)
-            # Rank 0 finishes after the reply.
-            threading.Timer(1.0, _write_profile, (Path(output_dir), profile_id, start_ns, 0)).start()
+            for rank in range(tp):
+                write = (_write_profile, (Path(output_dir), profile_id, start_ns, rank))
+                if os.environ.get("TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND") == "1":
+                    threading.Timer(1.0, *write).start()  # after the reply
+                else:
+                    write[0](*write[1])
             state.log(event="stop_profile", profile_id=profile_id)
             self._reply({"success": True, "message": "Succeeded."})
 
@@ -239,7 +242,9 @@ def main():
     parser.add_argument("--control-port", type=int, required=True)
     args, _ = parser.parse_known_args()
     state = State(args)
-    state.log(event="launch", args=vars(args))
+    names = ("TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND", "TOKENSPEED_PROTON_SESSION_DIR")
+    env = {name: os.environ.get(name) for name in names}
+    state.log(event="launch", args=vars(args), env=env)
     ThreadingHTTPServer(("0.0.0.0", args.control_port), make_handler(state, args.tp)).serve_forever()
 
 

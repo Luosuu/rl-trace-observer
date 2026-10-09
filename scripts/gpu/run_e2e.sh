@@ -27,9 +27,10 @@ ROLLOUT_TP=${ROLLOUT_TP:-2}
 RUN_E0=${RUN_E0:-1}
 RUN_E2=${RUN_E2:-1}
 TRAINER=${TRAINER:-sync}
-# With CUDA graphs (False), Proton profiles come from the session that
-# integrations/tokenspeed/proton_graphs.py keeps from before capture.
+# With CUDA graphs (False), Proton profiles come from the session our
+# TokenSpeed fork keeps from before capture (TOKENSPEED_PROTON_SESSION_DIR).
 ROLLOUT_EAGER=${ROLLOUT_EAGER:-False}
+RUN_TOKENSPEED_TESTS=${RUN_TOKENSPEED_TESTS:-1}
 mkdir -p "$RESULTS_DIR" "$WORK_DIR"
 mkdir -p "$WORK_DIR/out"
 exec > >(tee -a "$WORK_DIR/out/job.log") 2>&1
@@ -53,6 +54,19 @@ export PATH=$UV_PROJECT_ENVIRONMENT/bin:$PATH
 PY=$UV_PROJECT_ENVIRONMENT/bin/python
 $PY -c "import torch, tokenspeed; print('torch', torch.__version__, 'cuda', torch.version.cuda, torch.cuda.device_count(), 'gpus')"
 $PY -m tokenspeed.cli env > "$WORK_DIR/out/tokenspeed_env.txt" 2>&1 || true
+
+if [ "$RUN_TOKENSPEED_TESTS" = 1 ]; then
+  echo "=== TokenSpeed fork: profiling and weight-group unit tests (need a GPU to import)"
+  TS_COMMIT=$($PY -c "import importlib.metadata as m, json; print(json.loads(m.distribution('tokenspeed').read_text('direct_url.json'))['vcs_info']['commit_id'])")
+  TS_SRC=$WORK_DIR/tokenspeed-src
+  [ -d "$TS_SRC" ] || git clone -q --filter=blob:none https://github.com/Luosuu/tokenspeed "$TS_SRC"
+  git -C "$TS_SRC" fetch -q origin "$TS_COMMIT" && git -C "$TS_SRC" checkout -q "$TS_COMMIT"
+  (cd "$TS_SRC" && $PY -m pytest -q test/runtime/test_request_handler_profile.py \
+    test/runtime/test_proton_session.py test/runtime/test_weights_update_group.py) \
+    > "$WORK_DIR/out/tokenspeed_tests.txt" 2>&1
+  echo "TokenSpeed tests at $TS_COMMIT exit $?"
+  tail -3 "$WORK_DIR/out/tokenspeed_tests.txt"
+fi
 
 MODEL_DIR=$WORK_DIR/models/$(basename "$MODEL")
 [ -d "$MODEL_DIR" ] || $PY -c "from huggingface_hub import snapshot_download; snapshot_download('$MODEL', local_dir='$MODEL_DIR')" || exit 1
