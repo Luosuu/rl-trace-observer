@@ -335,11 +335,15 @@ def _profile(server, generate, prompt_ids, profile_dir: Path, tp: int) -> tuple[
 
 
 def _request_id_probe(server, prompt_ids: list[list[int]]) -> dict:
-    """P6-0: does the ``rid`` a client sends reach TokenSpeed's engine and scheduler unchanged?
+    """Does the ``rid`` a client sends reach TokenSpeed's scheduler unchanged? (P6-0)
 
-    Three independent signs: the ``meta_info.id`` of the response, the gRPC
-    servicer's and AsyncLLM's request logs, and aborting a running request by
-    its ``rid`` (the scheduler looks requests up by ``rid``).
+    Signs: the ``meta_info.id`` of the response, and the gRPC servicer's,
+    AsyncLLM's and the scheduler's logs. On 2026-10-09 all held: request-level
+    correlation keys on the rid our server actor sends.
+
+    Also records what aborting a running request by its ``rid`` does: the
+    scheduler ends it, but on fork 58cdfadc the HTTP request is never answered
+    (the gateway gives up with 500), so only the finding is recorded.
     """
     import re
     import uuid
@@ -360,31 +364,34 @@ def _request_id_probe(server, prompt_ids: list[list[int]]) -> dict:
         "sampling_params": {"max_new_tokens": max_tokens, "ignore_eos": True, "temperature": 1.0},
     }
     with concurrent.futures.ThreadPoolExecutor(1) as pool:
-        running = pool.submit(requests.post, server.url("/generate"), json=body, timeout=600)
+        running = pool.submit(requests.post, server.url("/generate"), json=body, timeout=60)
         time.sleep(1.5)
         aborted_at = time.time()
         abort = requests.post(server.url("/abort_request"), json={"rid": abort_rid}, timeout=60)
-        response = running.result(timeout=600)
+        try:
+            response = running.result(timeout=120)
+        except requests.Timeout:
+            response = None
     probe["abort_request"] = {"status": abort.status_code, "text": abort.text[:500]}
-    probe["aborted_generate"] = {"status": response.status_code, "seconds_after_abort": time.time() - aborted_at}
-    try:
-        payload = response.json()
-        payload = payload[0] if isinstance(payload, list) else payload
-        finish = (payload.get("meta_info") or {}).get("finish_reason")
-        tokens = len(payload.get("output_ids") or [])
-        probe["aborted_generate"].update(
-            finish_reason=finish, output_tokens=tokens, meta_info_id=payload.get("meta_info", {}).get("id")
-        )
-        probe["rid_abort_works"] = tokens < max_tokens
-    except ValueError:
-        probe["aborted_generate"]["text"] = response.text[:500]
-        probe["rid_abort_works"] = "abort" in response.text.lower()
+    probe["aborted_generate"] = {"answered": response is not None, "seconds_after_abort": time.time() - aborted_at}
+    probe["rid_abort_works"] = False
+    if response is not None:
+        probe["aborted_generate"].update(status=response.status_code, text=response.text[:500])
+        if response.status_code == 200:
+            payload = response.json()
+            payload = payload[0] if isinstance(payload, list) else payload
+            meta = payload.get("meta_info") or {}
+            tokens = len(payload.get("output_ids") or [])
+            probe["aborted_generate"].update(finish_reason=meta.get("finish_reason"), output_tokens=tokens)
+            probe["rid_abort_works"] = tokens < max_tokens
 
     server.log.flush()
     time.sleep(1)
     text = Path(server.log.name).read_text(errors="replace")
     probe["servicer_logged_rid"] = f"Generate request {rid}" in text
     probe["async_llm_logged_rid"] = any(rid in line and "Receive" in line for line in text.splitlines())
+    probe["scheduler_logged_rid"] = f"Req: {rid} Finish" in text
+    probe["scheduler_ended_aborted_rid"] = f"Req: {abort_rid} Finish" in text
     # What the servicer saw instead, if not our rid.
     probe["servicer_request_ids"] = re.findall(r"Generate request (\S+)", text)[-4:]
     print(f"  request id probe: {probe}", flush=True)
@@ -414,9 +421,12 @@ def check_server(model, tp, out, variant, extra_args, prompt_ids, tokenizer, pro
         checks["generate_logprobs"] = bool(token_ids) and len(token_ids) == len(logprobs)
         result["generate_text"] = tokenizer.decode(token_ids)
         try:
-            result["request_id_probe"] = _request_id_probe(server, prompt_ids)
+            probe = result["request_id_probe"] = _request_id_probe(server, prompt_ids)
         except Exception as error:
-            result["request_id_probe"] = {"error": repr(error)}
+            probe = result["request_id_probe"] = {"error": repr(error)}
+        checks["request_id_passes_through"] = all(
+            probe.get(key) for key in ("rid_returned", "servicer_logged_rid", "scheduler_logged_rid")
+        )
 
         for index in range(profiles):
             # 2. profile concurrent requests
