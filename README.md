@@ -144,9 +144,9 @@ in VERL or TokenSpeed is modified:
   per scheduler from before capture. `/start_profile` activates it in a new data phase, and `/stop_profile` has
   Proton's periodic flushing write that phase to the file TokenSpeed would have written. Replayed kernels then appear
   under a `<captured_at>` frame with the name they were captured with. The same path serves eager servers.
-- The server actor also sets `TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND=1`: `/stop_profile` replies once recording stops,
-  and each scheduler writes its files on threads, so a profiled step holds up neither the scheduler nor the trainer.
-  The server actor registers each file once it is complete, and the trainer waits for them before `fit` returns.
+- In our TokenSpeed fork, `/stop_profile` replies once recording stops, and each scheduler writes its files on
+  threads, so a profiled step holds up neither the scheduler nor the trainer. The server actor registers each file once
+  it is complete, and the trainer waits for them before `fit` returns.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -156,9 +156,8 @@ in VERL or TokenSpeed is modified:
 | `RL_TRACE_TOKENSPEED_STARTUP_TIMEOUT` | `1800` | seconds to wait for `/health` |
 | `RL_TRACE_TOKENSPEED_SYNC_TIMEOUT` | `600` | seconds before a weight-update group operation times out |
 
-`TOKENSPEED_KERNEL_PROFILE_DATA=trace`, `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace`,
-`TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND=1` and, with `PROTON`, `TOKENSPEED_PROTON_SESSION_DIR` are set for the server
-unless you set them. `tests/test_cpu_tokenspeed_ppo.py` runs the real `main_ppo` against a fake TokenSpeed
+`TOKENSPEED_KERNEL_PROFILE_DATA=trace`, `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace` and, with `PROTON`,
+`TOKENSPEED_PROTON_SESSION_DIR` are set for the server unless you set them. `tests/test_cpu_tokenspeed_ppo.py` runs the real `main_ppo` against a fake TokenSpeed
 server on CPU, sending weights over gloo. `scripts/gpu/run_e2e.sh` runs the GPU experiments on one 8-GPU node, and
 `scripts/gpu/submit_nebius.sh` submits it as a Nebius AI job.
 

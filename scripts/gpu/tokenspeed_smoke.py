@@ -7,8 +7,8 @@ Launches ``tokenspeed serve`` (TP=2 by default), then checks and records:
    VizTracer report and one Proton Chrome trace per TP rank, each with its
    ``baseTimeNanoseconds`` anchor. Once with ``--enforce-eager`` and once with
    CUDA graphs, profiling twice; both use our TokenSpeed fork's long-lived
-   Proton session (``TOKENSPEED_PROTON_SESSION_DIR``) and background writes
-   (``TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND``), as the VERL rollout does;
+   Proton session (``TOKENSPEED_PROTON_SESSION_DIR``), as the VERL rollout
+   does, and its files are written after ``/stop_profile`` replies;
 3. releasing and resuming weights and KV cache keeps generation working;
 4. weights broadcast from a "trainer" on the next GPU through
    ``/update_weights_from_distributed`` are loaded, for each way of wrapping

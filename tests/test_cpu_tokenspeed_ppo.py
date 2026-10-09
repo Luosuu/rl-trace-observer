@@ -52,9 +52,8 @@ def test_ppo_with_tokenspeed_rollout_on_cpu(tmp_path, load_in_perfetto):
     for events in servers.values():
         assert [event for event in events if event["event"] == "error"] == []
         kinds = [event["event"] for event in events]
-        # The server writes profiles in the background, Proton from one session per scheduler.
+        # Proton profiles come from one session per scheduler.
         env = events[0]["env"]
-        assert env["TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND"] == "1"
         assert env["TOKENSPEED_PROTON_SESSION_DIR"].startswith(str(output_dir / "rollout"))
         assert kinds.count("init_group") == 1
         assert kinds.count("generate") == TRAIN_BATCH_SIZE * ROLLOUT_N * STEPS // WORLD_SIZE

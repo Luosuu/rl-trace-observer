@@ -3,9 +3,9 @@
 TokenSpeed 不再通过 `sitecustomize` 打补丁，改为从我们的 fork 安装：[Luosuu/tokenspeed](https://github.com/Luosuu/tokenspeed/tree/tianle/rl-trace) `tianle/rl-trace`，基于上游 `76fc28f`（即之前固定的 `0.1.0.post20260930` nightly）。fork 有两个提交：
 
 - `eb558118`：`init_weights_update_group` 创建权重组时临时解除默认进程组的设备绑定，避免 torch 2.14 把它从 TokenSpeed 自己的世界 split 出来、trainer 连不上；
-- `d81f1a25`：`TOKENSPEED_PROTON_SESSION_DIR`（scheduler 启动前建立常驻 Proton session，支持 CUDA graph）和 `TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND`（`/stop_profile` 停止记录后立即返回，文件在后台线程写）。
+- `d81f1a25`：`TOKENSPEED_PROTON_SESSION_DIR`（scheduler 启动前建立常驻 Proton session，支持 CUDA graph）和 `TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND`（`/stop_profile` 停止记录后立即返回，文件在后台线程写）。之后的 `0ea62714` 去掉了这个开关，后台写成为唯一行为。
 
-server actor 为 `tokenspeed serve` 设置这两个变量。`tokenspeed-kernel` 仍是同一 commit 的 nightly `0.1.3.post20260930`。
+本次运行时 server actor 为 `tokenspeed serve` 设置这两个变量。`tokenspeed-kernel` 仍是同一 commit 的 nightly `0.1.3.post20260930`。
 
 复现方式：`TRAINER=one_step_off PLATFORM=gpu-h100-sxm scripts/gpu/submit_nebius.sh`（commit `54f1aac`，8×H100，job `rl-trace-fork-20261008-231050-54f1aac`）。
 

@@ -147,7 +147,7 @@ VERL 插件注册 `rollout.name=tokenspeed`，包括 `TokenSpeedReplica` 和 `To
   - driver 把正在 profile 的 step 传给 `start_profile`。
   - 每个 replica 请求 `{"activities": ["VIZTRACER", "PROTON"], "output_dir": "<RL_TRACE_OUTPUT_DIR>/rollout/replica<r>/<run_id>-step-<n>"}`。`tokenspeed serve` 不使用 `profile_id`，文件名是时间戳，因此由目录标识这一次 profile。
   - Proton 只有在 graph capture 时 session 已激活，才能把 graph 回放的 kernel 归到对应节点。`tokenspeed serve` 启动时 capture，却在每次 `/start_profile` 新建 session。因此 server actor 设置 `TOKENSPEED_PROTON_SESSION_DIR`，我们的 TokenSpeed fork 会在 capture 之前为每个 scheduler 建立一个常驻 session：`/start_profile` 让它进入新的 data phase 并激活；`/stop_profile` 结束该 phase，由 periodic flushing 写出，再改名为 TokenSpeed 原本的文件名。eager 模式走同一条路径。
-  - server actor 还设置 `TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND=1`：`/stop_profile` 停止记录后立即返回，各 scheduler 在后台线程写文件；下一次 `/start_profile` 会先等上一次写完。
+  - fork 中 `/stop_profile` 停止记录后立即返回，各 scheduler 在后台线程写文件；下一次 `/start_profile` 会先等上一次写完。
   - server actor 在后台等每个 rank 的文件写完整，再连同 `rank_tag` 登记到自己的进程记录。
 
 TokenSpeed 在 VizTracer 中为每个 Python scope 写 flow 起点，在 Proton 的 CPU scope 上写 `scope_id`。merger 在同一 rank 的文件对内把两者连接起来，并负责多 rank 的时间对齐和 PID/flow-ID 隔离。

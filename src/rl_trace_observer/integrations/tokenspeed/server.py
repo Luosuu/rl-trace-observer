@@ -48,14 +48,12 @@ TOKENSPEED_ENV_DEFAULTS = {
     # Proton writes a mergeable timeline only as a Chrome trace of trace-mode data.
     "TOKENSPEED_KERNEL_PROFILE_DATA": "trace",
     "TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT": "chrome_trace",
-    # /stop_profile only stops recording; the scheduler writes the files on threads.
-    "TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND": "1",
 }
 # Each scheduler keeps one Proton session from before its CUDA-graph captures.
 PROTON_SESSION_ENV = "TOKENSPEED_PROTON_SESSION_DIR"
 _ACTIVITY_KINDS = {"VIZTRACER": TOKENSPEED_VIZTRACER, "PROTON": TOKENSPEED_PROTON}
-# TokenSpeed's ranks write their files after /stop_profile returns
-# (TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND); registration waits for them in the background.
+# Our TokenSpeed fork's ranks write their files after /stop_profile returns;
+# registration waits for them in the background.
 ARTIFACT_WAIT_SECONDS = 1800.0
 
 
