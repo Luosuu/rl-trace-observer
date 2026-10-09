@@ -125,7 +125,7 @@ def register_rl_insight_client(register: Callable[[str, Callable], None] | None 
         if not _supports_backend_env():
             raise RuntimeError(
                 f"The installed RL-Insight does not support {RL_INSIGHT_BACKEND_ENV}; install the "
-                "pinned fork with `uv sync`"
+                "locked version (RL-Insight main) with `uv sync`"
             )
         register = register_monitor_client
 

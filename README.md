@@ -22,17 +22,23 @@ actor-side VizTracer call stacks are needed.
 
 The project is managed with [uv](https://docs.astral.sh/uv/) on Python 3.12.
 `uv.lock` pins every dependency: VERL (>= 0.9.1), VizTracer, and RL-Insight
-from the
-[Luosuu/rl-insight](https://github.com/Luosuu/rl-insight/tree/tianle/server-backend-env)
-fork that adds `RL_INSIGHT_SERVER_BACKEND` until it lands upstream. TokenSpeed
-is the only extra.
+from [verl-project/rl-insight](https://github.com/verl-project/rl-insight)
+`main`, the first version with `RL_INSIGHT_SERVER_BACKEND` (no release has it
+yet). TokenSpeed
+is the only extra (Linux only). It is pinned to a nightly build of
+[lightseekorg/tokenspeed](https://github.com/lightseekorg/tokenspeed) `main`
+(`0.1.0.post20260930`, from `https://lightseek.org/whl/nightly`), because the
+0.1.0 release does not link VizTracer scopes to Proton. A git checkout of `main`
+does not work on its own: each nightly needs the `tokenspeed-kernel` nightly of
+the same date, and that kernel requires `torch==2.14.0`, so the extra moves the
+environment to torch 2.14.
 
 ```bash
 uv sync --extra tokenspeed
 uv run pytest -q
 ```
 
-`pytest` and `ruff` come from the default `dev` group. tokenspeed 0.1.0 pins
+`pytest` and `ruff` come from the default `dev` group. tokenspeed pins
 `transformers==5.12.0` while verl 0.9.1 declares `transformers<5.11`; uv
 overrides the latter so both install together.
 
@@ -84,7 +90,7 @@ ray job submit --runtime-env ray_runtime_env.yaml -- \
 worker. VERL workers initialize RL-Insight lazily without the trainer config, so
 the plugin selects its backend through `RL_INSIGHT_SERVER_BACKEND`, which it
 defaults to `rl_trace_observer` in each process; an explicitly set value wins.
-This requires the pinned RL-Insight fork; the plugin raises an error on an
+This requires RL-Insight `main` (see Setup); the plugin raises an error on an
 RL-Insight without `RL_INSIGHT_SERVER_BACKEND`.
 
 Each process incrementally writes:
@@ -113,6 +119,8 @@ Inputs are files or directories, searched recursively for:
 | `rl-insight-<host>-pid-<pid>.chrome.jsonl` | the RL-Insight backend above | epoch µs `ts` |
 | `<role>_..._rank<r>_pid<pid>_<timestamp>.json[.gz]` | VERL `global_profiler.tool=torch` | `baseTimeNanoseconds` |
 | `step-<s>-role-<r>-rank-<n>-pid-<pid>.viztracer.json` | the optional actor VizTracer | `viztracer_metadata.baseTimeNanoseconds` |
+| `<profile_id>-<rank_tag>[-<stage>].viztracer.json` | a TokenSpeed scheduler rank (`/start_profile` `VIZTRACER`) | `viztracer_metadata.baseTimeNanoseconds` |
+| `<profile_id>-<rank_tag>[-<stage>].proton.chrome_trace` | a TokenSpeed scheduler rank (`PROTON`) | `baseTimeNanoseconds` |
 | `rl-trace-process-<host>-pid-<pid>.json` | each tracing process (process record) | clock snapshot only |
 
 Every process that writes an artifact also writes a process record with its
@@ -120,7 +128,10 @@ hostname, pid, run id, role, Ray job/node/actor identity, `torch.distributed`
 rank, the versions of the profilers and frameworks it loaded, a wall/monotonic
 clock snapshot and the files it registered, each with its step and role.
 RL-Insight and VizTracer register their files when they create them; VERL's
-Torch traces are registered when VERL exports them. The merger links an artifact
+Torch traces are registered when VERL exports them. TokenSpeed's scheduler
+processes do not load this package; the rollout server actor that stopped the
+profile registers their files with the scheduler's `rank_tag` (`TP0`,
+`DP0-CP0-TP0`, …). The merger links an artifact
 only through the record that registered it, and never infers ownership from a
 filename, pid or rank; an artifact nobody registered (e.g. from a run without
 this package) is reported as `unlinked` and merged as a process of its own.
@@ -149,9 +160,18 @@ Every source is placed on one timeline starting at the earliest event. All
 sources of one OS process share one Perfetto process named
 `<hostname> pid <pid> · <Ray actor name>`, with thread names prefixed by their
 source (`RL-Insight · rank_0`, `Torch · thread …`, `VizTracer · …`). Other pids
-in a source, such as Kineto GPU devices, get their own process. Threads get
-trace-wide unique tids and flow ids are renumbered per source, so identical OS
-pids, tids or Kineto flow ids on different nodes never collide.
+in a source, such as Kineto GPU devices, get their own process. Each TokenSpeed
+scheduler rank is one process, `<server actor process> · <rank_tag>`, holding
+its `VizTracer · …` and `Proton · CPU Thread …`/`Proton · GPU Stream …`
+threads. Threads get trace-wide unique tids and flow ids are renumbered per
+source, so identical OS pids, tids or Kineto flow ids on different nodes never
+collide. The one link across files is TokenSpeed's own: the flow its VizTracer
+report starts at a Python scope ends on the Proton CPU scope with that
+`scope_id`, as in `tokenspeed merge-traces`, and only within one rank's
+profile. Proton writes a timeline only with
+`TOKENSPEED_KERNEL_PROFILE_DATA=trace` and
+`TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace`; its default tree output
+cannot be merged and is not picked up.
 
 Next to the trace, `rl-trace-merge` writes the session manifest
 (`<output>.manifest.json`, or `--manifest PATH`): every process, every artifact

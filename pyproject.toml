@@ -16,7 +16,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-tokenspeed = ["tokenspeed"]
+# Kernel wheels exist only for Linux. post20261001 imports kernel functions its
+# same-date kernel nightly lacks.
+tokenspeed = ["tokenspeed==0.1.0.post20260930; sys_platform == 'linux'"]
 
 [dependency-groups]
 dev = ["perfetto", "pytest>=8", "pyyaml", "ruff>=0.12"]
@@ -28,12 +30,20 @@ rl-trace-merge = "rl_trace_observer.merger.cli:main"
 rl-trace-observer = "rl_trace_observer.integrations.verl.register"
 
 [tool.uv.sources]
-# Fork adding RL_INSIGHT_SERVER_BACKEND (branch tianle/server-backend-env),
-# required until it lands upstream.
-rl-insight = { git = "https://github.com/Luosuu/rl-insight", rev = "72763beecf2c9652ad182ba83ce9104417a70d1e" }
+# RL_INSIGHT_SERVER_BACKEND is on main (verl-project/rl-insight#190) but in no
+# release yet; uv.lock pins the commit.
+rl-insight = { git = "https://github.com/verl-project/rl-insight", branch = "main" }
+
+# TokenSpeed nightly builds of main: its VizTracer reports carry the scope-entry
+# flows that link Python slices to Proton CPU scopes, which the 0.1.0 release
+# lacks. Each nightly needs the tokenspeed-kernel nightly of the same date, which
+# needs further tokenspeed-* nightlies; the index holds only tokenspeed packages.
+[[tool.uv.index]]
+name = "tokenspeed-nightly"
+url = "https://lightseek.org/whl/nightly"
 
 [tool.uv]
-# tokenspeed 0.1.0 pins transformers==5.12.0 while verl 0.9.1 declares
+# tokenspeed pins transformers==5.12.0 while verl 0.9.1 declares
 # transformers<5.11. Both must share one environment, so force tokenspeed's pin.
 override-dependencies = ["transformers==5.12.0"]
 

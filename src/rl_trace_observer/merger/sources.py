@@ -7,7 +7,10 @@ placed on one timeline without losing precision:
 * RL-Insight JSONL written by this package: ``ts`` is epoch µs.
 * Torch Profiler (Kineto) Chrome traces: ``ts`` is relative to the top-level
   ``baseTimeNanoseconds``.
-* VizTracer reports: ``ts`` is relative to ``viztracer_metadata.baseTimeNanoseconds``.
+* VizTracer reports, ours and TokenSpeed's: ``ts`` is relative to
+  ``viztracer_metadata.baseTimeNanoseconds``.
+* TokenSpeed Proton Chrome traces: ``ts`` is relative to the top-level
+  ``baseTimeNanoseconds``.
 """
 
 import gzip
@@ -24,6 +27,8 @@ logger = logging.getLogger(__name__)
 RL_INSIGHT = "rl_insight"
 TORCH = "torch"
 VIZTRACER = "viztracer"
+TOKENSPEED_VIZTRACER = "tokenspeed_viztracer"
+TOKENSPEED_PROTON = "tokenspeed_proton"
 PROCESS_RECORD = "process_record"
 
 # rl-trace-process-<host>-pid-<pid>.json, written by process_record.register_artifact.
@@ -38,6 +43,12 @@ _TORCH_FILE = re.compile(
 _VIZTRACER_FILE = re.compile(
     r"^step-(?P<step>.+)-role-(?P<role>.+)-rank-(?P<rank>\d+)-pid-(?P<pid>\d+)\.viztracer\.json$"
 )
+# TokenSpeed scheduler profiles, <profile_id>-<rank_tag>[-<stage>].<suffix>, where
+# rank_tag is e.g. TP0 or DP0-CP0-TP0 and stage EXTEND or DECODE. Proton writes a
+# timeline only as chrome_trace; its tree formats (.hatchet, ...) cannot be merged.
+_TOKENSPEED_NAME = r"^(?P<stem>(?P<profile_id>.+)-(?P<rank_tag>(?:DP\d+-)?(?:CP\d+-)?TP\d+)(?:-(?P<stage>[A-Z_]+))?)"
+_TOKENSPEED_VIZTRACER_FILE = re.compile(_TOKENSPEED_NAME + r"\.viztracer\.json$")
+_TOKENSPEED_PROTON_FILE = re.compile(_TOKENSPEED_NAME + r"\.proton\.chrome_trace$")
 
 # Kineto's own bookkeeping pseudo-processes: the profiling window ("Spans"),
 # iteration markers ("Traces") and window-end instants (empty pid). GPU devices
@@ -68,6 +79,10 @@ class TraceSource:
     # Registered by the writing process; RL-Insight sources span steps.
     global_step: int | None = None
     role: str | None = None
+    # TokenSpeed scheduler rank, e.g. "TP0", and the file name shared by the
+    # VizTracer report and Proton trace that rank wrote in one profile.
+    rank_tag: str | None = None
+    pair: str | None = None
 
 
 def classify(path: Path) -> str | None:
@@ -79,6 +94,10 @@ def classify(path: Path) -> str | None:
         return RL_INSIGHT
     if _VIZTRACER_FILE.match(name):
         return VIZTRACER
+    if _TOKENSPEED_VIZTRACER_FILE.match(name):
+        return TOKENSPEED_VIZTRACER
+    if _TOKENSPEED_PROTON_FILE.match(name):
+        return TOKENSPEED_PROTON
     if _TORCH_FILE.match(name):
         return TORCH
     return None
@@ -107,6 +126,8 @@ def read_source(kind: str, path: Path) -> TraceSource:
         return read_torch_trace(path)
     if kind == VIZTRACER:
         return read_viztracer_trace(path)
+    if kind in (TOKENSPEED_VIZTRACER, TOKENSPEED_PROTON):
+        return read_tokenspeed_trace(kind, path)
     raise ValueError(f"Not a trace source kind: {kind}")
 
 
@@ -199,4 +220,38 @@ def read_viztracer_trace(path: Path) -> TraceSource:
         events=list(data.get("traceEvents", [])),
         os_pid=pid,
         labels={"step": step, "role": role},
+    )
+
+
+def read_tokenspeed_trace(kind: str, path: Path) -> TraceSource:
+    """Read a TokenSpeed scheduler's VizTracer report or Proton Chrome trace."""
+    pattern = _TOKENSPEED_VIZTRACER_FILE if kind == TOKENSPEED_VIZTRACER else _TOKENSPEED_PROTON_FILE
+    match = pattern.match(path.name)
+    if match is None:
+        raise ValueError(f"Not a TokenSpeed {kind} artifact: {path}")
+
+    data = _load_json(path)
+    if kind == TOKENSPEED_VIZTRACER:
+        anchor = _anchor(
+            data.get("viztracer_metadata", {}).get("baseTimeNanoseconds"),
+            path,
+            "viztracer_metadata.baseTimeNanoseconds",
+        )
+        label = "VizTracer"
+    else:
+        anchor = _anchor(data.get("baseTimeNanoseconds"), path, "baseTimeNanoseconds")
+        label = "Proton"
+    stage = f" {match['stage']}" if match["stage"] else ""
+    return TraceSource(
+        kind=kind,
+        path=path,
+        title=f"TokenSpeed {label} {match['profile_id']} {match['rank_tag']}{stage}",
+        base_ns=anchor,
+        events=list(data.get("traceEvents", [])),
+        # A scheduler process, not one that writes process records; Proton
+        # records everything under a synthetic pid 0.
+        os_pid=-1,
+        labels={key: value for key in ("profile_id", "stage") if (value := match[key])},
+        rank_tag=match["rank_tag"],
+        pair=str(path.parent / match["stem"]),
     )
