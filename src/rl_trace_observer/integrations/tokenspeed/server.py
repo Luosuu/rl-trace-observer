@@ -34,7 +34,12 @@ from typing import Any
 import aiohttp
 import ray
 
-from rl_trace_observer.context import current_run_id, profile_session_id
+from rl_trace_observer.context import (
+    REQUEST_FLOW_ATTRIBUTE,
+    REQUEST_ID_ATTRIBUTE,
+    current_run_id,
+    profile_session_id,
+)
 from rl_trace_observer.merger.sources import TOKENSPEED_PROTON, TOKENSPEED_VIZTRACER, tokenspeed_profile_file
 
 logger = logging.getLogger(__name__)
@@ -333,7 +338,9 @@ class TokenSpeedServer:
         self._busy_slots.add(slot)
         try:
             lane = f"replica_{self.replica_rank}/slot_{slot}"
-            with RLInsightLogger.trace_state("tokenspeed_generate", state_lane_id=lane, request_id=request_id):
+            # A point on the request's path, after the agent loop's span for it (see verl.requests).
+            labels = {REQUEST_ID_ATTRIBUTE: request_id, REQUEST_FLOW_ATTRIBUTE: True}
+            with RLInsightLogger.trace_state("tokenspeed_generate", state_lane_id=lane, **labels):
                 output = await self._post("/generate", body)
         finally:
             self._busy_slots.discard(slot)

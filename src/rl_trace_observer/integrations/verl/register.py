@@ -1,9 +1,10 @@
 import os
 
 from rl_trace_observer.integrations.rl_insight import register_rl_insight_client
-from rl_trace_observer.integrations.verl import rollout, steps, torch_traces
+from rl_trace_observer.integrations.verl import requests, rollout, steps, torch_traces
 
 register_rl_insight_client()
+requests.install()
 rollout.install()
 steps.install()
 torch_traces.install()

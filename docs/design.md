@@ -384,10 +384,12 @@ manifest
 
 ### P6：Request-level correlation
 
-- [ ] 生成并传播 request trace ID；
-- [ ] 在 actor/RPC 发送侧写 flow start；
-- [ ] 在 rollout 接收侧写 flow finish；
-- [ ] 将 request ID 加入 RL-Insight labels；
+- [x] request ID：复用 server 收到的 `rid`（VERL 每次调用生成的 uuid），GPU 上确认 TokenSpeed 从 HTTP 到 scheduler 都使用它（P6-0）；agent loop 的 sticky ID 记为 `trajectory_id`；
+- [x] 发送侧：patch `LLMServerClient.generate`，每次调用记录一个 `rollout_request` span（P6-a）；
+- [x] 接收侧：server actor 的 `tokenspeed_generate` span 带同一个 `request_id`；merger 把带 `rl_trace_observer.request_flow` 标记的 span 按 request ID、按时间连成一条跨进程 flow，flow ID 自成命名空间（P6-a）；
+- [x] 将 request ID 加入 RL-Insight labels；
+- [ ] TokenSpeed scheduler 迭代记录 request ID，flow 延伸到 prefill / 最后一次迭代（P6-b）；
+- [ ] 请求的权重版本与消费它的训练 step（P6-d）；
 - [ ] 验证 flow 可继续连接 TokenSpeed Proton kernel。
 
 完成标准：可以从一个 actor rollout 请求跟踪到目标 replica 和相关 kernel。

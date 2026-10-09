@@ -261,6 +261,26 @@ each replaced atomically, and neither may be one of the inputs.
 Timestamps are each host's wall clock, so cross-node ordering is only as good
 as the nodes' clock synchronization (NTP/PTP).
 
+### Request flows
+
+The merged trace links each rollout request across the processes on its path
+with one flow (category `rl_trace_observer.request`), so selecting a request in
+Perfetto shows where it went:
+
+- VERL's agent loop sends a request with `LLMServerClient.generate`; the
+  plugin records one `rollout_request` span per call on the agent loop
+  worker's `agent_loop/slot_<k>` lanes, with `request_id` (the id the server
+  is sent, a fresh one per call), `trajectory_id` (the agent loop's id, shared
+  by the turns of one trajectory) and `server_id`;
+- the TokenSpeed server actor's `tokenspeed_generate` span carries the same
+  `request_id`, which TokenSpeed keeps from HTTP to its scheduler.
+
+Any RL-Insight span with the attributes `request_id` and
+`rl_trace_observer.request_flow=True` is a point on its request's path; the
+merger links a request's points in time order and gives these flows ids of
+their own, apart from every file's flow ids. A request with a single point
+gets no flow.
+
 ## Preserve the normal RL-Insight backend
 
 Set the following to make the custom client forward all events to the existing

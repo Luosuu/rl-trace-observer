@@ -95,3 +95,24 @@ def test_ppo_with_tokenspeed_rollout_on_cpu(tmp_path, load_in_perfetto):
         "select count(*) as n from flow f join slice s on f.slice_out = s.id where s.name = 'forward'"
     ).as_pandas_dataframe()
     assert flows.n[0] == WORLD_SIZE
+
+    # Every request of the step is one flow from the agent loop's call to the server that handled it.
+    requests = processor.query(
+        """
+        select extract_arg(o.arg_set_id, 'args.request_id') as caller,
+               extract_arg(i.arg_set_id, 'args.request_id') as server,
+               po.name as caller_process, pi.name as server_process
+        from flow f
+        join slice o on f.slice_out = o.id join thread_track tto on o.track_id = tto.id
+        join thread tho on tho.utid = tto.utid join process po on po.upid = tho.upid
+        join slice i on f.slice_in = i.id join thread_track tti on i.track_id = tti.id
+        join thread thi on thi.utid = tti.utid join process pi on pi.upid = thi.upid
+        where o.name = 'rollout_request' and i.name = 'tokenspeed_generate'
+        """
+    ).as_pandas_dataframe()
+    generates_in_step = processor.query(
+        "select count(*) as n from slice where name = 'tokenspeed_generate'"
+    ).as_pandas_dataframe()
+    assert len(requests) == generates_in_step.n[0] == TRAIN_BATCH_SIZE * ROLLOUT_N
+    assert (requests.caller == requests.server).all() and requests.caller.nunique() == len(requests)
+    assert (requests.caller_process != requests.server_process).all()
