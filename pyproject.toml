@@ -10,7 +10,8 @@ requires-python = "==3.12.*"
 dependencies = [
     # 0.9 adds verl.plugins entry point discovery and the RL-Insight hooks used here.
     # verl-core holds what running verl.trainer.main_ppo needs (TransferQueue, ...).
-    "verl[verl-core]>=0.9.1",
+    # Exact: the plugin patches private trainer and profiler methods of this release.
+    "verl[verl-core]==0.9.1",
     "rl-insight",
     "viztracer>=0.16",
 ]

@@ -53,15 +53,21 @@ TOKENSPEED_ENV_DEFAULTS = {
 PROTON_SESSION_ENV = "TOKENSPEED_PROTON_SESSION_DIR"
 _ACTIVITY_KINDS = {"VIZTRACER": TOKENSPEED_VIZTRACER, "PROTON": TOKENSPEED_PROTON}
 # Our TokenSpeed fork's ranks write their files after /stop_profile returns;
-# registration waits for them in the background.
-ARTIFACT_WAIT_SECONDS = 1800.0
+# registration waits for them in the background. It gives up once no file has
+# appeared or grown for this long (seconds).
+STALL_TIMEOUT_ENV = "RL_TRACE_TOKENSPEED_PROFILE_STALL_TIMEOUT"
+# A file the fork failed to write leaves this marker next to it instead.
+FAILED_SUFFIX = ".failed"
 
 
 SERVER_NAME_PREFIX = "tokenspeed_server_"
+# What a replica serves: the policy's rollout, or a frozen reward or teacher model.
+ROLLOUT, REWARD, TEACHER = "rollout", "reward", "teacher"
 
 
-def server_name(replica_rank: int, name_suffix: str = "") -> str:
-    return f"{SERVER_NAME_PREFIX}{replica_rank}{name_suffix}"
+def server_name(replica_rank: int, role: str = ROLLOUT, name_suffix: str = "") -> str:
+    """The Ray actor name of a replica's server; weights are only ever sent to ``ROLLOUT`` servers."""
+    return f"{SERVER_NAME_PREFIX}{role}_{replica_rank}{name_suffix}"
 
 
 def _free_port() -> int:
@@ -81,14 +87,24 @@ def _die_with_parent() -> None:
         ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
 
 
-def _complete_files(output_dir: Path, kinds: set[str], sizes: dict[Path, int]) -> dict[Path, tuple[str, str, str]]:
-    """Profile files of ``kinds`` that hold a whole JSON object and stopped growing since ``sizes``.
+def _complete_files(
+    output_dir: Path, kinds: set[str], sizes: dict[Path, int]
+) -> tuple[dict[Path, tuple[str, str, str]], list[Path]]:
+    """Profile files of ``kinds`` that are complete, and the outputs the server failed to write.
 
-    Cheap enough for files of hundreds of MB: it reads the last bytes only.
-    ``sizes`` is updated for the next call.
+    The fork renames VizTracer and Proton files into place once written; a
+    file still counts as complete only if it holds a whole JSON object and
+    stopped growing since ``sizes``, for writers that write in place. Cheap
+    enough for files of hundreds of MB: it reads the last bytes only. ``sizes``
+    is updated for the next call.
     """
-    files = {}
+    files, failed = {}, []
     for path in sorted(output_dir.iterdir()) if output_dir.is_dir() else []:
+        if path.name.endswith(FAILED_SUFFIX):
+            parsed = tokenspeed_profile_file(path.with_name(path.name.removesuffix(FAILED_SUFFIX)))
+            if parsed and parsed[0] in kinds:
+                failed.append(path)
+            continue
         parsed = tokenspeed_profile_file(path)
         if not parsed or parsed[0] not in kinds:
             continue
@@ -102,7 +118,7 @@ def _complete_files(output_dir: Path, kinds: set[str], sizes: dict[Path, int]) -
         if size > 0 and ends_object and sizes.get(path) == size:
             files[path] = parsed
         sizes[path] = size
-    return files
+    return files, failed
 
 
 class TokenSpeedServer:
@@ -115,6 +131,8 @@ class TokenSpeedServer:
         replica_rank: int,
         cuda_visible_devices: str,
         free_cache_engine: bool,
+        role: str,
+        name_suffix: str,
     ):
         from verl.utils.config import omega_conf_to_dataclass
         from verl.workers.config import HFModelConfig
@@ -122,6 +140,8 @@ class TokenSpeedServer:
         self.config = omega_conf_to_dataclass(config)
         self.model_config = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
         self.replica_rank = replica_rank
+        # Where this replica's profiles go and the role its artifacts are registered under.
+        self.output_component = ROLLOUT if role == ROLLOUT and not name_suffix else f"{role}{name_suffix}"
         self.cuda_visible_devices = cuda_visible_devices
         self.free_cache_engine = free_cache_engine
         self.world_size = (
@@ -179,7 +199,7 @@ class TokenSpeedServer:
             from rl_trace_observer.output import trace_output_dir
 
             try:
-                session_dir = trace_output_dir() / "rollout" / f"replica{self.replica_rank}" / "proton-session"
+                session_dir = self._replica_dir(trace_output_dir()) / "proton-session"
             except ValueError as error:
                 logger.warning("TokenSpeed Proton profiles need --enforce-eager: %s", error)
             else:
@@ -196,21 +216,17 @@ class TokenSpeedServer:
             connector=aiohttp.TCPConnector(force_close=True),
         )
 
-        deadline = time.monotonic() + float(os.environ.get(STARTUP_TIMEOUT_ENV, "1800"))
-        while True:
-            if self._process.poll() is not None:
-                raise RuntimeError(f"tokenspeed serve exited with {self._process.returncode} before becoming ready")
-            try:
-                async with self._session.get(self._url("/health"), timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    if resp.status == 200:
-                        break
-            except (TimeoutError, aiohttp.ClientError):
-                pass
-            if time.monotonic() > deadline:
-                raise TimeoutError(f"tokenspeed serve not ready on {self._url('/health')}")
-            await asyncio.sleep(2)
+        try:
+            await self._wait_until_ready(float(os.environ.get(STARTUP_TIMEOUT_ENV, "1800")))
+        except BaseException:
+            # Ray keeps the actor alive after a failed call, so the server would keep its GPUs.
+            await self._stop_process()
+            raise
         logger.info("Replica %d: TokenSpeed ready at %s", self.replica_rank, self._url(""))
         self._set_process_role()
+
+    def _replica_dir(self, root: Path) -> Path:
+        return root / self.output_component / f"replica{self.replica_rank}"
 
     def _set_process_role(self) -> None:
         try:
@@ -220,6 +236,33 @@ class TokenSpeedServer:
             set_process_role(trace_output_dir(), "rollout_server")
         except Exception:
             logger.debug("No process record for the TokenSpeed server actor", exc_info=True)
+
+    async def _wait_until_ready(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._process.poll() is not None:
+                raise RuntimeError(f"tokenspeed serve exited with {self._process.returncode} before becoming ready")
+            try:
+                async with self._session.get(self._url("/health"), timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        return
+            except (TimeoutError, aiohttp.ClientError):
+                pass
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"tokenspeed serve not ready on {self._url('/health')}")
+            await asyncio.sleep(2)
+
+    async def _stop_process(self) -> None:
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+        if self._process is None or self._process.poll() is not None:
+            return
+        self._process.terminate()
+        try:
+            await asyncio.to_thread(self._process.wait, 30)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
 
     def shutdown(self) -> None:
         if self._process is not None and self._process.poll() is None:
@@ -386,15 +429,23 @@ class TokenSpeedServer:
         try:
             from rl_trace_observer.output import safe_component, trace_output_dir
 
-            output_dir = trace_output_dir() / "rollout" / f"replica{self.replica_rank}" / safe_component(profile_id)
+            output_dir = self._replica_dir(trace_output_dir()) / safe_component(profile_id)
         except ValueError as error:
             logger.warning("Not profiling TokenSpeed: %s", error)
             return
+        # TokenSpeed starts a profile only once the previous one is written; wait
+        # here, where it is visible, rather than inside /start_profile.
+        await asyncio.gather(*self._registrations)
         body = {"output_dir": str(output_dir), "activities": activities, "profile_id": profile_id}
         try:
             await self._post("/start_profile", body, timeout=300)
         except Exception as error:
-            logger.warning("TokenSpeed /start_profile %s was rejected; continuing without it: %s", body, error)
+            logger.warning("TokenSpeed /start_profile %s failed; continuing without it: %s", body, error)
+            # A start that timed out may still begin later; stop it, or every later start is rejected.
+            try:
+                await self._post("/stop_profile", timeout=600)
+            except Exception:
+                pass
             return
         self._profile = (profile_id, global_step, output_dir)
 
@@ -434,16 +485,30 @@ class TokenSpeedServer:
 
         kinds = {_ACTIVITY_KINDS[a] for a in self._activities() if a in _ACTIVITY_KINDS}
         expected = len(kinds) * self.world_size
-        deadline = time.monotonic() + ARTIFACT_WAIT_SECONDS
+        stall_timeout = float(os.environ.get(STALL_TIMEOUT_ENV, "300"))
         sizes: dict[Path, int] = {}
+        progress, last_progress = None, time.monotonic()
         while True:
+            exited = self._process is not None and self._process.poll() is not None
             # Off the event loop, which keeps serving generation requests.
-            files = await asyncio.to_thread(_complete_files, output_dir, kinds, sizes)
-            if len(files) >= expected or time.monotonic() > deadline:
+            files, failed = await asyncio.to_thread(_complete_files, output_dir, kinds, sizes)
+            if len(files) + len(failed) >= expected or exited:
+                break
+            if (state := (len(files), dict(sizes))) != progress:
+                progress, last_progress = state, time.monotonic()
+            elif time.monotonic() - last_progress > stall_timeout:
                 break
             await asyncio.sleep(1.0)
+        if failed:
+            logger.warning("TokenSpeed profile %s: the server failed to write %s", profile_id, [p.name for p in failed])
         if len(files) < expected:
-            logger.warning("TokenSpeed profile %s: found %d of %d files", profile_id, len(files), expected)
+            logger.warning(
+                "TokenSpeed profile %s: found %d of %d files%s",
+                profile_id,
+                len(files),
+                expected,
+                " (the server exited)" if exited else "",
+            )
         root = trace_output_dir()
         for path, (kind, _, rank_tag) in files.items():
             register_artifact(
@@ -451,6 +516,6 @@ class TokenSpeedServer:
                 kind,
                 path,
                 global_step=global_step,
-                role=f"rollout_replica{self.replica_rank}",
+                role=f"{self.output_component}_replica{self.replica_rank}",
                 rank_tag=rank_tag,
             )

@@ -137,3 +137,67 @@ def test_fit_waits_for_profiles_written_in_the_background(trainer_module, spans,
 
     assert trainer.fit(None) == "trained"
     assert waited == [trainer]
+
+
+def test_a_missing_verl_method_fails_clearly():
+    module = types.ModuleType("fake_trainer_base_old")
+    module.PPOTrainer = type("PPOTrainer", (), {"step": lambda self: None, "fit": lambda self: None})
+
+    with pytest.raises(RuntimeError, match="supports verl 0.9.1.*_start_rollout_profiling"):
+        steps.patch_trainer(module)
+
+
+def test_one_step_off_starts_a_profile_only_after_the_previous_stop(spans, monkeypatch):
+    import asyncio
+
+    import ray
+
+    gets = []
+    monkeypatch.setattr(ray, "get", lambda refs: gets.append(list(refs)))
+
+    class Remote:
+        def __init__(self, name):
+            self.name = name
+
+        def remote(self, **kwargs):
+            return (self.name, kwargs.get("global_step"))
+
+    server = types.SimpleNamespace(start_profile=Remote("start"), stop_profile=Remote("stop"))
+
+    class Trainer:
+        global_steps = 2
+
+        def __init__(self):
+            self.config = types.SimpleNamespace(
+                actor_rollout_ref=types.SimpleNamespace(rollout=types.SimpleNamespace(name="tokenspeed")),
+                global_profiler={"steps": [2, 3]},
+            )
+            self.llm_server_manager = types.SimpleNamespace(
+                get_replicas=lambda: [types.SimpleNamespace(servers=[server])]
+            )
+
+        async def fit(self):
+            pass
+
+        async def fit_step(self):
+            task = asyncio.create_task(self._async_gen_next_batch())
+            await asyncio.sleep(0)
+            await task
+            self.global_steps += 1
+
+        async def _async_gen_next_batch(self):
+            return "batch"
+
+    module = types.ModuleType("fake_one_step_off")
+    module.OneStepOffRayTrainer = Trainer
+    assert steps.patch_one_step_off_trainer(module)
+    trainer = Trainer()
+
+    async def two_steps():
+        await trainer.fit_step()
+        await trainer.fit_step()
+
+    asyncio.run(two_steps())
+
+    # Step 3's start waits for step 2's stop, which was not awaited.
+    assert gets == [[], [("start", 2)], [("stop", None)], [("start", 3)]]

@@ -8,7 +8,7 @@ replicas, for VERL's asynchronous trainers.
 
 from types import ModuleType
 
-from rl_trace_observer.integrations.verl.import_hook import when_imported
+from rl_trace_observer.integrations.verl.import_hook import require, when_imported
 
 REPLICA_MODULE = "verl.workers.rollout.replica"
 CHECKPOINT_ENGINE_MODULE = "verl.checkpoint_engine.base"
@@ -25,6 +25,8 @@ def _load_replica():
 def register_rollout(module: ModuleType) -> None:
     from verl.workers.rollout import base
 
+    require(base, "_ROLLOUT_REGISTRY")
+    require(module, "RolloutReplicaRegistry")
     base._ROLLOUT_REGISTRY.setdefault((ROLLOUT_NAME, "async"), ADAPTER)
     module.RolloutReplicaRegistry.register(ROLLOUT_NAME, _load_replica)
 
@@ -45,6 +47,8 @@ class _TokenSpeedCheckpointEngine:
 
 
 def register_checkpoint_engine(module: ModuleType) -> None:
+    require(module, "CheckpointEngineRegistry")
+    require(module.CheckpointEngineRegistry, "_registry")
     module.CheckpointEngineRegistry._registry.setdefault(ROLLOUT_NAME, _TokenSpeedCheckpointEngine)
 
 

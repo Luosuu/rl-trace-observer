@@ -21,7 +21,8 @@ actor-side VizTracer call stacks are needed.
 ## Setup
 
 The project is managed with [uv](https://docs.astral.sh/uv/) on Python 3.12.
-`uv.lock` pins every dependency: VERL (>= 0.9.1), VizTracer, and RL-Insight
+`uv.lock` pins every dependency: VERL (exactly 0.9.1, whose private trainer and profiler methods the plugin
+patches; it fails at import with a clear error on another release), VizTracer, and RL-Insight
 from [verl-project/rl-insight](https://github.com/verl-project/rl-insight)
 `main`, the first version with `RL_INSIGHT_SERVER_BACKEND` (no release has it
 yet). TokenSpeed is the only extra (Linux only). It comes from our fork,
@@ -117,7 +118,8 @@ in VERL or TokenSpeed is modified:
   on GPUs of their own, and step `n` trains while they generate the batch of step `n + 1`. Standalone replicas need
   `actor_rollout_ref.rollout.checkpoint_engine.backend=tokenspeed`: VERL's other backends hand weights to the server
   over CUDA IPC, which TokenSpeed lacks, so this one has training rank 0 broadcast every bucket once to all TokenSpeed
-  ranks over TokenSpeed's weight-sync API. VERL does not profile that trainer's rollout; the plugin profiles the
+  ranks over TokenSpeed's weight-sync API. Hybrid replicas reject this backend at startup, since VERL's synchronous
+  trainer never runs it. VERL does not profile that trainer's rollout; the plugin profiles the
   generation that runs during a profiled step, so the step's trace shows it beside the actor update. Its config
   extends `ppo_trainer` through a path relative to a VERL checkout, so outside one add
   `'hydra.searchpath=[pkg://verl.trainer.config]'`.
@@ -145,8 +147,12 @@ in VERL or TokenSpeed is modified:
   Proton's periodic flushing write that phase to the file TokenSpeed would have written. Replayed kernels then appear
   under a `<captured_at>` frame with the name they were captured with. The same path serves eager servers.
 - In our TokenSpeed fork, `/stop_profile` replies once recording stops, and each scheduler writes its files on
-  threads, so a profiled step holds up neither the scheduler nor the trainer. The server actor registers each file once
-  it is complete, and the trainer waits for them before `fit` returns.
+  threads, so a profiled step holds up neither the scheduler nor the trainer. Each file is renamed into place once
+  complete, and a failed write leaves `<file>.failed`. The server actor registers each file once it is complete; it
+  stops waiting when every file is complete or failed, when the server exits, or when no file appears or grows for
+  `RL_TRACE_TOKENSPEED_PROFILE_STALL_TIMEOUT`. The trainer waits for them before `fit` returns.
+- Reward and teacher models served by TokenSpeed get server actors and output directories of their own
+  (`tokenspeed_server_<role>_<replica>`, `<role>/replica<r>`); weights only go to the policy's `rollout` servers.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -155,6 +161,8 @@ in VERL or TokenSpeed is modified:
 | `RL_TRACE_TOKENSPEED_COMMAND` | `python -m tokenspeed.cli serve` | the server command (the CPU test points it at a fake server) |
 | `RL_TRACE_TOKENSPEED_STARTUP_TIMEOUT` | `1800` | seconds to wait for `/health` |
 | `RL_TRACE_TOKENSPEED_SYNC_TIMEOUT` | `600` | seconds before a weight-update group operation times out |
+| `RL_TRACE_TOKENSPEED_PROFILE_STALL_TIMEOUT` | `300` | seconds without a new or growing profile file before registration gives up |
+| `RL_TRACE_PROFILE_WAIT_TIMEOUT` | `1800` | seconds the driver waits for pending profiles when `fit` ends |
 
 `TOKENSPEED_KERNEL_PROFILE_DATA=trace`, `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace` and, with `PROTON`,
 `TOKENSPEED_PROTON_SESSION_DIR` are set for the server unless you set them. `tests/test_cpu_tokenspeed_ppo.py` runs the real `main_ppo` against a fake TokenSpeed

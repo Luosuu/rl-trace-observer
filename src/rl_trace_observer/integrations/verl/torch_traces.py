@@ -13,6 +13,7 @@ finish hook (relocation or the user's command) does so here, and the trainer
 does so for every worker before training ends (see ``steps``).
 """
 
+import copy
 import functools
 import inspect
 import logging
@@ -20,7 +21,7 @@ import threading
 from pathlib import Path
 from types import ModuleType
 
-from rl_trace_observer.integrations.verl.import_hook import when_imported
+from rl_trace_observer.integrations.verl.import_hook import require, when_imported
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,7 @@ def wait_for_exports() -> None:
 
 def patch_torch_profile(module: ModuleType) -> bool:
     """Wrap ``module.get_torch_profiler``; returns ``False`` if already wrapped."""
+    require(module, "get_torch_profiler")
     original = module.get_torch_profiler
     if getattr(original, _PATCHED, False):
         return False
@@ -81,9 +83,17 @@ def patch_torch_profile(module: ModuleType) -> bool:
         export = profiler.export_chrome_trace
 
         def export_chrome_trace(path):
+            if getattr(profiler, "_use_cupti_monitor", False):
+                # torch defers this export itself.
+                export(path)
+                _register(path, step, role or None)
+                return
+            # A scheduled profiler starts its next window right after this call
+            # and replaces `profiler.profiler`; export the window being saved.
+            window = functools.partial(type(profiler).export_chrome_trace, copy.copy(profiler))
             # Not a daemon: a normal interpreter exit still finishes the file.
             thread = threading.Thread(
-                target=_export, args=(export, path, step, role or None), name="rl-trace-torch-export"
+                target=_export, args=(window, path, step, role or None), name="rl-trace-torch-export"
             )
             with _exports_lock:
                 _exports.append(thread)
@@ -99,7 +109,9 @@ def patch_torch_profile(module: ModuleType) -> bool:
 
 def patch_finish_hook(module: ModuleType) -> bool:
     """Make ``DistProfiler``'s finish hook (relocation, the user's command) see finished traces."""
+    require(module, "DistProfiler")
     profiler_class = module.DistProfiler
+    require(profiler_class, "_run_finish_hook")
     original = profiler_class._run_finish_hook
     if getattr(original, _PATCHED, False):
         return False

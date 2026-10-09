@@ -5,8 +5,8 @@ two standalone TokenSpeed replicas with TP=1. Step ``n`` trains on the batch
 generated during step ``n - 1`` while the replicas generate the batch of step
 ``n + 1``. Weights reach both replicas through the ``tokenspeed`` checkpoint
 engine: training rank 0 broadcasts them once over one ``gloo`` group with both
-servers. Only step 2 is profiled; its trace holds the actor update and the
-generation that ran beside it.
+servers. Steps 2 and 3 are profiled back to back; each trace holds the actor
+update and the generation that ran beside it.
 """
 
 import json
@@ -20,8 +20,9 @@ from transformers import AutoModelForCausalLM
 
 from rl_trace_observer.merger.cli import main as merge
 
-STEPS = 3
-PROFILED_STEP = 2
+STEPS = 4
+PROFILED_STEPS = (2, 3)
+PROFILED_STEP = PROFILED_STEPS[0]
 TRAINER_GPUS = ROLLOUT_GPUS = 2
 
 
@@ -43,7 +44,7 @@ def test_one_step_off_policy_with_standalone_tokenspeed_on_cpu(tmp_path):
         "rollout.nnodes": 1,
         "rollout.n_gpus_per_node": ROLLOUT_GPUS,
         "trainer.total_training_steps": STEPS,
-        "global_profiler.steps": f"[{PROFILED_STEP}]",
+        "global_profiler.steps": f"[{','.join(map(str, PROFILED_STEPS))}]",
         "+ray_kwargs.ray_init.num_gpus": TRAINER_GPUS + ROLLOUT_GPUS,
         # Its task runner alone reserves 10 CPUs.
         "+ray_kwargs.ray_init.num_cpus": 32,
@@ -77,7 +78,9 @@ def test_one_step_off_policy_with_standalone_tokenspeed_on_cpu(tmp_path):
         assert len(names) == len(weights) * (STEPS + 1) and set(names) <= set(weights)
         expected = sum(weights[name] for name in names)
         assert abs(sum(event["checksum"] for event in updates) - expected) <= 1e-3 * abs(expected)
-        assert kinds.count("start_profile") == kinds.count("stop_profile") == 1
+        # Each profile stops before the next starts.
+        profile_calls = [kind for kind in kinds if kind in ("start_profile", "stop_profile")]
+        assert profile_calls == ["start_profile", "stop_profile"] * len(PROFILED_STEPS)
     offsets = [event["rank_offset"] for events in servers.values() for event in events if "rank_offset" in event]
     assert sorted(offsets) == [1, 2]
 
@@ -94,11 +97,12 @@ def test_one_step_off_policy_with_standalone_tokenspeed_on_cpu(tmp_path):
         "the rollout of step 3 should overlap the actor update of step 2"
     )
 
-    merged = tmp_path / "step.json"
-    assert merge([str(output_dir), "-o", str(merged), "--strict", "--step", str(PROFILED_STEP)]) == 0
-    manifest = json.loads((tmp_path / "step.manifest.json").read_text())
-    tokenspeed = [a for a in manifest["artifacts"] if a["kind"].startswith("tokenspeed") and a["selected"]]
     kinds = ("tokenspeed_proton", "tokenspeed_viztracer")
-    assert sorted((a["role"], a["kind"]) for a in tokenspeed) == [
-        (f"rollout_replica{r}", kind) for r in range(ROLLOUT_GPUS) for kind in kinds
-    ]
+    for step in PROFILED_STEPS:
+        merged = tmp_path / f"step{step}.json"
+        assert merge([str(output_dir), "-o", str(merged), "--strict", "--step", str(step)]) == 0
+        manifest = json.loads((tmp_path / f"step{step}.manifest.json").read_text())
+        tokenspeed = [a for a in manifest["artifacts"] if a["kind"].startswith("tokenspeed") and a["selected"]]
+        assert sorted((a["role"], a["kind"]) for a in tokenspeed) == [
+            (f"rollout_replica{r}", kind) for r in range(ROLLOUT_GPUS) for kind in kinds
+        ]

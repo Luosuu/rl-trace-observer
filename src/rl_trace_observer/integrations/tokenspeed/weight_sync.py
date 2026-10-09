@@ -48,6 +48,32 @@ def _join_group(master_address: str, master_port: int, world_size: int, group_na
     return group
 
 
+async def _with_receivers(work, receivers: list[asyncio.Task]):
+    """Await ``work``, a blocking collective, together with the servers' replies for it.
+
+    A server that rejects its side never joins the collective, so ``work``
+    would wait until its timeout and hide the server's error; that error is
+    raised as soon as it arrives instead.
+    """
+    work = asyncio.ensure_future(work)
+    done, _ = await asyncio.wait([work, *receivers], return_when=asyncio.FIRST_EXCEPTION)
+    failed = [task for task in receivers if task in done and task.exception() is not None]
+    if failed:
+        for task in receivers:
+            task.cancel()
+        # `work` stays blocked until its own timeout; nothing can interrupt the collective.
+        work.add_done_callback(lambda task: task.cancelled() or task.exception())
+        raise failed[0].exception()
+    try:
+        result = await work
+    except BaseException:
+        for task in receivers:
+            task.cancel()
+        raise
+    await asyncio.gather(*receivers)
+    return result
+
+
 class WeightSender:
     """Rank 0 of a weight-update group whose other ranks are TokenSpeed servers.
 
@@ -117,10 +143,10 @@ class WeightSender:
             )
             for replica, offset in zip(self.replicas, offsets, strict=True)
         ]
-        self._group = await asyncio.to_thread(
-            self._on_device, _join_group, address, port, world_size, self.group_name, self.backend
+        self._group = await _with_receivers(
+            asyncio.to_thread(self._on_device, _join_group, address, port, world_size, self.group_name, self.backend),
+            joined,
         )
-        await asyncio.gather(*joined)
         print(f"[rl-trace-observer] sending weights to TokenSpeed replicas {self.replicas} ({self.backend})")
 
     async def _send_bucket(self, bucket: list[tuple[str, torch.Tensor]]) -> None:
@@ -142,8 +168,7 @@ class WeightSender:
             if self.backend == "nccl":
                 torch.cuda.synchronize()
 
-        await asyncio.to_thread(self._on_device, broadcast)
-        await asyncio.gather(*received)
+        await _with_receivers(asyncio.to_thread(self._on_device, broadcast), received)
 
     async def send(self, weights: AsyncIterator[tuple[str, torch.Tensor]], bucket_bytes: int) -> int:
         """Broadcast ``weights`` in buckets of about ``bucket_bytes``; returns the number of tensors."""

@@ -59,3 +59,15 @@ def when_imported(name: str, callback: Callable[[ModuleType], None]) -> None:
         raise RuntimeError(f"{name} already has another post-import callback")
     if not any(finder.name == name for finder in installed):
         sys.meta_path.insert(0, _PostImportFinder(name, callback))
+
+
+def require(owner: object, *names: str) -> None:
+    """Fail clearly when VERL lacks what a patch relies on, instead of breaking later."""
+    missing = [name for name in names if not hasattr(owner, name)]
+    if missing:
+        from importlib.metadata import version
+
+        raise RuntimeError(
+            f"rl-trace-observer supports verl 0.9.1, but {getattr(owner, '__name__', owner)} of the installed "
+            f"verl {version('verl')} has no {', '.join(missing)}"
+        )

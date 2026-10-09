@@ -75,3 +75,43 @@ def test_finish_hook_waits_for_exports(monkeypatch):
     DistProfiler(None)._run_finish_hook()
     DistProfiler("upload $SAVE_PATH")._run_finish_hook()
     assert calls == ["hook", "wait", "hook"]
+
+
+def test_a_scheduled_profiler_exports_each_window_even_when_the_thread_starts_late(tmp_path, monkeypatch):
+    import gzip
+    import time
+
+    import torch
+
+    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path / "out"))
+    # The thread runs after the next window has begun, as under load.
+    export = torch_traces._export
+    monkeypatch.setattr(torch_traces, "_export", lambda *args: (time.sleep(0.5), export(*args)))
+    traces = tmp_path / "traces"
+    traces.mkdir()
+
+    windows = iter(range(2))
+
+    def on_trace_ready(profiler):
+        profiler.export_chrome_trace(str(traces / f"window{next(windows)}.json.gz"))
+
+    module = types.SimpleNamespace(
+        get_torch_profiler=lambda **kwargs: torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=2),
+            on_trace_ready=on_trace_ready,
+        )
+    )
+    torch_traces.patch_torch_profile(module)
+    profiler = module.get_torch_profiler(profile_step=1)
+    profiler.start()
+    for window in range(2):
+        with torch.profiler.record_function(f"window{window}_marker"):
+            torch.ones(8).sum()
+        profiler.step()
+    profiler.stop()
+    torch_traces.wait_for_exports()
+
+    for window in range(2):
+        names = {event.get("name") for event in json.load(gzip.open(traces / f"window{window}.json.gz"))["traceEvents"]}
+        assert f"window{window}_marker" in names and f"window{1 - window}_marker" not in names

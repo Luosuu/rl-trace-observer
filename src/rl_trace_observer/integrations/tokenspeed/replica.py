@@ -18,7 +18,25 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from verl.utils.device import get_visible_devices_keyword
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica
 
-from .server import TokenSpeedServer, server_name
+from .adapter import STANDALONE_BACKEND
+from .server import REWARD, ROLLOUT, TEACHER, TokenSpeedServer, server_name
+
+
+def _check_weight_sync(mode: RolloutMode, backend: str) -> None:
+    """Fail at startup on a checkpoint-engine backend that would leave the policy's replicas without weights."""
+    if mode == RolloutMode.STANDALONE and backend != STANDALONE_BACKEND:
+        raise ValueError(
+            "Standalone TokenSpeed replicas receive weights only through "
+            f"actor_rollout_ref.rollout.checkpoint_engine.backend={STANDALONE_BACKEND}, not {backend!r}"
+        )
+    if mode == RolloutMode.HYBRID and backend == STANDALONE_BACKEND:
+        # The training workers would leave weight sync to a checkpoint engine
+        # that VERL's synchronous trainer never runs.
+        raise ValueError(
+            f"checkpoint_engine.backend={STANDALONE_BACKEND} is for standalone replicas "
+            "(hybrid_engine=False, e.g. the one-step-off-policy trainer); hybrid TokenSpeed replicas "
+            "receive weights from the training workers, so leave it at its default"
+        )
 
 
 class TokenSpeedReplica(RolloutReplica):
@@ -27,12 +45,9 @@ class TokenSpeedReplica(RolloutReplica):
             raise NotImplementedError("A TokenSpeed replica must fit on one node")
         if self.rollout_mode not in (RolloutMode.HYBRID, RolloutMode.STANDALONE):
             raise NotImplementedError(f"TokenSpeed rollout supports hybrid or standalone mode, not {self.rollout_mode}")
-        if self.rollout_mode == RolloutMode.STANDALONE and self.config.checkpoint_engine.backend != "tokenspeed":
-            raise ValueError(
-                "Standalone TokenSpeed replicas receive weights only through "
-                "actor_rollout_ref.rollout.checkpoint_engine.backend=tokenspeed, "
-                f"not {self.config.checkpoint_engine.backend!r}"
-            )
+        role = REWARD if self.is_reward_model else TEACHER if self.is_teacher_model else ROLLOUT
+        if role == ROLLOUT:
+            _check_weight_sync(self.rollout_mode, self.config.checkpoint_engine.backend)
         assert len(self.workers) == self.world_size, f"{len(self.workers)} workers for world size {self.world_size}"
 
         keyword = get_visible_devices_keyword()
@@ -48,7 +63,7 @@ class TokenSpeedReplica(RolloutReplica):
         server = (
             ray.remote(TokenSpeedServer)
             .options(
-                name=server_name(self.replica_rank, self.name_suffix),
+                name=server_name(self.replica_rank, role, self.name_suffix),
                 scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=infos[0][0], soft=False),
                 max_concurrency=self.max_concurrency,
             )
@@ -58,6 +73,8 @@ class TokenSpeedReplica(RolloutReplica):
                 replica_rank=self.replica_rank,
                 cuda_visible_devices=",".join(map(str, devices)),
                 free_cache_engine=self.config.free_cache_engine,
+                role=role,
+                name_suffix=self.name_suffix,
             )
         )
         await server.launch_server.remote()

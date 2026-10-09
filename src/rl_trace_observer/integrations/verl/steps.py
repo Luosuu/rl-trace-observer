@@ -24,11 +24,12 @@ the patches are applied when VERL imports them.
 import functools
 import inspect
 import logging
+import os
 import time
 from types import ModuleType
 
 from rl_trace_observer.context import STEP_MARKER_ATTRIBUTE, STEP_SPAN_NAME, current_run_id
-from rl_trace_observer.integrations.verl.import_hook import when_imported
+from rl_trace_observer.integrations.verl.import_hook import require, when_imported
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,10 @@ ONE_STEP_OFF_MODULE = "verl.experimental.one_step_off_policy.ray_trainer"
 _PATCHED = "_rl_trace_observer_step_marker"
 # Set on a one-step-off-policy trainer while a step runs.
 _IN_STEP = "_rl_trace_observer_in_step"
+# The TokenSpeed stops a one-step-off-policy trainer submitted without waiting.
+_PENDING_STOPS = "_rl_trace_observer_pending_stops"
+# How long the driver waits for pending profiles when fit ends (seconds).
+PROFILE_WAIT_TIMEOUT_ENV = "RL_TRACE_PROFILE_WAIT_TIMEOUT"
 
 
 def _emit_step_span(trainer: object, start_time_ns: int, end_time_ns: int, global_step: int | None = None) -> None:
@@ -84,7 +89,11 @@ def _wait_for_profiles(trainer: object) -> None:
     for name in ray.util.list_named_actors():
         if name.startswith(SERVER_NAME_PREFIX):
             refs.append(ray.get_actor(name).wait_for_profiles.remote())
-    ray.get(refs)
+    timeout = float(os.environ.get(PROFILE_WAIT_TIMEOUT_ENV, "1800"))
+    try:
+        ray.get(refs, timeout=timeout)
+    except ray.exceptions.GetTimeoutError:
+        logger.warning("Gave up waiting for pending profiles after %.0f s; some may be incomplete", timeout)
 
 
 def _wait_after(original):
@@ -122,6 +131,7 @@ def _wait_after(original):
 def patch_trainer(module: ModuleType) -> bool:
     """Wrap ``module.PPOTrainer.step``; returns ``False`` if already wrapped."""
     trainer_class = module.PPOTrainer
+    require(trainer_class, "step", "fit", "_start_rollout_profiling", "_rollout_server_managers")
     original = trainer_class.step
     if getattr(original, _PATCHED, False):
         return False
@@ -162,6 +172,7 @@ def _profiles_rollout(trainer, global_step: int) -> bool:
 def patch_one_step_off_trainer(module: ModuleType) -> bool:
     """Wrap ``module.OneStepOffRayTrainer``'s steps; returns ``False`` if already wrapped."""
     trainer_class = module.OneStepOffRayTrainer
+    require(trainer_class, "fit", "fit_step", "_async_gen_next_batch")
     original_step = trainer_class.fit_step
     if getattr(original_step, _PATCHED, False):
         return False
@@ -194,15 +205,17 @@ def patch_one_step_off_trainer(module: ModuleType) -> bool:
             import ray
 
             servers = [server for replica in self.llm_server_manager.get_replicas() for server in replica.servers]
+            # Ray does not keep an async actor's calls in order: the previous
+            # profile's stop must be done before this start.
+            ray.get(getattr(self, _PENDING_STOPS, []))
             ray.get([server.start_profile.remote(global_step=global_step) for server in servers])
         try:
             return await original_generate(self, *args, **kwargs)
         finally:
             if profile:
-                # Not awaited: the servers stop and save on their own, in order
-                # with the next start, and the batch goes to training now.
-                for server in servers:
-                    server.stop_profile.remote()
+                # Not awaited, so the batch goes to training now; the next start
+                # waits for these, and the servers save in the background.
+                setattr(self, _PENDING_STOPS, [server.stop_profile.remote() for server in servers])
 
     setattr(fit_step, _PATCHED, True)
     trainer_class.fit_step = fit_step
