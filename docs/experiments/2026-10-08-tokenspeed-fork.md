@@ -33,3 +33,11 @@ TokenSpeed 不再通过 `sitecustomize` 打补丁，改为从我们的 fork 安�
   | 5 | 7.8 | 0 | 7.4 | 0.42 | |
 
   与补丁版本（[2026-10-02](2026-10-02-tokenspeed-one-step-off.md)）一致：profile 步之后的下一步不等数据。actor 侧仍有约 6 s 的 Torch profiler 停止时间，与 TokenSpeed 无关。
+
+## 复测：后台写成为唯一行为（fork `0ea62714`）
+
+去掉 `TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND` 开关后，在 8×H100 上重跑（commit `69d4a18`，job `rl-trace-fork-20261009-000315-69d4a18`）：
+
+- fork 单元测试 20 个全部通过；
+- E0 的 32 项检查全部通过，`/stop_profile` 在 0.14–0.32 s 内返回，约 3 s 后文件写完；
+- E2 的 5 步全部完成，第 2–5 步等待数据均为 0 s，第 3、4 步的 strict 合并没有问题，每步 19 个产物。actor 的 `stop_profile` 仍约 6 s。
