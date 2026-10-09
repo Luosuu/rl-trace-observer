@@ -154,6 +154,9 @@ echo "=== merge"
 for step in $(echo "$PROFILE_STEPS" | tr -d '[] ' | tr , ' '); do
   $PY -m rl_trace_observer.merger.cli "$RL_TRACE_OUTPUT_DIR" -o "$E2/step$step.json.gz" --strict --step "$step"
   echo "merge step $step exit $?"
+  # P6-c: follow each request of the step down to the GPU kernels.
+  $PY scripts/gpu/check_request_flows.py "$E2/step$step.json.gz" --out "$E2/step$step.request_flows.json"
+  echo "request flows step $step exit $?"
 done
 $PY -m rl_trace_observer.merger.cli "$RL_TRACE_OUTPUT_DIR" -o "$E2/all_steps.json.gz"
 exit $status
