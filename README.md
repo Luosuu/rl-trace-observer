@@ -22,9 +22,9 @@ actor-side VizTracer call stacks are needed.
 
 The project is managed with [uv](https://docs.astral.sh/uv/) on Python 3.12.
 `uv.lock` pins every dependency: VERL (>= 0.9.1), VizTracer, and RL-Insight
-from the
-[Luosuu/rl-insight](https://github.com/Luosuu/rl-insight/tree/tianle/server-backend-env)
-fork that adds `RL_INSIGHT_SERVER_BACKEND` until it lands upstream. TokenSpeed
+from [verl-project/rl-insight](https://github.com/verl-project/rl-insight)
+`main`, the first version with `RL_INSIGHT_SERVER_BACKEND` (no release has it
+yet). TokenSpeed
 is the only extra (Linux only). It is pinned to a nightly build of
 [lightseekorg/tokenspeed](https://github.com/lightseekorg/tokenspeed) `main`
 (`0.1.0.post20260930`, from `https://lightseek.org/whl/nightly`), because the
@@ -90,7 +90,7 @@ ray job submit --runtime-env ray_runtime_env.yaml -- \
 worker. VERL workers initialize RL-Insight lazily without the trainer config, so
 the plugin selects its backend through `RL_INSIGHT_SERVER_BACKEND`, which it
 defaults to `rl_trace_observer` in each process; an explicitly set value wins.
-This requires the pinned RL-Insight fork; the plugin raises an error on an
+This requires RL-Insight `main` (see Setup); the plugin raises an error on an
 RL-Insight without `RL_INSIGHT_SERVER_BACKEND`.
 
 Each process incrementally writes:

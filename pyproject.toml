@@ -30,9 +30,9 @@ rl-trace-merge = "rl_trace_observer.merger.cli:main"
 rl-trace-observer = "rl_trace_observer.integrations.verl.register"
 
 [tool.uv.sources]
-# Fork adding RL_INSIGHT_SERVER_BACKEND (branch tianle/server-backend-env),
-# required until it lands upstream.
-rl-insight = { git = "https://github.com/Luosuu/rl-insight", rev = "72763beecf2c9652ad182ba83ce9104417a70d1e" }
+# RL_INSIGHT_SERVER_BACKEND is on main (verl-project/rl-insight#190) but in no
+# release yet; uv.lock pins the commit.
+rl-insight = { git = "https://github.com/verl-project/rl-insight", branch = "main" }
 
 # TokenSpeed nightly builds of main: its VizTracer reports carry the scope-entry
 # flows that link Python slices to Proton CPU scopes, which the 0.1.0 release

@@ -2280,7 +2280,7 @@ wheels = [
 [[package]]
 name = "rl-insight"
 version = "0.3.0"
-source = { git = "https://github.com/Luosuu/rl-insight?rev=72763beecf2c9652ad182ba83ce9104417a70d1e#72763beecf2c9652ad182ba83ce9104417a70d1e" }
+source = { git = "https://github.com/verl-project/rl-insight?branch=main#878296e6e5b19455d2cc1df9f4a8d10dd5d5523a" }
 dependencies = [
     { name = "fastapi" },
     { name = "omegaconf" },
@@ -2319,7 +2319,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "rl-insight", git = "https://github.com/Luosuu/rl-insight?rev=72763beecf2c9652ad182ba83ce9104417a70d1e" },
+    { name = "rl-insight", git = "https://github.com/verl-project/rl-insight?branch=main" },
     { name = "tokenspeed", marker = "sys_platform == 'linux' and extra == 'tokenspeed'", specifier = "==0.1.0.post20260930" },
     { name = "verl", extras = ["verl-core"], specifier = ">=0.9.1" },
     { name = "viztracer", specifier = ">=0.16" },

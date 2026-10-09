@@ -110,14 +110,14 @@ VERL 已经在 actor 和 rollout 路径调用 `RLInsightLogger.trace_state`。�
 
 MVP 方案：
 
-1. 在 RL-Insight fork（`Luosuu/rl-insight@tianle/server-backend-env`，已向上游提交）中增加 `RL_INSIGHT_SERVER_BACKEND`，覆盖 `server.backend`；
+1. RL-Insight 增加 `RL_INSIGHT_SERVER_BACKEND`，覆盖 `server.backend`（verl-project/rl-insight#190，已合入 main）；
 2. 插件在每个进程加载时注册 `rl_trace_observer` backend，并默认设置 `RL_INSIGHT_SERVER_BACKEND=rl_trace_observer`（用户显式设置时不覆盖）；
 3. worker 即使无参数初始化，也会进入本地 collector；
 4. 若用户启用原 RL-Insight 服务，event 同时转发给 RL-Insight 内置 Ray client；
 5. RL-Insight 不支持该变量时 fail fast，不提供替换默认 `ray` factory 的回退；
 6. 通过真实 Ray actor 与 VERL `RayWorkerGroup` 测试验证 backend 选择。
 
-项目由 uv 管理并固定 Python 3.12；verl、RL-Insight fork（按 commit 固定）与 VizTracer 为根依赖，TokenSpeed 为唯一 extra。Ray 运行遵循 Ray + uv 范式：`ray_runtime_env.yaml` 上传项目为 `working_dir`，并以 `uv run --locked --extra tokenspeed python` 作为 `py_executable`，每个 worker 使用同一锁定环境。末尾的 `python` 不可省略：否则 `uv run <default_worker.py>` 会从 Ray 安装位置而不是 `working_dir` 发现项目。
+项目由 uv 管理并固定 Python 3.12；verl、RL-Insight main（由 `uv.lock` 按 commit 固定）与 VizTracer 为根依赖，TokenSpeed 为唯一 extra。Ray 运行遵循 Ray + uv 范式：`ray_runtime_env.yaml` 上传项目为 `working_dir`，并以 `uv run --locked --extra tokenspeed python` 作为 `py_executable`，每个 worker 使用同一锁定环境。末尾的 `python` 不可省略：否则 `uv run <default_worker.py>` 会从 Ray 安装位置而不是 `working_dir` 发现项目。
 
 ### 6.2 Actor profiler
 
@@ -304,7 +304,7 @@ manifest
 
 ### P0：修复真实 worker 采集链路
 
-- [x] 通过 `RL_INSIGHT_SERVER_BACKEND`（RL-Insight fork）为无参数初始化的 worker 选择本地 backend；
+- [x] 通过 `RL_INSIGHT_SERVER_BACKEND`（RL-Insight main）为无参数初始化的 worker 选择本地 backend；
 - [x] 可选转发到 RL-Insight 内置 Ray client，转发失败不影响训练；
 - [x] 验证 driver、actor、rollout 进程均加载插件（CPU 上使用 VERL 真实 `RayWorkerGroup`；rollout 以调用同一 `RLInsightLogger.trace_state` 的 Ray actor 代替 vLLM/SGLang server）；
 - [x] 增加真实 RL-Insight lazy-init 测试；
@@ -312,7 +312,7 @@ manifest
 - [x] CPU 上运行真实 `verl.trainer.main_ppo` 一个 PPO step（FSDP2 actor + 测试用 mock rollout，`tests/test_cpu_ppo.py`），actor 与 rollout 进程均写出 semantic artifact，合并后 RL-Insight 与 Torch 的 `actor_update` 在 Perfetto 中对齐；
 - [ ] 在真实 vLLM/SGLang/TokenSpeed rollout server 中确认 `*_generate` span（需 GPU）。
 
-已验证版本：`verl==0.9.1`、`tokenspeed==0.1.0.post20260930`（main 的 nightly，0.1.0 之后加入 VizTracer→Proton scope flow；配套的 `tokenspeed-kernel` nightly 要求 `torch==2.14.0`；`transformers` 覆盖为 5.12.0）、RL-Insight fork `72763be`（基于 0.3.0）。VERL 0.9 通过 `verl.plugins` entry point 在每个导入 verl 的进程中自动加载插件，并通过 `get_ppo_ray_runtime_env` 将 `VERL_RL_INSIGHT_ENABLE` 转发给所有 worker。两个版本的 `load_monitor_config` 都只允许环境变量覆盖 `server.url`，无法覆盖 `server.backend`，因此项目固定使用增加了 `RL_INSIGHT_SERVER_BACKEND` 的 fork。
+已验证版本：`verl==0.9.1`、`tokenspeed==0.1.0.post20260930`（main 的 nightly，0.1.0 之后加入 VizTracer→Proton scope flow；配套的 `tokenspeed-kernel` nightly 要求 `torch==2.14.0`；`transformers` 覆盖为 5.12.0）、RL-Insight main `878296e`（0.3.0 之后）。VERL 0.9 通过 `verl.plugins` entry point 在每个导入 verl 的进程中自动加载插件，并通过 `get_ppo_ray_runtime_env` 将 `VERL_RL_INSIGHT_ENABLE` 转发给所有 worker。RL-Insight 0.3.0 及之前的 `load_monitor_config` 只允许环境变量覆盖 `server.url`，无法覆盖 `server.backend`；`RL_INSIGHT_SERVER_BACKEND` 在 main 中加入（#190），尚未发布，因此项目从 main 安装并由 `uv.lock` 固定 commit。
 
 完成标准：至少两个 Ray worker 的 `trace_state` 都产生本地 semantic artifact。
 

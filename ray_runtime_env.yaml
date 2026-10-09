@@ -5,7 +5,7 @@
 #     python -m verl.trainer.main_ppo trainer.logger='["console","rl_insight"]' ...
 #
 # Every Ray worker starts through `uv run` inside the uploaded working_dir, so
-# it gets the environment pinned by uv.lock, including the RL-Insight fork.
+# it gets the environment pinned by uv.lock, including RL-Insight main.
 # Keep the extras here identical to the ones on the driver's `uv run`.
 #
 # The trailing `python` is required: Ray appends the path of its own
