@@ -388,7 +388,7 @@ manifest
 - [x] 发送侧：patch `LLMServerClient.generate`，每次调用记录一个 `rollout_request` span（P6-a）；
 - [x] 接收侧：server actor 的 `tokenspeed_generate` span 带同一个 `request_id`；merger 把带 `rl_trace_observer.request_flow` 标记的 span 按 request ID、按时间连成一条跨进程 flow，flow ID 自成命名空间（P6-a）；
 - [x] 将 request ID 加入 RL-Insight labels；
-- [ ] TokenSpeed scheduler 迭代记录 request ID，flow 延伸到 prefill / 最后一次迭代（P6-b）；
+- [x] TokenSpeed scheduler 迭代记录 request ID（fork：profile 期间每次 forward 在 `tokenspeed::forward` 线程上记录一个带 `request_ids` 的 `forward_batch` slice，kernel scope 嵌套其中），flow 延伸到一个 rank 上的 prefill / 最后一次 forward，可选逐 forward（P6-b）；
 - [ ] 请求的权重版本与消费它的训练 step（P6-d）；
 - [ ] 验证 flow 可继续连接 TokenSpeed Proton kernel。
 

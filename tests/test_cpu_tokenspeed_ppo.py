@@ -116,3 +116,16 @@ def test_ppo_with_tokenspeed_rollout_on_cpu(tmp_path, load_in_perfetto):
     assert len(requests) == generates_in_step.n[0] == TRAIN_BATCH_SIZE * ROLLOUT_N
     assert (requests.caller == requests.server).all() and requests.caller.nunique() == len(requests)
     assert (requests.caller_process != requests.server_process).all()
+    # ...and continues through the first and last forward that served it on the server's scheduler.
+    hops = processor.query(
+        """
+        select o.name as out_name, i.name as in_name, count(*) as n
+        from flow f join slice o on f.slice_out = o.id join slice i on f.slice_in = i.id
+        where i.name = 'forward_batch'
+        group by o.name, i.name
+        """
+    ).as_pandas_dataframe()
+    assert dict(zip(zip(hops.out_name, hops.in_name, strict=True), hops.n, strict=True)) == {
+        ("tokenspeed_generate", "forward_batch"): TRAIN_BATCH_SIZE * ROLLOUT_N,
+        ("forward_batch", "forward_batch"): TRAIN_BATCH_SIZE * ROLLOUT_N,
+    }

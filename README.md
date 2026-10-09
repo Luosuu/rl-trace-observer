@@ -273,7 +273,15 @@ Perfetto shows where it went:
   is sent, a fresh one per call), `trajectory_id` (the agent loop's id, shared
   by the turns of one trajectory) and `server_id`;
 - the TokenSpeed server actor's `tokenspeed_generate` span carries the same
-  `request_id`, which TokenSpeed keeps from HTTP to its scheduler.
+  `request_id`, which TokenSpeed keeps from HTTP to its scheduler;
+- while profiling, our TokenSpeed fork wraps each model forward in a
+  `forward_batch` slice on the scheduler's `tokenspeed::forward` thread, with
+  the `request_ids` of its batch. The request's flow continues to the first
+  (prefill) and last forward that served it on one scheduler rank (the lowest
+  `rank_tag`), and from those forwards the VizTracer→Proton scope flows lead
+  to the kernels. `rl-trace-merge --request-flow-every-forward` links every
+  forward instead. To find all forwards of a request, query
+  `forward_batch` slices by their `args.request_ids`.
 
 Any RL-Insight span with the attributes `request_id` and
 `rl_trace_observer.request_flow=True` is a point on its request's path; the

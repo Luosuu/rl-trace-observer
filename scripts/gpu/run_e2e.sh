@@ -62,7 +62,7 @@ if [ "$RUN_TOKENSPEED_TESTS" = 1 ]; then
   [ -d "$TS_SRC" ] || git clone -q --filter=blob:none https://github.com/Luosuu/tokenspeed "$TS_SRC"
   git -C "$TS_SRC" fetch -q origin "$TS_COMMIT" && git -C "$TS_SRC" checkout -q "$TS_COMMIT"
   (cd "$TS_SRC" && $PY -m pytest -q test/runtime/test_request_handler_profile.py \
-    test/runtime/test_proton_session.py test/runtime/test_weights_update_group.py) \
+    test/runtime/test_proton_session.py test/runtime/test_weights_update_group.py test/runtime/test_forward_trace.py) \
     > "$WORK_DIR/out/tokenspeed_tests.txt" 2>&1
   echo "TokenSpeed tests at $TS_COMMIT exit $?"
   tail -3 "$WORK_DIR/out/tokenspeed_tests.txt"

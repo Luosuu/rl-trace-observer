@@ -113,7 +113,14 @@ def two_step_run(root: Path, run_id="run-a") -> tuple[TracedProcess, TracedProce
 
 
 def write_tokenspeed_pair(
-    directory: Path, profile_id: str, rank_tag="TP0", *, base_ns=BASE_NS, proton_offset_ns=2_000, scheduler_pid=900
+    directory: Path,
+    profile_id: str,
+    rank_tag="TP0",
+    *,
+    base_ns=BASE_NS,
+    proton_offset_ns=2_000,
+    scheduler_pid=900,
+    forwards=(),
 ) -> tuple[Path, Path]:
     """Files shaped like a TokenSpeed scheduler's ``/start_profile`` VIZTRACER + PROTON output.
 
@@ -121,6 +128,9 @@ def write_tokenspeed_pair(
     for scope 5 (recorded by Proton) and scope 6 (not recorded). Proton, anchored
     ``proton_offset_ns`` later, records scope 5 on its CPU thread and the
     kernel it launched on a GPU stream, linked by its own flow 1.
+
+    ``forwards`` are ``(start_us, dur_us, request_ids)``: the ``forward_batch``
+    slices our TokenSpeed fork records on the forward thread.
     """
     viztracer = directory / f"{profile_id}-{rank_tag}.viztracer.json"
     viztracer.write_text(
@@ -135,6 +145,12 @@ def write_tokenspeed_pair(
                         {"ph": "s", "name": "viztracer->proton", "cat": "tokenspeed.proton", "id": scope}
                         | {"pid": scheduler_pid, "tid": 1, "ts": 11.0}
                         for scope in (5, 6)
+                    ),
+                    {"ph": "M", "name": "thread_name", "pid": scheduler_pid, "tid": 2, "args": {"name": "forward"}},
+                    *(
+                        {"ph": "X", "name": "forward_batch", "cat": "tokenspeed.requests", "ts": start, "dur": dur}
+                        | {"pid": scheduler_pid, "tid": 2, "args": {"request_ids": list(rids), "num_extends": 0}}
+                        for start, dur, rids in forwards
                     ),
                 ],
             }
