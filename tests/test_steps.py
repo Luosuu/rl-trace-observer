@@ -201,3 +201,48 @@ def test_one_step_off_starts_a_profile_only_after_the_previous_stop(spans, monke
 
     # Step 3's start waits for step 2's stop, which was not awaited.
     assert gets == [[], [("start", 2)], [("stop", None)], [("start", 3)]]
+
+
+def test_one_step_off_batches_say_which_step_trains_on_them(spans, monkeypatch):
+    import asyncio
+
+    class Trainer:
+        """VERL's flow: fit asks for the first batch, each step trains on one and asks for the next."""
+
+        def __init__(self):
+            self.global_steps = 1
+            self.config = types.SimpleNamespace(
+                actor_rollout_ref=types.SimpleNamespace(rollout=types.SimpleNamespace(name="vllm")),
+                global_profiler={"steps": []},
+            )
+
+        async def fit(self):
+            # The first batch's task runs only once step 1 waits for it.
+            future = asyncio.create_task(self._async_gen_next_batch())
+            for _ in range(3):
+                future = await self.fit_step(future)
+
+        async def fit_step(self, future):
+            await future
+            following = asyncio.create_task(self._async_gen_next_batch())
+            await asyncio.sleep(0)
+            self.global_steps += 1
+            return following
+
+        async def _async_gen_next_batch(self):
+            return "batch"
+
+    module = types.ModuleType("fake_one_step_off_batches")
+    module.OneStepOffRayTrainer = Trainer
+    steps.patch_one_step_off_trainer(module)
+    monkeypatch.setattr(steps, "_wait_for_profiles", lambda trainer: None)
+
+    asyncio.run(Trainer().fit())
+
+    batches = [kwargs["attributes"] for name, kwargs in spans if name == "rollout_batch"]
+    assert [(b["batch_step"], b.get("requested_during_step"), b["consumed_by_step"]) for b in batches] == [
+        (1, None, 1),
+        (1, 1, 2),
+        (2, 2, 3),
+        (3, 3, 4),
+    ]

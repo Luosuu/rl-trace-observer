@@ -2600,7 +2600,7 @@ wheels = [
 [[package]]
 name = "tokenspeed"
 version = "0.1.0"
-source = { git = "https://github.com/Luosuu/tokenspeed?subdirectory=python&branch=tianle%2Frl-trace#58cdfadc8968904becb150b21290f426925a8eb5" }
+source = { git = "https://github.com/Luosuu/tokenspeed?subdirectory=python&branch=tianle%2Frl-trace#2a23f03956f81546150e997d7d7c4e31a24e3908" }
 dependencies = [
     { name = "aiohttp", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "compressed-tensors", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },

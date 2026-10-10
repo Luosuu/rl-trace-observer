@@ -19,6 +19,13 @@ Kineto also emits device indices and strings such as ``"Spans"`` as pids.
   two files: its VizTracer report starts a flow at every Python scope whose id
   is the Proton CPU scope's ``scope_id``, and the merger ends it on that scope,
   as ``tokenspeed merge-traces`` does.
+* Request flows cross processes on purpose: every span marked as a point on a
+  rollout request's path (``REQUEST_FLOW_ATTRIBUTE``, e.g. the agent loop's
+  call and the server's handling of it) is linked into one flow per request
+  id, in time order, and so are the TokenSpeed forwards that served it
+  (``forward_batch`` slices listing their requests): by default its first
+  (prefill) and last forward, on one scheduler rank. Their ids form a
+  namespace of their own.
 """
 
 import itertools
@@ -26,6 +33,8 @@ from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
+
+from rl_trace_observer.context import REQUEST_FLOW_ATTRIBUTE, REQUEST_ID_ATTRIBUTE
 
 from .manifest import Process
 from .sources import RL_INSIGHT, TOKENSPEED_PROTON, TOKENSPEED_VIZTRACER, TORCH, VIZTRACER, TraceSource
@@ -48,6 +57,11 @@ _SCOPE_ID_ARG = "scope_id"
 # links events; ids are only unique within the file that produced them.
 _ID_PHASES = frozenset("stfbneSTF")
 _FLOW_PHASES = frozenset("stf")
+_REQUEST_FLOW_NAME = "rollout request"
+_REQUEST_FLOW_CATEGORY = "rl_trace_observer.request"
+# The slice our TokenSpeed fork records around each forward, listing its requests.
+_FORWARD_BATCH_NAME = "forward_batch"
+_FORWARD_BATCH_CATEGORY = "tokenspeed.requests"
 
 
 class EmptyTraceError(ValueError):
@@ -172,7 +186,10 @@ class _SourceRemapper:
 
     def flow_id(self, event: dict[str, Any]) -> int:
         original = event["id"]
-        if isinstance(original, tuple):
+        if isinstance(original, tuple) and original[0] == "request":
+            # A request flow from _link_request_flows, across processes.
+            ids, key = self._namespace.shared_flow_ids, original
+        elif isinstance(original, tuple):
             # A scope flow from _link_scope_flows, shared with the partner file.
             ids, key = self._namespace.shared_flow_ids, (self._source.pair, original)
         elif (chain := self._flow_chains.get(id(event))) is not None:
@@ -255,10 +272,86 @@ def _link_scope_flows(sources: list[TraceSource]) -> dict[int, list[dict[str, An
     return ends
 
 
-def merge_sources(sources: Iterable[TraceSource], processes: Mapping[str, Process] | None = None) -> MergeResult:
-    """Merge ``sources``; ``processes`` (from the session manifest) names linked OS processes."""
+def _request_point(event: dict[str, Any]) -> str | None:
+    """The request id of a span marked as a point on a request's path, else ``None``."""
+    args = event.get("args")
+    if event.get("ph") != "X" or not isinstance(args, dict) or "ts" not in event:
+        return None
+    marker = args.get(REQUEST_FLOW_ATTRIBUTE)
+    request_id = args.get(REQUEST_ID_ATTRIBUTE)
+    if marker not in (True, 1, "1", "true", "True") or request_id in (None, ""):
+        return None
+    return str(request_id)
+
+
+def _forward_requests(event: dict[str, Any]) -> list[str]:
+    """The request ids a TokenSpeed ``forward_batch`` slice served, else ``[]``."""
+    args = event.get("args")
+    if (
+        event.get("ph") != "X"
+        or event.get("name") != _FORWARD_BATCH_NAME
+        or event.get("cat") != _FORWARD_BATCH_CATEGORY
+        or not isinstance(args, dict)
+        or "ts" not in event
+    ):
+        return []
+    return [str(request_id) for request_id in args.get("request_ids") or []]
+
+
+def _link_request_flows(sources: list[TraceSource], every_forward: bool = False) -> dict[int, list[dict[str, Any]]]:
+    """One flow per rollout request through every point on its path.
+
+    The points are the spans marked as points on the request's path and the
+    TokenSpeed forwards that served it: those of one scheduler rank (the
+    lowest ``rank_tag``; the other TP ranks run the same forwards), its first
+    (prefill) and last unless ``every_forward``.
+
+    Returns, by ``id()`` of the source, the flow events to add to it: the
+    request's points in absolute time order start (``s``), step through
+    (``t``) and end (``f``) the flow, each bound to its slice. A request with a
+    single point gets no flow. The id ``("request", <request id>)`` is shared
+    by all sources and no profiler writes it.
+    """
+    points: dict[str, list[tuple[int, TraceSource, dict[str, Any]]]] = defaultdict(list)
+    forwards: dict[str, dict[str, list[tuple[int, TraceSource, dict[str, Any]]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for source in sources:
+        for event in source.events:
+            if (request_id := _request_point(event)) is not None:
+                points[request_id].append((_event_start_ns(source, event), source, event))
+            elif source.kind == TOKENSPEED_VIZTRACER:
+                for request_id in _forward_requests(event):
+                    forwards[request_id][source.rank_tag or ""].append((_event_start_ns(source, event), source, event))
+    for request_id, by_rank in forwards.items():
+        served = sorted(by_rank[min(by_rank)], key=lambda point: point[0])
+        points[request_id] += served if every_forward else [served[0], served[-1]][: len(served)]
+    flows: dict[int, list[dict[str, Any]]] = {}
+    for request_id, path in points.items():
+        if len(path) < 2:
+            continue
+        path.sort(key=lambda point: point[0])
+        for index, (_, source, event) in enumerate(path):
+            phase = "s" if index == 0 else "f" if index == len(path) - 1 else "t"
+            flow = {"name": _REQUEST_FLOW_NAME, "cat": _REQUEST_FLOW_CATEGORY, "ph": phase, "bp": "e"}
+            flow.update(ts=event["ts"], pid=event.get("pid"), tid=event.get("tid"), id=("request", request_id))
+            flows.setdefault(id(source), []).append(flow)
+    return flows
+
+
+def merge_sources(
+    sources: Iterable[TraceSource],
+    processes: Mapping[str, Process] | None = None,
+    every_forward: bool = False,
+) -> MergeResult:
+    """Merge ``sources``; ``processes`` (from the session manifest) names linked OS processes.
+
+    ``every_forward`` links each request through every TokenSpeed forward that
+    served it instead of its first and last.
+    """
     ordered = sorted(sources, key=lambda source: (_KIND_ORDER.get(source.kind, 99), source.title, str(source.path)))
     scope_flow_ends = _link_scope_flows(ordered)
+    request_flows = _link_request_flows(ordered, every_forward)
     starts = [_event_start_ns(source, event) for source in ordered for event in source.events]
     starts = [start for start in starts if start is not None]
     if not starts:
@@ -274,7 +367,8 @@ def merge_sources(sources: Iterable[TraceSource], processes: Mapping[str, Proces
         remapper = _SourceRemapper(source, namespace, ids)
         offset_us = (source.base_ns - global_base_ns) / 1000
         dropped = 0
-        for event in itertools.chain(source.events, scope_flow_ends.get(id(source), [])):
+        added = scope_flow_ends.get(id(source), []) + request_flows.get(id(source), [])
+        for event in itertools.chain(source.events, added):
             if event.get("ph") == "M":
                 continue
             if "ts" not in event or float(event.get("dur", 0)) < 0:

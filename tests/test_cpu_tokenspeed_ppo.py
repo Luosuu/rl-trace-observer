@@ -95,3 +95,50 @@ def test_ppo_with_tokenspeed_rollout_on_cpu(tmp_path, load_in_perfetto):
         "select count(*) as n from flow f join slice s on f.slice_out = s.id where s.name = 'forward'"
     ).as_pandas_dataframe()
     assert flows.n[0] == WORLD_SIZE
+
+    # Every request of the step is one flow from the agent loop's call to the server that handled it.
+    requests = processor.query(
+        """
+        select extract_arg(o.arg_set_id, 'args.request_id') as caller,
+               extract_arg(i.arg_set_id, 'args.request_id') as server,
+               po.name as caller_process, pi.name as server_process
+        from flow f
+        join slice o on f.slice_out = o.id join thread_track tto on o.track_id = tto.id
+        join thread tho on tho.utid = tto.utid join process po on po.upid = tho.upid
+        join slice i on f.slice_in = i.id join thread_track tti on i.track_id = tti.id
+        join thread thi on thi.utid = tti.utid join process pi on pi.upid = thi.upid
+        where o.name = 'rollout_request' and i.name = 'tokenspeed_generate'
+        """
+    ).as_pandas_dataframe()
+    generates_in_step = processor.query(
+        "select count(*) as n from slice where name = 'tokenspeed_generate'"
+    ).as_pandas_dataframe()
+    assert len(requests) == generates_in_step.n[0] == TRAIN_BATCH_SIZE * ROLLOUT_N
+    assert (requests.caller == requests.server).all() and requests.caller.nunique() == len(requests)
+    assert (requests.caller_process != requests.server_process).all()
+    # Both ends of a request agree on the weights it was generated with.
+    versions = processor.query(
+        """
+        select extract_arg(o.arg_set_id, 'args.weight_version') as caller,
+               extract_arg(i.arg_set_id, 'args.weight_version') as server,
+               extract_arg(o.arg_set_id, 'args.batch_step') as batch_step
+        from flow f join slice o on f.slice_out = o.id join slice i on f.slice_in = i.id
+        where o.name = 'rollout_request' and i.name = 'tokenspeed_generate'
+        """
+    ).as_pandas_dataframe()
+    # The synchronous trainer generates step n's batch with the weights it synced after step n - 1.
+    assert (versions.caller == versions.server).all() and set(versions.caller) == {STEPS - 1}
+    assert set(versions.batch_step) == {STEPS}
+    # ...and continues through the first and last forward that served it on the server's scheduler.
+    hops = processor.query(
+        """
+        select o.name as out_name, i.name as in_name, count(*) as n
+        from flow f join slice o on f.slice_out = o.id join slice i on f.slice_in = i.id
+        where i.name = 'forward_batch'
+        group by o.name, i.name
+        """
+    ).as_pandas_dataframe()
+    assert dict(zip(zip(hops.out_name, hops.in_name, strict=True), hops.n, strict=True)) == {
+        ("tokenspeed_generate", "forward_batch"): TRAIN_BATCH_SIZE * ROLLOUT_N,
+        ("forward_batch", "forward_batch"): TRAIN_BATCH_SIZE * ROLLOUT_N,
+    }

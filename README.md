@@ -261,6 +261,53 @@ each replaced atomically, and neither may be one of the inputs.
 Timestamps are each host's wall clock, so cross-node ordering is only as good
 as the nodes' clock synchronization (NTP/PTP).
 
+### Request flows
+
+The merged trace links each rollout request across the processes on its path
+with one flow (category `rl_trace_observer.request`), so selecting a request in
+Perfetto shows where it went:
+
+- VERL's agent loop sends a request with `LLMServerClient.generate`; the
+  plugin records one `rollout_request` span per call on the agent loop
+  worker's `agent_loop/slot_<k>` lanes, with `request_id` (the id the server
+  is sent, a fresh one per call), `trajectory_id` (the agent loop's id, shared
+  by the turns of one trajectory) and `server_id`;
+- the TokenSpeed server actor's `tokenspeed_generate` span carries the same
+  `request_id`, which TokenSpeed keeps from HTTP to its scheduler;
+- while profiling, our TokenSpeed fork wraps each model forward in a
+  `forward_batch` slice on the scheduler's `tokenspeed::forward` thread, with
+  the `request_ids` of its batch. The request's flow continues to the first
+  (prefill) and last forward that served it on one scheduler rank (the lowest
+  `rank_tag`), and from those forwards the VizTracer→Proton scope flows lead
+  to the kernels. `rl-trace-merge --request-flow-every-forward` links every
+  forward instead. To find all forwards of a request, query
+  `forward_batch` slices by their `args.request_ids`.
+
+Requests also say which weights generated them and which step trains on them:
+
+- `rollout_request` carries `weight_version` (VERL's tag on the output: the
+  `global_steps` of the last weight update the server received; with
+  `min_weight_version`/`max_weight_version` if weights changed during a partial
+  rollout), and the trajectory: `batch_step` (the trainer's `global_steps` when
+  it asked for the batch), `sample_index`, `rollout_n`, `validate`.
+  `tokenspeed_generate` carries the server's `weight_version` at the start (and
+  `weight_version_end` if an update arrived meanwhile).
+- In VERL's synchronous trainer a step generates and trains on its own batch,
+  with the weights synced after the previous step (`weight_version` = step - 1).
+- With the one-step-off-policy trainer, each generation is a `rollout_batch`
+  span on the trainer's `trainer/rollout` lane with `batch_step`,
+  `requested_during_step` (absent for the batch asked for before step 1) and
+  `consumed_by_step`: the first batch trains in step 1, the one asked for in
+  step n trains in step n + 1. A request's staleness is
+  `consumed_by_step - weight_version` of its batch, which its `batch_step` and
+  time window identify.
+
+Any RL-Insight span with the attributes `request_id` and
+`rl_trace_observer.request_flow=True` is a point on its request's path; the
+merger links a request's points in time order and gives these flows ids of
+their own, apart from every file's flow ids. A request with a single point
+gets no flow.
+
 ## Preserve the normal RL-Insight backend
 
 Set the following to make the custom client forward all events to the existing
