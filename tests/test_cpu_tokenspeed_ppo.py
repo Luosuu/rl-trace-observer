@@ -116,6 +116,19 @@ def test_ppo_with_tokenspeed_rollout_on_cpu(tmp_path, load_in_perfetto):
     assert len(requests) == generates_in_step.n[0] == TRAIN_BATCH_SIZE * ROLLOUT_N
     assert (requests.caller == requests.server).all() and requests.caller.nunique() == len(requests)
     assert (requests.caller_process != requests.server_process).all()
+    # Both ends of a request agree on the weights it was generated with.
+    versions = processor.query(
+        """
+        select extract_arg(o.arg_set_id, 'args.weight_version') as caller,
+               extract_arg(i.arg_set_id, 'args.weight_version') as server,
+               extract_arg(o.arg_set_id, 'args.batch_step') as batch_step
+        from flow f join slice o on f.slice_out = o.id join slice i on f.slice_in = i.id
+        where o.name = 'rollout_request' and i.name = 'tokenspeed_generate'
+        """
+    ).as_pandas_dataframe()
+    # The synchronous trainer generates step n's batch with the weights it synced after step n - 1.
+    assert (versions.caller == versions.server).all() and set(versions.caller) == {STEPS - 1}
+    assert set(versions.batch_step) == {STEPS}
     # ...and continues through the first and last forward that served it on the server's scheduler.
     hops = processor.query(
         """

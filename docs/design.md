@@ -175,7 +175,7 @@ clock_snapshot_id
 
 - `TraceContext` 是可 JSON 序列化的 frozen dataclass，包含上述字段（`clock_snapshot_id` 暂由进程记录的 clock snapshot 代替）；`from_json` 拒绝其他 schema 版本。
 - `run_id`：优先取 `RL_TRACE_RUN_ID`；否则取 Ray `get_session_name()` 与 `get_job_id()`，即 `<session_name>-job-<job_id>`。同一训练 job 的所有 Ray 进程天然一致，无需额外传播；只有 job id 时不同集群会重复（都从 `01000000` 开始），所以带上 session 名。非 Ray 进程（如 P2 的 TokenSpeed server）需显式传入。
-- `global_step`：Torch/VizTracer 在登记时写入（VERL `profile_step`）；RL-Insight span 不带 step，因此 driver 在 VERL v1 trainer 的 `PPOTrainer.step` 外包一层（模块导入时通过 post-import hook 打补丁，不在插件加载时导入重量级模块），每个 step 在 `trainer` lane 上记录一个 `global_step` span（args 含 `global_step`、`run_id` 与标记属性 `rl_trace_observer.step_marker`，与用户同名 span 区分），作为该 profile session 的时间窗口。异步 trainer 中下一步的 generation 可能与当前 step 重叠，精确归属留给 P6 request-level。
+- `global_step`：Torch/VizTracer 在登记时写入（VERL `profile_step`）；RL-Insight span 不带 step，因此 driver 在 VERL v1 trainer 的 `PPOTrainer.step` 外包一层（模块导入时通过 post-import hook 打补丁，不在插件加载时导入重量级模块），每个 step 在 `trainer` lane 上记录一个 `global_step` span（args 含 `global_step`、`run_id` 与标记属性 `rl_trace_observer.step_marker`，与用户同名 span 区分），作为该 profile session 的时间窗口。异步 trainer 中下一步的 generation 可能与当前 step 重叠：one-step-off 下每次生成记录为 `rollout_batch` span，标明由哪个 step 请求、由哪个 step 训练（P6-d）。
 - `role`：进程级 role 目前只有 trainer（记录 `global_step` 的进程）；artifact 级 role 在登记时写入（Torch 为 VERL 的 `save_file_prefix` 与 role，如 `actor_train`；VizTracer 为 observer 的 role），未登记 role 的 artifact 取所属进程的 role。
 
 ### 6.5 Artifact manifest
@@ -389,7 +389,7 @@ manifest
 - [x] 接收侧：server actor 的 `tokenspeed_generate` span 带同一个 `request_id`；merger 把带 `rl_trace_observer.request_flow` 标记的 span 按 request ID、按时间连成一条跨进程 flow，flow ID 自成命名空间（P6-a）；
 - [x] 将 request ID 加入 RL-Insight labels；
 - [x] TokenSpeed scheduler 迭代记录 request ID（fork：profile 期间每次 forward 在 `tokenspeed::forward` 线程上记录一个带 `request_ids` 的 `forward_batch` slice，kernel scope 嵌套其中），flow 延伸到一个 rank 上的 prefill / 最后一次 forward，可选逐 forward（P6-b）；
-- [ ] 请求的权重版本与消费它的训练 step（P6-d）；
+- [x] 请求的权重版本与消费它的训练 step（P6-d）：`rollout_request` 记录 VERL 输出上的 `weight_version`（及 partial rollout 下的 min/max）和 trajectory（`batch_step`、`sample_index`、`rollout_n`），`tokenspeed_generate` 记录 server 开始时的 `weight_version`；one-step-off 下每次生成是一个 `rollout_batch` span（`batch_step`、`requested_during_step`、`consumed_by_step`），同步 trainer 中一个 step 训练自己生成的 batch；
 - [ ] 验证 flow 可继续连接 TokenSpeed Proton kernel。
 
 完成标准：可以从一个 actor rollout 请求跟踪到目标 replica 和相关 kernel。

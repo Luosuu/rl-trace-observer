@@ -11,13 +11,21 @@ timeline, with:
 
 - ``request_id``: the id the server was sent;
 - ``trajectory_id``: the agent loop's id, shared by the turns of a trajectory;
-- ``server_id``: the server the call went to.
+- ``server_id``: the server the call went to;
+- ``weight_version``: the weights it was generated with, as VERL tags its output
+  (``global_steps`` of the last weight update the server received), with
+  ``min_weight_version`` and ``max_weight_version`` when they differ (weights
+  updated during a partial rollout);
+- ``batch_step``, ``sample_index``, ``rollout_n``, ``validate``: the trajectory,
+  as VERL's agent loop knows it (``batch_step`` is the trainer's
+  ``global_steps`` when it asked for the batch; see ``steps`` for which step
+  trains on it).
 
 The span is marked as a point on the request's path, like the server's span
 for it, so the merger links them with one flow.
 
-VERL's client lives in a heavy module that the plugin must not import itself,
-so the patch is applied when VERL imports it.
+VERL's client and agent loop live in heavy modules that the plugin must not
+import itself, so the patches are applied when VERL imports them.
 """
 
 import contextvars
@@ -33,11 +41,20 @@ from rl_trace_observer.integrations.verl.import_hook import require, when_import
 logger = logging.getLogger(__name__)
 
 MANAGER_MODULE = "verl.workers.rollout.llm_server"
+AGENT_LOOP_MODULE = "verl.experimental.agent_loop.agent_loop"
 SPAN_NAME = "rollout_request"
 _PATCHED = "_rl_trace_observer_records_requests"
 
 # What the call in progress learned: the server's request id and the server.
 _CALL: contextvars.ContextVar[dict | None] = contextvars.ContextVar("rl_trace_observer_request", default=None)
+# The trajectory VERL's agent loop is running (its ``trajectory`` argument).
+_TRAJECTORY: contextvars.ContextVar[dict | None] = contextvars.ContextVar("rl_trace_observer_trajectory", default=None)
+_TRAJECTORY_FIELDS = {
+    "step": "batch_step",
+    "sample_index": "sample_index",
+    "rollout_n": "rollout_n",
+    "validate": "validate",
+}
 # Concurrent calls get their own lanes, so their spans never overlap.
 _busy_slots: set[int] = set()
 _slots_lock = threading.Lock()
@@ -55,6 +72,11 @@ def _release_slot(slot: int) -> None:
         _busy_slots.discard(slot)
 
 
+def _plain(value):
+    """A JSON-friendly scalar (VERL passes numpy integers)."""
+    return value.item() if hasattr(value, "item") else value
+
+
 def _emit(start_time_ns: int, call: dict, trajectory_id: object, slot: int) -> None:
     from verl.utils.tracking import RLInsightLogger
 
@@ -68,6 +90,15 @@ def _emit(start_time_ns: int, call: dict, trajectory_id: object, slot: int) -> N
     }
     if call.get("server_id") is not None:
         attributes["server_id"] = str(call["server_id"])
+    extra = getattr(call.get("output"), "extra_fields", None) or {}
+    if extra.get("global_steps") is not None:
+        attributes["weight_version"] = _plain(extra["global_steps"])
+    versions = {_plain(extra.get(key)) for key in ("min_global_steps", "max_global_steps")} - {None}
+    if len(versions) > 1:
+        attributes["min_weight_version"], attributes["max_weight_version"] = min(versions), max(versions)
+    for key, attribute in _TRAJECTORY_FIELDS.items():
+        if (value := (call.get("trajectory") or {}).get(key)) is not None:
+            attributes[attribute] = _plain(value)
     RLInsightLogger.trace_span(
         SPAN_NAME, start_time_ns=start_time_ns, end_time_ns=time.time_ns(), attributes=attributes
     )
@@ -100,11 +131,12 @@ def patch_server_client(module: ModuleType) -> bool:
 
     @functools.wraps(original)
     async def generate(self, request_id, *args, **kwargs):
-        call: dict = {}
+        call: dict = {"trajectory": _TRAJECTORY.get()}
         token = _CALL.set(call)
         start_time_ns, slot = time.time_ns(), _take_slot()
         try:
-            return await original(self, request_id, *args, **kwargs)
+            call["output"] = await original(self, request_id, *args, **kwargs)
+            return call["output"]
         finally:
             _CALL.reset(token)
             _release_slot(slot)
@@ -120,5 +152,28 @@ def patch_server_client(module: ModuleType) -> bool:
     return True
 
 
+def patch_agent_loop(module: ModuleType) -> bool:
+    """Wrap ``module.AgentLoopWorker._run_agent_loop`` to expose its trajectory; ``False`` if already wrapped."""
+    require(module, "AgentLoopWorker")
+    worker_class = module.AgentLoopWorker
+    require(worker_class, "_run_agent_loop")
+    original = worker_class._run_agent_loop
+    if getattr(original, _PATCHED, False):
+        return False
+
+    @functools.wraps(original)
+    async def _run_agent_loop(self, sampling_params, trajectory, *args, **kwargs):
+        token = _TRAJECTORY.set(trajectory if isinstance(trajectory, dict) else None)
+        try:
+            return await original(self, sampling_params, trajectory, *args, **kwargs)
+        finally:
+            _TRAJECTORY.reset(token)
+
+    setattr(_run_agent_loop, _PATCHED, True)
+    worker_class._run_agent_loop = _run_agent_loop
+    return True
+
+
 def install() -> None:
     when_imported(MANAGER_MODULE, patch_server_client)
+    when_imported(AGENT_LOOP_MODULE, patch_agent_loop)

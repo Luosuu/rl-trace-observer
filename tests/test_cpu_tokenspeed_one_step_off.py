@@ -11,6 +11,7 @@ update and the generation that ran beside it.
 
 import json
 import sys
+from collections import Counter
 
 from cpu_ppo.assets import build_assets
 from test_cpu_ppo import ROLLOUT_N, TESTS_DIR, TRAIN_BATCH_SIZE, failure_report, rl_insight_spans
@@ -86,6 +87,22 @@ def test_one_step_off_policy_with_standalone_tokenspeed_on_cpu(tmp_path):
 
     # Step 2 generates the batch of step 3 beside its own actor update.
     spans = rl_insight_spans(output_dir)
+    # Each generation says which step trains on it: the batch asked for before step 1, then one per step but the last.
+    batches = sorted((s["args"] for s in spans if s["name"] == "rollout_batch"), key=lambda b: b["consumed_by_step"])
+    assert [(b["batch_step"], b.get("requested_during_step"), b["consumed_by_step"]) for b in batches] == [
+        (1, None, 1),
+        *((step, step, step + 1) for step in range(1, STEPS)),
+    ]
+    # A request carries the weights it was generated with: the batch of step n + 1 is generated during
+    # step n with the weights VERL synced in step n (global_steps n); the first batch, with those of step 0.
+    requests = [s["args"] for s in spans if s["name"] == "rollout_request"]
+    per_batch = TRAIN_BATCH_SIZE * ROLLOUT_N
+    assert Counter((r["batch_step"], r["weight_version"]) for r in requests) == {
+        (1, 0): per_batch,
+        **{(step, step): per_batch for step in range(1, STEPS)},
+    }
+    served = {s["args"]["request_id"]: s["args"]["weight_version"] for s in spans if s["name"] == "tokenspeed_generate"}
+    assert all(served[r["request_id"]] == r["weight_version"] for r in requests)
     [window] = [s for s in spans if s["name"] == "global_step" and s["args"].get("global_step") == PROFILED_STEP]
     start, end = window["ts"], window["ts"] + window["dur"]
     generates = [s for s in spans if s["name"] == "tokenspeed_generate" and start <= s["ts"] < end]

@@ -283,6 +283,25 @@ Perfetto shows where it went:
   forward instead. To find all forwards of a request, query
   `forward_batch` slices by their `args.request_ids`.
 
+Requests also say which weights generated them and which step trains on them:
+
+- `rollout_request` carries `weight_version` (VERL's tag on the output: the
+  `global_steps` of the last weight update the server received; with
+  `min_weight_version`/`max_weight_version` if weights changed during a partial
+  rollout), and the trajectory: `batch_step` (the trainer's `global_steps` when
+  it asked for the batch), `sample_index`, `rollout_n`, `validate`.
+  `tokenspeed_generate` carries the server's `weight_version` at the start (and
+  `weight_version_end` if an update arrived meanwhile).
+- In VERL's synchronous trainer a step generates and trains on its own batch,
+  with the weights synced after the previous step (`weight_version` = step - 1).
+- With the one-step-off-policy trainer, each generation is a `rollout_batch`
+  span on the trainer's `trainer/rollout` lane with `batch_step`,
+  `requested_during_step` (absent for the batch asked for before step 1) and
+  `consumed_by_step`: the first batch trains in step 1, the one asked for in
+  step n trains in step n + 1. A request's staleness is
+  `consumed_by_step - weight_version` of its batch, which its `batch_step` and
+  time window identify.
+
 Any RL-Insight span with the attributes `request_id` and
 `rl_trace_observer.request_flow=True` is a point on its request's path; the
 merger links a request's points in time order and gives these flows ids of

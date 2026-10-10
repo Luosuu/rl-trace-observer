@@ -102,3 +102,56 @@ def test_a_missing_manager_method_fails_clearly():
     module = types.SimpleNamespace(LLMServerClient=type("LLMServerClient", (), {"generate": None}))
     with pytest.raises(RuntimeError, match="supports verl 0.9.1.*_vllm_request_id"):
         requests.patch_server_client(module)
+
+
+def test_the_span_records_the_weights_and_the_trajectory_of_the_request(spans):
+    module = _module()
+
+    async def generate(self, request_id, **kwargs):
+        self._vllm_request_id(request_id)
+        # VERL's client tags the output with the weights it was generated with.
+        return types.SimpleNamespace(extra_fields={"global_steps": 4, "min_global_steps": 3, "max_global_steps": 4})
+
+    module.LLMServerClient.generate = generate
+    requests.patch_server_client(module)
+    client = module.LLMServerClient()
+
+    class AgentLoopWorker:
+        async def _run_agent_loop(self, sampling_params, trajectory, *, agent_name="single_turn", **kwargs):
+            return await client.generate("traj", prompt_ids=[], sampling_params=sampling_params)
+
+    agent_loop = types.SimpleNamespace(AgentLoopWorker=AgentLoopWorker)
+    assert requests.patch_agent_loop(agent_loop) is True
+    assert requests.patch_agent_loop(agent_loop) is False
+
+    import numpy as np
+
+    trajectory = {"step": np.int64(5), "sample_index": np.int64(17), "rollout_n": 2, "validate": False}
+    asyncio.run(AgentLoopWorker()._run_agent_loop({}, trajectory=trajectory))
+
+    [(_, kwargs)] = spans
+    attributes = kwargs["attributes"]
+    assert (attributes["weight_version"], attributes["min_weight_version"], attributes["max_weight_version"]) == (
+        4,
+        3,
+        4,
+    )
+    assert (attributes["batch_step"], attributes["sample_index"], attributes["rollout_n"]) == (5, 17, 2)
+    assert attributes["validate"] is False
+    assert type(attributes["batch_step"]) is int, "numpy scalars must be plain for the JSON trace"
+
+
+def test_one_weight_version_is_not_repeated(spans):
+    module = _module()
+
+    async def generate(self, request_id, **kwargs):
+        self._vllm_request_id(request_id)
+        return types.SimpleNamespace(extra_fields={"global_steps": 4, "min_global_steps": 4, "max_global_steps": 4})
+
+    module.LLMServerClient.generate = generate
+    requests.patch_server_client(module)
+    asyncio.run(module.LLMServerClient().generate("traj", prompt_ids=[], sampling_params={}))
+
+    [(_, kwargs)] = spans
+    assert kwargs["attributes"]["weight_version"] == 4
+    assert "min_weight_version" not in kwargs["attributes"] and "batch_step" not in kwargs["attributes"]
