@@ -38,3 +38,19 @@
 此前的 trace 中，CUDA graph 下 TP0 的 516 次 forward 只有 2 次（eager prefill）有到 Proton 的 scope flow：回放 graph 不执行 Python，没有 scope，decode 请求因此连不到 kernel。fork 给 graph 回放加上 scope 后，decode 请求也能连到 kernel。
 
 其余检查：E0 的 34 项检查（含 `request_id_passes_through`）全部通过；第 3、4 步的 `--strict` 合并没有问题，每步选中 27 个产物；fork 的单元测试在 GPU 上全部通过。
+
+## P6-d：请求的权重版本与消费它的训练 step
+
+8×H100，job `rl-trace-p6d-20261009-230600-06e7462`（commit `06e7462`），one-step-off E2：actor 用 4 张卡，2 个 standalone replica × TP=2，第 3、4 步 profile。
+
+| | step 3 | step 4 |
+|---|---|---|
+| 请求数 | 128 | 128 |
+| 带权重版本的请求 | 128 | 128 |
+| 两端权重版本不一致 | 0 | 0 |
+| 请求按 (batch_step, weight_version) | 3/3：128 | 4/4：128 |
+| 该步窗口内的 `rollout_batch` | 第 3 步请求，第 4 步训练 | 第 4 步请求，第 5 步训练 |
+
+第 n 步请求的 batch 用第 n 步同步的权重（版本 n）生成，由第 n+1 步训练，staleness 为 1。请求的跟踪链路（agent loop → server → forward → kernel）的检查也全部通过。
+
+CPU 端到端测试覆盖了完整序列：第 1 步之前请求的 batch 用版本 0 的权重、在第 1 步训练；其后第 n 步请求的 batch 在第 n+1 步训练。同步 trainer 中，一个 step 训练自己生成的 batch，权重版本为 step − 1。
