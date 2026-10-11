@@ -389,7 +389,7 @@ manifest
 - [x] 接收侧：server actor 的 `tokenspeed_generate` span 带同一个 `request_id`；merger 把带 `rl_trace_observer.request_flow` 标记的 span 按 request ID、按时间连成一条跨进程 flow，flow ID 自成命名空间（P6-a）；
 - [x] 将 request ID 加入 RL-Insight labels；
 - [x] TokenSpeed scheduler 迭代记录 request ID（fork：profile 期间每次 forward 在 `tokenspeed::forward` 线程上记录一个带 `request_ids` 的 `forward_batch` slice，kernel scope 嵌套其中），flow 延伸到一个 rank 上的 prefill / 最后一次 forward，可选逐 forward（P6-b）；
-- [x] 请求的权重版本与消费它的训练 step（P6-d）：`rollout_request` 记录 VERL 输出上的 `weight_version`（及 partial rollout 下的 min/max）和 trajectory（`batch_step`、`sample_index`、`rollout_n`），`tokenspeed_generate` 记录 server 开始时的 `weight_version`；one-step-off 下每次生成是一个 `rollout_batch` span（`batch_step`、`requested_during_step`、`consumed_by_step`），同步 trainer 中一个 step 训练自己生成的 batch；
+- [x] 请求的权重版本与消费它的训练 step（P6-d）：`rollout_request` 记录 VERL 输出上的 `weight_version`（及 partial rollout 下的 min/max）和 trajectory（`batch_step`、`sample_index`、`rollout_n`），`tokenspeed_generate` 记录 server 开始时的 `weight_version`；one-step-off 下每次生成是一个 `rollout_batch` span（`batch_step`、`requested_during_step`、`consumed_by_step`），同步 trainer 中一个 step 训练自己生成的 batch；每次权重更新（`CheckpointEngineManager.update_weights(global_steps)`）是 trainer 上 `trainer/weights` lane 的 `weight_update` span，merger 将其转为 trainer 进程上的 `rollout weight_version` counter track，单 step trace 会把窗口开始前最后一次更新带入窗口起点；
 - [ ] 验证 flow 可继续连接 TokenSpeed Proton kernel。
 
 完成标准：可以从一个 actor rollout 请求跟踪到目标 replica 和相关 kernel。

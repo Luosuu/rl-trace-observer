@@ -103,6 +103,9 @@ def test_one_step_off_policy_with_standalone_tokenspeed_on_cpu(tmp_path):
     }
     served = {s["args"]["request_id"]: s["args"]["weight_version"] for s in spans if s["name"] == "tokenspeed_generate"}
     assert all(served[r["request_id"]] == r["weight_version"] for r in requests)
+    # One weight update after loading the model and one in every step, each to that step's version.
+    synced = [s["args"]["weight_version"] for s in spans if s["name"] == "weight_update"]
+    assert synced == list(range(STEPS + 1))
     [window] = [s for s in spans if s["name"] == "global_step" and s["args"].get("global_step") == PROFILED_STEP]
     start, end = window["ts"], window["ts"] + window["dur"]
     generates = [s for s in spans if s["name"] == "tokenspeed_generate" and start <= s["ts"] < end]
@@ -123,3 +126,7 @@ def test_one_step_off_policy_with_standalone_tokenspeed_on_cpu(tmp_path):
         assert sorted((a["role"], a["kind"]) for a in tokenspeed) == [
             (f"rollout_replica{r}", kind) for r in range(ROLLOUT_GPUS) for kind in kinds
         ]
+        # The step starts on the weights synced in step n - 1 and syncs version n.
+        events = json.loads(merged.read_text())["traceEvents"]
+        counter = sorted((e["ts"], e["args"]["weight_version"]) for e in events if e["ph"] == "C")
+        assert [version for _, version in counter] == [step - 1, step]

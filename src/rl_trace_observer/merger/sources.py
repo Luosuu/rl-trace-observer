@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from rl_trace_observer.context import WEIGHT_UPDATE_ATTRIBUTE, WEIGHT_VERSION_ATTRIBUTE
+
 logger = logging.getLogger(__name__)
 
 RL_INSIGHT = "rl_insight"
@@ -83,6 +85,24 @@ class TraceSource:
     # VizTracer report and Proton trace that rank wrote in one profile.
     rank_tag: str | None = None
     pair: str | None = None
+
+
+# Set on the copy of a weight update that carries the servers' weights into a
+# step window that starts after it (see ``manifest.select``).
+CARRIED_WEIGHT_UPDATE = "rl_trace_observer.carried"
+
+
+def weight_update_version(event: dict[str, Any]) -> int | None:
+    """The version of a span marked as a weight update of the rollout servers, else ``None``."""
+    args = event.get("args")
+    if event.get("ph") != "X" or not isinstance(args, dict) or "ts" not in event:
+        return None
+    if args.get(WEIGHT_UPDATE_ATTRIBUTE) not in (True, 1, "1", "true", "True"):
+        return None
+    try:
+        return int(args[WEIGHT_VERSION_ATTRIBUTE])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
 
 
 def classify(path: Path) -> str | None:

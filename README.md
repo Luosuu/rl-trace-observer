@@ -301,6 +301,17 @@ Requests also say which weights generated them and which step trains on them:
   step n trains in step n + 1. A request's staleness is
   `consumed_by_step - weight_version` of its batch, which its `batch_step` and
   time window identify.
+- Every weight update of the rollout servers is a `weight_update` span on the
+  trainer's `trainer/weights` lane with the `weight_version` it installs, and
+  the merged trace has a `rollout weight_version` counter track on the trainer
+  process that steps up when each update ends. A step's trace starts the
+  counter at the weights the servers held when the step began, so the
+  timeline shows which weights were serving at any moment; the per-request
+  values are in the slices' arguments (select a `rollout_request` or
+  `tokenspeed_generate` slice).
+
+Any RL-Insight span with the attributes `weight_version` and
+`rl_trace_observer.weight_update=True` sets that counter when it ends.
 
 Any RL-Insight span with the attributes `request_id` and
 `rl_trace_observer.request_flow=True` is a point on its request's path; the

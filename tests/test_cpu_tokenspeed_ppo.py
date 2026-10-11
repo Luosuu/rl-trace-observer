@@ -129,6 +129,17 @@ def test_ppo_with_tokenspeed_rollout_on_cpu(tmp_path, load_in_perfetto):
     # The synchronous trainer generates step n's batch with the weights it synced after step n - 1.
     assert (versions.caller == versions.server).all() and set(versions.caller) == {STEPS - 1}
     assert set(versions.batch_step) == {STEPS}
+    # The trainer's weight version counter: the step starts on the weights synced after step n - 1
+    # and syncs its own at its end.
+    counter = processor.query(
+        """
+        select c.value from counter c join process_counter_track t on c.track_id = t.id
+        where t.name = 'rollout weight_version' order by c.ts
+        """
+    ).as_pandas_dataframe()
+    assert list(counter.value) == [STEPS - 1, STEPS]
+    synced = [s["args"]["weight_version"] for s in rl_insight_spans(output_dir) if s["name"] == "weight_update"]
+    assert synced == list(range(STEPS + 1))
     # ...and continues through the first and last forward that served it on the server's scheduler.
     hops = processor.query(
         """

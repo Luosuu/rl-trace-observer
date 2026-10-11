@@ -13,8 +13,10 @@ step), counts how far its request flow reaches:
 
 Also checks that no request flow passes through a forward that does not list
 its request, and (P6-d) that every request carries the weights it was
-generated with, the same at both ends; summarizes requests by batch and weight
-version, and the one-step-off ``rollout_batch`` spans. Prints and writes a summary; exits non-zero if a check fails.
+generated with, the same at both ends, and that the trainer's ``rollout
+weight_version`` counter shows those weights during the step; summarizes requests
+by batch and weight version, the counter, and the one-step-off
+``rollout_batch`` spans. Prints and writes a summary; exits non-zero if a check fails.
 """
 
 import argparse
@@ -131,6 +133,12 @@ def main() -> int:
         from slice where name = 'rollout_batch'
         """
     )
+    counter = query(
+        """
+        select c.value from counter c join process_counter_track t on c.track_id = t.id
+        where t.name = 'rollout weight_version' order by c.ts
+        """
+    )
     summary = {
         "requests": len(generates),
         "linked_from_agent_loop": len(callers),
@@ -147,6 +155,7 @@ def main() -> int:
                 Counter((w.get("batch_step"), w["tokenspeed_generate"]) for w in versioned).items(), key=str
             )
         },
+        "weight_version_counter": [_plain(v) for v in counter.value],
         "rollout_batches": [
             {"batch_step": _plain(b), "requested_during_step": _plain(r), "consumed_by_step": _plain(c)}
             for b, r, c in zip(batches.batch_step, batches.requested_during_step, batches.consumed_by_step, strict=True)
@@ -159,6 +168,9 @@ def main() -> int:
         "every_request_has_its_weight_version": len(versioned) == summary["requests"],
         "both_ends_agree_on_the_weights": summary["weight_versions_disagreeing"] == 0,
         "some_request_reaches_kernels": summary["first_forward_reaches_kernels"] > 0,
+        # The servers held the weights of the step's requests at some point of the step.
+        "the_counter_shows_the_requests_weights": {w["tokenspeed_generate"] for w in versioned}
+        <= set(summary["weight_version_counter"]),
     }
     summary["checks"] = checks
     print(json.dumps(summary, indent=2))

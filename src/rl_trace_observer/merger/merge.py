@@ -26,6 +26,10 @@ Kineto also emits device indices and strings such as ``"Spans"`` as pids.
   (``forward_batch`` slices listing their requests): by default its first
   (prefill) and last forward, on one scheduler rank. Their ids form a
   namespace of their own.
+* Each weight update of the rollout servers (a span marked with
+  ``WEIGHT_UPDATE_ATTRIBUTE``) also sets the ``rollout weight_version``
+  counter of its process when it ends; a copy carried into a step window (see
+  ``manifest.select``) only sets the counter.
 """
 
 import itertools
@@ -37,7 +41,16 @@ from typing import Any
 from rl_trace_observer.context import REQUEST_FLOW_ATTRIBUTE, REQUEST_ID_ATTRIBUTE
 
 from .manifest import Process
-from .sources import RL_INSIGHT, TOKENSPEED_PROTON, TOKENSPEED_VIZTRACER, TORCH, VIZTRACER, TraceSource
+from .sources import (
+    CARRIED_WEIGHT_UPDATE,
+    RL_INSIGHT,
+    TOKENSPEED_PROTON,
+    TOKENSPEED_VIZTRACER,
+    TORCH,
+    VIZTRACER,
+    TraceSource,
+    weight_update_version,
+)
 
 _KIND_ORDER = {RL_INSIGHT: 0, TORCH: 1, VIZTRACER: 2, TOKENSPEED_VIZTRACER: 3, TOKENSPEED_PROTON: 4}
 _KIND_LABEL = {
@@ -62,6 +75,8 @@ _REQUEST_FLOW_CATEGORY = "rl_trace_observer.request"
 # The slice our TokenSpeed fork records around each forward, listing its requests.
 _FORWARD_BATCH_NAME = "forward_batch"
 _FORWARD_BATCH_CATEGORY = "tokenspeed.requests"
+# Perfetto names a JSON counter track "<name> <arg>": "rollout weight_version".
+_WEIGHT_COUNTER_NAME = "rollout"
 
 
 class EmptyTraceError(ValueError):
@@ -380,6 +395,12 @@ def merge_sources(
             merged["ts"] = round(offset_us + float(event["ts"]), 3)
             if event.get("ph") in _ID_PHASES and "id" in event:
                 merged["id"] = remapper.flow_id(event)
+            if (version := weight_update_version(event)) is not None:
+                counter = {"name": _WEIGHT_COUNTER_NAME, "ph": "C", "pid": merged["pid"], "tid": merged["tid"]}
+                counter.update(ts=round(merged["ts"] + float(event.get("dur", 0)), 3), args={"weight_version": version})
+                events.append(counter)
+                if event["args"].get(CARRIED_WEIGHT_UPDATE):
+                    continue
             events.append(merged)
         if dropped:
             warnings.append(f"{source.path.name}: dropped {dropped} events without a timestamp or with negative dur")
