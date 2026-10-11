@@ -54,3 +54,14 @@
 第 n 步请求的 batch 用第 n 步同步的权重（版本 n）生成，由第 n+1 步训练，staleness 为 1。请求的跟踪链路（agent loop → server → forward → kernel）的检查也全部通过。
 
 CPU 端到端测试覆盖了完整序列：第 1 步之前请求的 batch 用版本 0 的权重、在第 1 步训练；其后第 n 步请求的 batch 在第 n+1 步训练。同步 trainer 中，一个 step 训练自己生成的 batch，权重版本为 step − 1。
+
+### 权重版本 counter track
+
+8×H100，job `rl-trace-p6d-counter-20261011-101626-bce1ae8`（commit `bce1ae8`），配置同上。每次 `CheckpointEngineManager.update_weights` 记录为 trainer 上 `trainer/weights` lane 的 `weight_update` span，合并后成为 trainer 进程上的 `rollout weight_version` counter track。
+
+| | step 3 | step 4 |
+|---|---|---|
+| counter 取值（按时间） | 2 → 3 | 3 → 4 |
+| 请求的权重版本 | 3 | 4 |
+
+窗口开始时 server 持有上一步同步的权重（n−1）；第 n 步中途同步到版本 n，随后生成的下一 batch 的请求都是版本 n。其余检查（链路、两端版本一致）全部通过。同步 trainer 在 `step()` 返回后才同步权重，因此单步 trace 中 counter 全程为 n−1（CPU 端到端测试覆盖）。
