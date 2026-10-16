@@ -14,7 +14,7 @@ def _write(tmp_path):
     offset = 2.0  # write_tokenspeed_pair's Proton anchor offset, µs
     # The fixture's flash_attn_kernel runs at 20-26 µs on lane 0.
     kernels = [
-        ("nested_kernel", 21.0, 1.0),  # inside flash_attn_kernel
+        ("nested_kernel", 21.0, 1.0),  # inside flash_attn_kernel: nests
         ("rmsnorm_kernel", 25.0, 3.0),  # starts 1 µs before flash_attn_kernel ends
         ("next_kernel", 27.0, 2.0),  # after flash_attn_kernel: back on the stream
     ]
@@ -48,7 +48,7 @@ def test_overlapping_kernels_get_overlap_lanes_with_their_launch_flows(tmp_path,
     assert dict(zip(lanes.name, lanes.thread, strict=True)) == {
         "flash_attn_kernel": "Proton · GPU Stream 7",
         "next_kernel": "Proton · GPU Stream 7",
-        "nested_kernel": "Proton · GPU Stream 7 · overlap",
+        "nested_kernel": "Proton · GPU Stream 7",
         "rmsnorm_kernel": "Proton · GPU Stream 7 · overlap",
     }
     # Every launch still ends on its own kernel.
@@ -77,6 +77,8 @@ def test_overlapping_kernels_on_a_kineto_stream_get_an_overlap_lane(tmp_path):
     trace = json.loads(gzip.open(path, "rt").read())
     trace["traceEvents"] += [
         {"ph": "M", "name": "thread_name", "pid": 0, "tid": 7, "args": {"name": "stream 7 "}},
+        # Kineto's range of a user annotation around the kernels it ran stays their parent.
+        {"ph": "X", "name": "ProfilerStep#1", "cat": "gpu_user_annotation", "pid": 0, "tid": 7, "ts": 1.5, "dur": 5.0},
         # A split-K GEMM's reduce starts before the GEMM ends.
         {"ph": "X", "name": "splitk_reduce", "pid": 0, "tid": 7, "ts": 2.5, "dur": 1.0},
     ]
@@ -86,4 +88,8 @@ def test_overlapping_kernels_on_a_kineto_stream_get_an_overlap_lane(tmp_path):
     events = merge_sources([read_source("torch", path)]).trace["traceEvents"]
     threads = {e["tid"]: e["args"]["name"] for e in events if e.get("name") == "thread_name"}
     lanes = {e["name"]: threads[e["tid"]] for e in events if e.get("ph") == "X" and e["name"] != "actor_update"}
-    assert lanes == {"gemm": "Torch · stream 7 ", "splitk_reduce": "Torch · stream 7 · overlap"}
+    assert lanes == {
+        "ProfilerStep#1": "Torch · stream 7 ",
+        "gemm": "Torch · stream 7 ",
+        "splitk_reduce": "Torch · stream 7 · overlap",
+    }

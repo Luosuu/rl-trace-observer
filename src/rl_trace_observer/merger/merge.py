@@ -29,9 +29,9 @@ Kineto also emits device indices and strings such as ``"Spans"`` as pids.
 * Kernels on one GPU stream (Proton's or Kineto's) can overlap by a few microseconds (a
   kernel launched with programmatic dependent launch starts while the
   previous one finishes), and overlapping slices cannot nest on one track.
-  A kernel that starts before the previous one on its lane ends moves to an
-  overlap lane of its stream (``GPU Stream 7 · overlap``), with the flows
-  that end on it; timestamps are unchanged.
+  A kernel that starts inside a slice on its lane and ends after it moves to
+  an overlap lane of its stream (``GPU Stream 7 · overlap``), with the flows
+  that end on it; fully nested slices stay put, and timestamps are unchanged.
 * Each weight update of the rollout servers (a span marked with
   ``WEIGHT_UPDATE_ATTRIBUTE``) also sets the ``rollout weight_version``
   counter of its process when it ends; a copy carried into a step window (see
@@ -297,11 +297,23 @@ def _link_scope_flows(sources: list[TraceSource]) -> dict[int, list[dict[str, An
     return ends
 
 
-def _split_overlapping_kernels(source: TraceSource) -> TraceSource:
-    """Move each GPU kernel that overlaps the previous one on its lane to another lane of its stream.
+def _nests(open_ends: list[float], start: float, end: float) -> bool:
+    """Whether a slice from ``start`` to ``end`` nests in a lane whose open slices end at ``open_ends``.
 
-    A kernel goes to the first lane of its stream whose last kernel has
-    ended; lane 0 is the stream itself. The flow events bound to a moved
+    Closes the open slices that ended by ``start``.
+    """
+    while open_ends and open_ends[-1] <= start:
+        open_ends.pop()
+    return not open_ends or end <= open_ends[-1]
+
+
+def _split_overlapping_kernels(source: TraceSource) -> TraceSource:
+    """Move each GPU kernel that partially overlaps a slice on its lane to another lane of its stream.
+
+    A slice goes to the first lane of its stream where it nests: after the
+    slices there have ended, or inside the innermost one still running (a
+    Kineto ``gpu_user_annotation`` range around its kernels stays a parent).
+    Lane 0 is the stream itself. The flow events bound to a moved
     kernel (same thread and start) move with it. Returns ``source`` itself
     when no kernel overlaps.
     """
@@ -324,18 +336,20 @@ def _split_overlapping_kernels(source: TraceSource) -> TraceSource:
     moved: dict[int, str] = {}  # id(kernel) -> its overlap lane's tid
     lanes_used: dict[tuple[str, str], int] = {}
     for stream, events in kernels.items():
-        lane_ends: list[float] = []
-        for event in sorted(events, key=lambda event: float(event["ts"])):
+        # Per lane, the ends of the slices still open, innermost last: a slice
+        # nests in a lane if it ends by the time the innermost open one does.
+        lanes: list[list[float]] = []
+        for event in sorted(events, key=lambda event: (float(event["ts"]), -float(event.get("dur", 0)))):
             start, end = float(event["ts"]), float(event["ts"]) + float(event.get("dur", 0))
-            lane = next((index for index, last in enumerate(lane_ends) if last <= start), len(lane_ends))
-            if lane == len(lane_ends):
-                lane_ends.append(end)
-            else:
-                lane_ends[lane] = end
+            lane = next((index for index, open_ends in enumerate(lanes) if _nests(open_ends, start, end)), None)
+            if lane is None:
+                lane = len(lanes)
+                lanes.append([])
+            lanes[lane].append(end)
             if lane:
                 moved[id(event)] = f"{stream[1]}{_OVERLAP_LANE_SUFFIX}{lane}"
-        if len(lane_ends) > 1:
-            lanes_used[stream] = len(lane_ends)
+        if len(lanes) > 1:
+            lanes_used[stream] = len(lanes)
     if not moved:
         return source
     # Flow events bind to the slice that starts at their timestamp on their thread.
