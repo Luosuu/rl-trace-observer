@@ -65,3 +65,9 @@ CPU 端到端测试覆盖了完整序列：第 1 步之前请求的 batch 用版
 | 请求的权重版本 | 3 | 4 |
 
 窗口开始时 server 持有上一步同步的权重（n−1）；第 n 步中途同步到版本 n，随后生成的下一 batch 的请求都是版本 n。其余检查（链路、两端版本一致）全部通过。同步 trainer 在 `step()` 返回后才同步权重，因此单步 trace 中 counter 全程为 n−1（CPU 端到端测试覆盖）。
+
+### Perfetto 导入无告警
+
+此前合并的 step trace 在 Perfetto 中有约 5.4 万条 `slice_spill_overlapping_complete_event`：同一 GPU stream 上约 17% 的 kernel 与前一个重叠 1–3 µs（programmatic dependent launch：FlashAttention 的 `prepare_varlen_num_blocks` → 主 kernel、flashinfer 的 lamport all-reduce → RMSNorm、采样 kernel、cuBLAS split-K），另有 3 条是 fork 的 `forward_batch` 与 VizTracer 记录的 `contextmanager.__exit__` 部分重叠。merger 现在把与本 lane 上 slice 部分重叠的 kernel 移到该 stream 的 overlap lane（完全嵌套的保留，例如 Kineto 的 `gpu_user_annotation`），launch flow 随之移动；fork 在 `device._forward` 中用 tracer 的 C `getts` 取时间戳。
+
+job `rl-trace-overlaps-20261016-150754-07cb998`（fork `3314732f`）：第 3、4 步 trace_processor 无 error/data_loss 统计，各约 5.4/5.8 万个 kernel 在 overlap lane 上；请求链路与权重版本检查全部通过。
