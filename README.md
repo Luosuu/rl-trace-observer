@@ -239,6 +239,15 @@ profile. Proton writes a timeline only with
 `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace`; its default tree output
 cannot be merged and is not picked up.
 
+Kernels on one GPU stream can overlap by a few microseconds: a kernel
+launched with programmatic dependent launch (FlashAttention, flashinfer's
+fused all-reduce, cuBLAS split-K) starts while the previous one finishes.
+Overlapping slices cannot nest on one Perfetto track, so the merger moves a
+kernel that starts before the previous one on its lane ends to an overlap
+lane of its stream (`Proton · GPU Stream 37 · overlap`, `Torch · stream 7 ·
+overlap`), together with the launch flow that ends on it. Timestamps are
+unchanged, and Perfetto has nothing to spill onto overflow tracks.
+
 Next to the trace, `rl-trace-merge` writes the session manifest
 (`<output>.manifest.json`, or `--manifest PATH`): every process, every artifact
 with its size, sha256, process and completeness, and the problems found:

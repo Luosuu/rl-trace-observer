@@ -26,6 +26,12 @@ Kineto also emits device indices and strings such as ``"Spans"`` as pids.
   (``forward_batch`` slices listing their requests): by default its first
   (prefill) and last forward, on one scheduler rank. Their ids form a
   namespace of their own.
+* Kernels on one GPU stream (Proton's or Kineto's) can overlap by a few microseconds (a
+  kernel launched with programmatic dependent launch starts while the
+  previous one finishes), and overlapping slices cannot nest on one track.
+  A kernel that starts before the previous one on its lane ends moves to an
+  overlap lane of its stream (``GPU Stream 7 · overlap``), with the flows
+  that end on it; timestamps are unchanged.
 * Each weight update of the rollout servers (a span marked with
   ``WEIGHT_UPDATE_ATTRIBUTE``) also sets the ``rollout weight_version``
   counter of its process when it ends; a copy carried into a step window (see
@@ -75,6 +81,10 @@ _REQUEST_FLOW_CATEGORY = "rl_trace_observer.request"
 # The slice our TokenSpeed fork records around each forward, listing its requests.
 _FORWARD_BATCH_NAME = "forward_batch"
 _FORWARD_BATCH_CATEGORY = "tokenspeed.requests"
+# How profilers name a GPU stream's thread: Proton "GPU Stream <n>", Kineto
+# "stream <n> ". Overlap lanes of a stream get tids of their own.
+_GPU_STREAM_PREFIXES = {TOKENSPEED_PROTON: "GPU Stream", TORCH: "stream "}
+_OVERLAP_LANE_SUFFIX = "~overlap"
 # Perfetto names a JSON counter track "<name> <arg>": "rollout weight_version".
 _WEIGHT_COUNTER_NAME = "rollout"
 
@@ -287,6 +297,76 @@ def _link_scope_flows(sources: list[TraceSource]) -> dict[int, list[dict[str, An
     return ends
 
 
+def _split_overlapping_kernels(source: TraceSource) -> TraceSource:
+    """Move each GPU kernel that overlaps the previous one on its lane to another lane of its stream.
+
+    A kernel goes to the first lane of its stream whose last kernel has
+    ended; lane 0 is the stream itself. The flow events bound to a moved
+    kernel (same thread and start) move with it. Returns ``source`` itself
+    when no kernel overlaps.
+    """
+    prefix = _GPU_STREAM_PREFIXES.get(source.kind)
+    if prefix is None:
+        return source
+    streams = {
+        (str(event.get("pid")), str(event.get("tid"))): event["args"]["name"]
+        for event in source.events
+        if event.get("ph") == "M"
+        and event.get("name") == "thread_name"
+        and str((event.get("args") or {}).get("name", "")).startswith(prefix)
+    }
+    if not streams:
+        return source
+    kernels: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for event in source.events:
+        if event.get("ph") == "X" and "ts" in event and (str(event.get("pid")), str(event.get("tid"))) in streams:
+            kernels[(str(event.get("pid")), str(event.get("tid")))].append(event)
+    moved: dict[int, str] = {}  # id(kernel) -> its overlap lane's tid
+    lanes_used: dict[tuple[str, str], int] = {}
+    for stream, events in kernels.items():
+        lane_ends: list[float] = []
+        for event in sorted(events, key=lambda event: float(event["ts"])):
+            start, end = float(event["ts"]), float(event["ts"]) + float(event.get("dur", 0))
+            lane = next((index for index, last in enumerate(lane_ends) if last <= start), len(lane_ends))
+            if lane == len(lane_ends):
+                lane_ends.append(end)
+            else:
+                lane_ends[lane] = end
+            if lane:
+                moved[id(event)] = f"{stream[1]}{_OVERLAP_LANE_SUFFIX}{lane}"
+        if len(lane_ends) > 1:
+            lanes_used[stream] = len(lane_ends)
+    if not moved:
+        return source
+    # Flow events bind to the slice that starts at their timestamp on their thread.
+    starts: dict[tuple[str, str, float], set[str]] = defaultdict(set)
+    for stream, events in kernels.items():
+        for event in events:
+            starts[(*stream, float(event["ts"]))].add(moved.get(id(event), stream[1]))
+    events = []
+    for event in source.events:
+        if id(event) in moved:
+            event = {**event, "tid": moved[id(event)]}
+        elif event.get("ph") in _FLOW_PHASES and "ts" in event:
+            lanes = starts.get((str(event.get("pid")), str(event.get("tid")), float(event["ts"])))
+            if lanes is not None and len(lanes) == 1 and (lane_tid := next(iter(lanes))) != str(event.get("tid")):
+                event = {**event, "tid": lane_tid}
+        events.append(event)
+    for (pid, tid), count in lanes_used.items():
+        for lane in range(1, count):
+            name = f"{streams[(pid, tid)].rstrip()} · overlap" + (f" {lane}" if lane > 1 else "")
+            events.append(
+                {
+                    "ph": "M",
+                    "name": "thread_name",
+                    "pid": pid,
+                    "tid": f"{tid}{_OVERLAP_LANE_SUFFIX}{lane}",
+                    "args": {"name": name},
+                }
+            )
+    return replace(source, events=events)
+
+
 def _request_point(event: dict[str, Any]) -> str | None:
     """The request id of a span marked as a point on a request's path, else ``None``."""
     args = event.get("args")
@@ -365,6 +445,7 @@ def merge_sources(
     served it instead of its first and last.
     """
     ordered = sorted(sources, key=lambda source: (_KIND_ORDER.get(source.kind, 99), source.title, str(source.path)))
+    ordered = [_split_overlapping_kernels(source) for source in ordered]
     scope_flow_ends = _link_scope_flows(ordered)
     request_flows = _link_request_flows(ordered, every_forward)
     starts = [_event_start_ns(source, event) for source in ordered for event in source.events]
