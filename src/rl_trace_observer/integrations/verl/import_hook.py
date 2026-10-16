@@ -11,16 +11,17 @@ from types import ModuleType
 
 
 class _PostImportLoader(importlib.abc.Loader):
-    def __init__(self, loader: importlib.abc.Loader, callback: Callable[[ModuleType], None]):
+    def __init__(self, loader: importlib.abc.Loader, callbacks: list[Callable[[ModuleType], None]]):
         self._loader = loader
-        self._callback = callback
+        self._callbacks = callbacks
 
     def create_module(self, spec):
         return self._loader.create_module(spec)
 
     def exec_module(self, module: ModuleType) -> None:
         self._loader.exec_module(module)
-        self._callback(module)
+        for callback in self._callbacks:
+            callback(module)
 
     def __getattr__(self, name: str):
         # get_source, get_filename, ...: tracebacks and inspect keep working.
@@ -28,11 +29,11 @@ class _PostImportLoader(importlib.abc.Loader):
 
 
 class _PostImportFinder(importlib.abc.MetaPathFinder):
-    """Run a callback right after one module is imported."""
+    """Run callbacks right after one module is imported, in the order they were added."""
 
-    def __init__(self, name: str, callback: Callable[[ModuleType], None]):
+    def __init__(self, name: str):
         self.name = name
-        self.callback = callback
+        self.callbacks: list[Callable[[ModuleType], None]] = []
 
     def find_spec(self, fullname, path, target=None):
         if fullname != self.name:
@@ -43,7 +44,7 @@ class _PostImportFinder(importlib.abc.MetaPathFinder):
             spec = finder.find_spec(fullname, path, target)
             if spec is not None:
                 if spec.loader is not None and hasattr(spec.loader, "exec_module"):
-                    spec.loader = _PostImportLoader(spec.loader, self.callback)
+                    spec.loader = _PostImportLoader(spec.loader, self.callbacks)
                 return spec
         return None
 
@@ -53,12 +54,14 @@ def when_imported(name: str, callback: Callable[[ModuleType], None]) -> None:
     if name in sys.modules:
         callback(sys.modules[name])
         return
-    # One callback per module keeps the hook simple; that is all the plugin needs.
-    installed = [finder for finder in sys.meta_path if isinstance(finder, _PostImportFinder)]
-    if any(finder.name == name and finder.callback is not callback for finder in installed):
-        raise RuntimeError(f"{name} already has another post-import callback")
-    if not any(finder.name == name for finder in installed):
-        sys.meta_path.insert(0, _PostImportFinder(name, callback))
+    finder = next(
+        (finder for finder in sys.meta_path if isinstance(finder, _PostImportFinder) and finder.name == name), None
+    )
+    if finder is None:
+        finder = _PostImportFinder(name)
+        sys.meta_path.insert(0, finder)
+    if callback not in finder.callbacks:
+        finder.callbacks.append(callback)
 
 
 def require(owner: object, *names: str) -> None:

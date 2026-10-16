@@ -39,6 +39,8 @@ class State:
         self.released: set[str] = set()
         self.group = None
         self.profile: tuple[str, str, int] | None = None
+        # (time_ns, rid) of each request's first and last forward while profiling.
+        self.forwards: list[tuple[int, str]] = []
         self.lock = threading.Lock()
         log_dir = Path(os.environ.get("FAKE_TOKENSPEED_LOG_DIR", "."))
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -82,8 +84,28 @@ def _join_group(body):
     return group
 
 
-def _write_profile(output_dir: Path, profile_id: str, start_ns: int, rank: int) -> None:
-    """One rank's VizTracer report and Proton trace over [start_ns, now]."""
+def _batches(forwards, start_ns: int, window_ns: int = 1_000_000):
+    """(begin_ns, end_ns, rids) of one forward thread's forwards, which never overlap.
+
+    Requests whose forwards fall within ``window_ns`` share one batch, which
+    starts once the last of them has arrived, as a real forward can only serve
+    requests it has received.
+    """
+    groups: list[list[tuple[int, str]]] = []
+    for point in sorted(point for point in forwards if point[0] >= start_ns):
+        if groups and point[0] - groups[-1][0][0] < window_ns:
+            groups[-1].append(point)
+        else:
+            groups.append([point])
+    begins = [group[-1][0] for group in groups]
+    return [
+        (begin, min(begin + window_ns, following), [rid for _, rid in group])
+        for begin, following, group in zip(begins, [*begins[1:], float("inf")], groups, strict=True)
+    ]
+
+
+def _write_profile(output_dir: Path, profile_id: str, start_ns: int, rank: int, forwards=()) -> None:
+    """One rank's VizTracer report and Proton trace over [start_ns, now], with the forwards it ran."""
     elapsed_us = (time.time_ns() - start_ns) / 1000
     tag = f"TP{rank}"
     pid = os.getpid()
@@ -95,6 +117,13 @@ def _write_profile(output_dir: Path, profile_id: str, start_ns: int, rank: int) 
             {"ph": "X", "name": "forward", "pid": pid, "tid": 1, "ts": 10.0, "dur": 20.0},
             {"ph": "s", "name": "viztracer->proton", "cat": "tokenspeed.proton", "id": 1}
             | {"pid": pid, "tid": 1, "ts": 11.0},
+            {"ph": "M", "name": "thread_name", "pid": pid, "tid": 2, "args": {"name": "tokenspeed::forward"}},
+            *(
+                {"ph": "X", "name": "forward_batch", "cat": "tokenspeed.requests", "pid": pid, "tid": 2}
+                | {"ts": (begin - start_ns) / 1000, "dur": (end - begin) / 1000}
+                | {"args": {"request_ids": rids, "num_extends": 0}}
+                for begin, end, rids in _batches(forwards, start_ns)
+            ),
         ],
     }
     # Proton's clock starts 1 µs later.
@@ -164,7 +193,14 @@ def make_handler(state: State, tp: int):
             if state.eos_token_id is not None and length < max_tokens:
                 token_ids.append(state.eos_token_id)
                 finish = "stop"
+            # As our TokenSpeed fork records while profiling: the request's
+            # first (prefill) forward now and its last one before the reply.
+            arrived = time.time_ns()
             time.sleep(SECONDS_PER_TOKEN * len(token_ids))
+            if state.profile is not None:
+                finished = time.time_ns()
+                with state.lock:
+                    state.forwards += [(arrived, body["rid"]), (finished, body["rid"])]
             logprob = -math.log(state.vocab_size)
             meta_info = {"finish_reason": {"type": finish}}
             if body.get("return_logprob"):
@@ -221,10 +257,12 @@ def make_handler(state: State, tp: int):
             if state.profile is None:
                 return self._fail("Profiling is not in progress")
             output_dir, profile_id, start_ns = state.profile
-            state.profile = None
+            with state.lock:
+                state.profile, forwards, state.forwards = None, state.forwards, []
             for rank in range(tp):
                 # After the reply.
-                threading.Timer(1.0, _write_profile, (Path(output_dir), profile_id, start_ns, rank)).start()
+                args = (Path(output_dir), profile_id, start_ns, rank, forwards)
+                threading.Timer(1.0, _write_profile, args).start()
             state.log(event="stop_profile", profile_id=profile_id)
             self._reply({"success": True, "message": "Succeeded."})
 

@@ -239,6 +239,15 @@ profile. Proton writes a timeline only with
 `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace`; its default tree output
 cannot be merged and is not picked up.
 
+Kernels on one GPU stream can overlap by a few microseconds: a kernel
+launched with programmatic dependent launch (FlashAttention, flashinfer's
+fused all-reduce, cuBLAS split-K) starts while the previous one finishes.
+Overlapping slices cannot nest on one Perfetto track, so the merger moves a
+kernel that starts before the previous one on its lane ends to an overlap
+lane of its stream (`Proton · GPU Stream 37 · overlap`, `Torch · stream 7 ·
+overlap`), together with the launch flow that ends on it. Timestamps are
+unchanged, and Perfetto has nothing to spill onto overflow tracks.
+
 Next to the trace, `rl-trace-merge` writes the session manifest
 (`<output>.manifest.json`, or `--manifest PATH`): every process, every artifact
 with its size, sha256, process and completeness, and the problems found:
@@ -260,6 +269,64 @@ each replaced atomically, and neither may be one of the inputs.
 
 Timestamps are each host's wall clock, so cross-node ordering is only as good
 as the nodes' clock synchronization (NTP/PTP).
+
+### Request flows
+
+The merged trace links each rollout request across the processes on its path
+with one flow (category `rl_trace_observer.request`), so selecting a request in
+Perfetto shows where it went:
+
+- VERL's agent loop sends a request with `LLMServerClient.generate`; the
+  plugin records one `rollout_request` span per call on the agent loop
+  worker's `agent_loop/slot_<k>` lanes, with `request_id` (the id the server
+  is sent, a fresh one per call), `trajectory_id` (the agent loop's id, shared
+  by the turns of one trajectory) and `server_id`;
+- the TokenSpeed server actor's `tokenspeed_generate` span carries the same
+  `request_id`, which TokenSpeed keeps from HTTP to its scheduler;
+- while profiling, our TokenSpeed fork wraps each model forward in a
+  `forward_batch` slice on the scheduler's `tokenspeed::forward` thread, with
+  the `request_ids` of its batch. The request's flow continues to the first
+  (prefill) and last forward that served it on one scheduler rank (the lowest
+  `rank_tag`), and from those forwards the VizTracer→Proton scope flows lead
+  to the kernels. `rl-trace-merge --request-flow-every-forward` links every
+  forward instead. To find all forwards of a request, query
+  `forward_batch` slices by their `args.request_ids`.
+
+Requests also say which weights generated them and which step trains on them:
+
+- `rollout_request` carries `weight_version` (VERL's tag on the output: the
+  `global_steps` of the last weight update the server received; with
+  `min_weight_version`/`max_weight_version` if weights changed during a partial
+  rollout), and the trajectory: `batch_step` (the trainer's `global_steps` when
+  it asked for the batch), `sample_index`, `rollout_n`, `validate`.
+  `tokenspeed_generate` carries the server's `weight_version` at the start (and
+  `weight_version_end` if an update arrived meanwhile).
+- In VERL's synchronous trainer a step generates and trains on its own batch,
+  with the weights synced after the previous step (`weight_version` = step - 1).
+- With the one-step-off-policy trainer, each generation is a `rollout_batch`
+  span on the trainer's `trainer/rollout` lane with `batch_step`,
+  `requested_during_step` (absent for the batch asked for before step 1) and
+  `consumed_by_step`: the first batch trains in step 1, the one asked for in
+  step n trains in step n + 1. A request's staleness is
+  `consumed_by_step - weight_version` of its batch, which its `batch_step` and
+  time window identify.
+- Every weight update of the rollout servers is a `weight_update` span on the
+  trainer's `trainer/weights` lane with the `weight_version` it installs, and
+  the merged trace has a `rollout weight_version` counter track on the trainer
+  process that steps up when each update ends. A step's trace starts the
+  counter at the weights the servers held when the step began, so the
+  timeline shows which weights were serving at any moment; the per-request
+  values are in the slices' arguments (select a `rollout_request` or
+  `tokenspeed_generate` slice).
+
+Any RL-Insight span with the attributes `weight_version` and
+`rl_trace_observer.weight_update=True` sets that counter when it ends.
+
+Any RL-Insight span with the attributes `request_id` and
+`rl_trace_observer.request_flow=True` is a point on its request's path; the
+merger links a request's points in time order and gives these flows ids of
+their own, apart from every file's flow ids. A request with a single point
+gets no flow.
 
 ## Preserve the normal RL-Insight backend
 

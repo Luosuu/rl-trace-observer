@@ -34,7 +34,12 @@ from typing import Any
 import aiohttp
 import ray
 
-from rl_trace_observer.context import current_run_id, profile_session_id
+from rl_trace_observer.context import (
+    REQUEST_FLOW_ATTRIBUTE,
+    REQUEST_ID_ATTRIBUTE,
+    current_run_id,
+    profile_session_id,
+)
 from rl_trace_observer.merger.sources import TOKENSPEED_PROTON, TOKENSPEED_VIZTRACER, tokenspeed_profile_file
 
 logger = logging.getLogger(__name__)
@@ -331,12 +336,25 @@ class TokenSpeedServer:
         # Concurrent requests get their own lanes, so their spans never overlap.
         slot = next(index for index in range(len(self._busy_slots) + 1) if index not in self._busy_slots)
         self._busy_slots.add(slot)
+        # The weights this request starts with: the global_steps of the last weight update.
+        weight_version, start_time_ns = self.global_steps, time.time_ns()
         try:
-            lane = f"replica_{self.replica_rank}/slot_{slot}"
-            with RLInsightLogger.trace_state("tokenspeed_generate", state_lane_id=lane, request_id=request_id):
-                output = await self._post("/generate", body)
+            output = await self._post("/generate", body)
         finally:
             self._busy_slots.discard(slot)
+            attributes = {
+                "state_lane_id": f"replica_{self.replica_rank}/slot_{slot}",
+                # A point on the request's path, after the agent loop's span for it (see verl.requests).
+                REQUEST_ID_ATTRIBUTE: request_id,
+                REQUEST_FLOW_ATTRIBUTE: True,
+                "weight_version": weight_version,
+            }
+            if self.global_steps != weight_version:
+                # Weights were updated while the request ran (partial rollout).
+                attributes["weight_version_end"] = self.global_steps
+            RLInsightLogger.trace_span(
+                "tokenspeed_generate", start_time_ns=start_time_ns, end_time_ns=time.time_ns(), attributes=attributes
+            )
 
         if isinstance(output, list):
             output = output[0]
