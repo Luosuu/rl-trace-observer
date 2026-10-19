@@ -120,6 +120,9 @@ def test_the_span_records_the_weights_and_the_trajectory_of_the_request(spans):
         async def _run_agent_loop(self, sampling_params, trajectory, *, agent_name="single_turn", **kwargs):
             return await client.generate("traj", prompt_ids=[], sampling_params=sampling_params)
 
+        async def generate_sequences(self, batch):
+            return batch
+
     agent_loop = types.SimpleNamespace(AgentLoopWorker=AgentLoopWorker)
     assert requests.patch_agent_loop(agent_loop) is True
     assert requests.patch_agent_loop(agent_loop) is False
@@ -155,3 +158,29 @@ def test_one_weight_version_is_not_repeated(spans):
     [(_, kwargs)] = spans
     assert kwargs["attributes"]["weight_version"] == 4
     assert "min_weight_version" not in kwargs["attributes"] and "batch_step" not in kwargs["attributes"]
+
+
+def test_each_agent_loop_batch_is_a_span(spans):
+    class AgentLoopWorker:
+        async def _run_agent_loop(self, sampling_params, trajectory, **kwargs):
+            return None
+
+        async def generate_sequences(self, batch):
+            await asyncio.sleep(0.01)
+            return "output"
+
+    class Batch(list):
+        meta_info = {"global_steps": 3, "validate": False}
+
+    requests.patch_agent_loop(types.SimpleNamespace(AgentLoopWorker=AgentLoopWorker))
+    assert asyncio.run(AgentLoopWorker().generate_sequences(Batch(range(16)))) == "output"
+
+    [(name, kwargs)] = spans
+    assert name == "agent_loop_batch"
+    assert kwargs["attributes"] == {
+        "state_lane_id": "agent_loop/batch",
+        "samples": 16,
+        "batch_step": 3,
+        "validate": False,
+    }
+    assert kwargs["end_time_ns"] - kwargs["start_time_ns"] >= 10_000_000

@@ -13,6 +13,9 @@ class _Profiler:
     def export_chrome_trace(self, path):
         self.exported.append(path)
 
+    def stop(self):
+        pass
+
 
 def _module():
     def get_torch_profiler(contents, save_path, role=None, save_file_prefix=None, rank=0, profile_step=None):
@@ -115,3 +118,98 @@ def test_a_scheduled_profiler_exports_each_window_even_when_the_thread_starts_la
     for window in range(2):
         names = {event.get("name") for event in json.load(gzip.open(traces / f"window{window}.json.gz"))["traceEvents"]}
         assert f"window{window}_marker" in names and f"window{1 - window}_marker" not in names
+
+
+def _recorded_spans(monkeypatch):
+    import sys
+
+    recorded = []
+
+    class Logger:
+        @staticmethod
+        def enabled():
+            return True
+
+        @staticmethod
+        def trace_span(name, **kwargs):
+            recorded.append((name, kwargs))
+
+    monkeypatch.setitem(sys.modules, "verl.utils.tracking", types.SimpleNamespace(RLInsightLogger=Logger))
+    return recorded
+
+
+def test_each_stop_is_a_span_with_its_parts(tmp_path, monkeypatch):
+    import torch
+
+    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path / "out"))
+    spans = _recorded_spans(monkeypatch)
+    module = types.SimpleNamespace(
+        get_torch_profiler=lambda contents, save_path, rank=0, profile_step=None: torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            on_trace_ready=lambda profiler: profiler.export_chrome_trace(str(tmp_path / "t.json.gz")),
+        )
+    )
+    torch_traces.patch_torch_profile(module)
+    profiler = module.get_torch_profiler([], str(tmp_path), rank=2, profile_step=3)
+    profiler.start()
+    torch.ones(8).sum()
+    profiler.stop()
+    torch_traces.wait_for_exports()
+
+    [(name, span)] = spans
+    attributes = span["attributes"]
+    assert name == "torch_profiler_stop" and attributes["state_lane_id"] == "rank_2/profiler"
+    assert (attributes["backend"], attributes["profile_step"]) == ("kineto", 3)
+    # Kineto's disable call, handing off the export, and the rest add up to the stop.
+    parts = attributes["disable_ms"] + attributes["export_dispatch_ms"] + attributes["other_ms"]
+    assert abs(parts - attributes["total_ms"]) < 0.01
+    assert attributes["export_dispatch_ms"] > 0
+    assert (tmp_path / "t.json.gz").exists()
+
+
+def test_the_cupti_monitor_backend_is_requested_from_torch(tmp_path, monkeypatch):
+    import torch
+
+    monkeypatch.setenv(torch_traces.PROFILER_BACKEND_ENV, "cupti_monitor")
+    module = types.SimpleNamespace(
+        # VERL's shape: torch.profiler.profile(**kwargs), with no experimental_config.
+        get_torch_profiler=lambda contents, save_path, profile_step=None: torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU]
+        )
+    )
+    torch_traces.patch_torch_profile(module)
+
+    profiler = module.get_torch_profiler([], str(tmp_path), profile_step=1)
+
+    assert profiler._use_cupti_monitor and profiler._cupti_async_export
+    assert torch.profiler.profile is torch.profiler.profiler.profile, "torch is left as it was"
+    monkeypatch.delenv(torch_traces.PROFILER_BACKEND_ENV)
+    assert not module.get_torch_profiler([], str(tmp_path))._use_cupti_monitor
+
+
+def test_a_cupti_monitor_export_is_finished_off_the_training_thread(tmp_path, monkeypatch):
+    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path / "out"))
+    joined = []
+
+    class Observer:
+        def join(self, *, force=True):
+            joined.append((threading.current_thread().name, force))
+            (tmp_path / "trace.json.gz").write_text("{}")
+
+    class CuptiProfiler(_Profiler):
+        _use_cupti_monitor = True
+
+        def take_pending_cupti_export(self):
+            return Observer()
+
+    module = types.SimpleNamespace(get_torch_profiler=lambda contents, save_path, profile_step=None: CuptiProfiler())
+    torch_traces.patch_torch_profile(module)
+    profiler = module.get_torch_profiler([], str(tmp_path), profile_step=4)
+
+    profiler.export_chrome_trace(str(tmp_path / "trace.json.gz"))
+    torch_traces.wait_for_exports()
+
+    assert profiler.exported == [str(tmp_path / "trace.json.gz")]
+    assert joined == [("rl-trace-torch-export", False)]
+    record = json.loads(record_path(tmp_path / "out").read_text())
+    assert [(a["file"], a["global_step"]) for a in record["artifacts"]] == [("../trace.json.gz", 4)]

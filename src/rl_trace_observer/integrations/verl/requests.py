@@ -24,6 +24,11 @@ timeline, with:
 The span is marked as a point on the request's path, like the server's span
 for it, so the merger links them with one flow.
 
+Each agent loop worker's share of a batch is also one ``agent_loop_batch``
+span on its ``agent_loop/batch`` lane (``AgentLoopWorker.generate_sequences``),
+so the timeline shows when generation actually finished, apart from when the
+trainer picked the batch up.
+
 VERL's client and agent loop live in heavy modules that the plugin must not
 import itself, so the patches are applied when VERL imports them.
 """
@@ -43,6 +48,7 @@ logger = logging.getLogger(__name__)
 MANAGER_MODULE = "verl.workers.rollout.llm_server"
 AGENT_LOOP_MODULE = "verl.experimental.agent_loop.agent_loop"
 SPAN_NAME = "rollout_request"
+BATCH_SPAN_NAME = "agent_loop_batch"
 _PATCHED = "_rl_trace_observer_records_requests"
 
 # What the call in progress learned: the server's request id and the server.
@@ -152,14 +158,49 @@ def patch_server_client(module: ModuleType) -> bool:
     return True
 
 
+def _emit_batch(start_time_ns: int, batch) -> None:
+    from verl.utils.tracking import RLInsightLogger
+
+    if not RLInsightLogger.enabled():
+        return
+    attributes = {"state_lane_id": "agent_loop/batch"}
+    try:
+        attributes["samples"] = len(batch)
+    except TypeError:
+        pass
+    meta = getattr(batch, "meta_info", None) or {}
+    if meta.get("global_steps") is not None:
+        attributes["batch_step"] = _plain(meta["global_steps"])
+    if meta.get("validate") is not None:
+        attributes["validate"] = bool(meta["validate"])
+    RLInsightLogger.trace_span(
+        BATCH_SPAN_NAME, start_time_ns=start_time_ns, end_time_ns=time.time_ns(), attributes=attributes
+    )
+
+
 def patch_agent_loop(module: ModuleType) -> bool:
-    """Wrap ``module.AgentLoopWorker._run_agent_loop`` to expose its trajectory; ``False`` if already wrapped."""
+    """Wrap ``module.AgentLoopWorker``'s ``_run_agent_loop`` (to expose its trajectory) and
+    ``generate_sequences`` (one span per batch); ``False`` if already wrapped."""
     require(module, "AgentLoopWorker")
     worker_class = module.AgentLoopWorker
-    require(worker_class, "_run_agent_loop")
+    require(worker_class, "_run_agent_loop", "generate_sequences")
     original = worker_class._run_agent_loop
     if getattr(original, _PATCHED, False):
         return False
+    original_generate = worker_class.generate_sequences
+
+    @functools.wraps(original_generate)
+    async def generate_sequences(self, batch, *args, **kwargs):
+        start_time_ns = time.time_ns()
+        try:
+            return await original_generate(self, batch, *args, **kwargs)
+        finally:
+            try:
+                _emit_batch(start_time_ns, batch)
+            except Exception:
+                logger.exception("Failed to record the agent_loop_batch span")
+
+    worker_class.generate_sequences = generate_sequences
 
     @functools.wraps(original)
     async def _run_agent_loop(self, sampling_params, trajectory, *args, **kwargs):

@@ -30,6 +30,9 @@ def trainer_module(tmp_path, monkeypatch):
         "    def _start_rollout_profiling(self):\n"
         "        for manager in self.managers:\n"
         "            manager.start_profile()\n"
+        "    curr_step_profile = False\n"
+        "    def _stop_profiling(self):\n"
+        "        self.curr_step_profile = False\n"
         "class Config:\n"
         "    def __init__(self, rollout):\n"
         "        self.actor_rollout_ref = type('R', (), {'rollout': type('N', (), {'name': rollout})})\n"
@@ -246,3 +249,38 @@ def test_one_step_off_batches_say_which_step_trains_on_them(spans, monkeypatch):
         (2, 2, 3),
         (3, 3, 4),
     ]
+
+
+def test_stopping_a_profile_is_a_span_on_the_trainer(trainer_module, spans):
+    module = importlib.import_module(trainer_module)
+    steps.patch_trainer(module)
+    trainer = module.PPOTrainer()
+
+    trainer._stop_profiling()  # the step was not profiled
+    trainer.curr_step_profile = True
+    trainer._stop_profiling()
+
+    stops = [kwargs for name, kwargs in spans if name == "stop_profile"]
+    assert [(s["attributes"]["state_lane_id"], s["attributes"]["global_step"]) for s in stops] == [
+        ("trainer/profiler", 3)
+    ]
+
+
+def test_the_ray_trainer_records_the_profiles_it_stops(spans):
+    calls = []
+
+    class RayPPOTrainer:
+        global_steps = 2
+
+        def _stop_profiling(self, do_profile, run_command=False):
+            calls.append((do_profile, run_command))
+
+    module = types.SimpleNamespace(RayPPOTrainer=RayPPOTrainer)
+    assert steps.patch_ray_trainer(module) is True
+    assert steps.patch_ray_trainer(module) is False
+
+    RayPPOTrainer()._stop_profiling(False)
+    RayPPOTrainer()._stop_profiling(True, run_command=True)
+
+    assert calls == [(False, False), (True, True)]
+    assert [kwargs["attributes"]["global_step"] for name, kwargs in spans if name == "stop_profile"] == [2]

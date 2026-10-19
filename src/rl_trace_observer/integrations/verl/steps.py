@@ -40,6 +40,7 @@ from rl_trace_observer.integrations.verl.import_hook import require, when_import
 logger = logging.getLogger(__name__)
 
 TRAINER_MODULE = "verl.trainer.ppo.v1.trainer_base"
+RAY_TRAINER_MODULE = "verl.trainer.ppo.ray_trainer"
 ONE_STEP_OFF_MODULE = "verl.experimental.one_step_off_policy.ray_trainer"
 _PATCHED = "_rl_trace_observer_step_marker"
 # Set on a one-step-off-policy trainer while a step runs.
@@ -47,6 +48,7 @@ _IN_STEP = "_rl_trace_observer_in_step"
 # The TokenSpeed stops a one-step-off-policy trainer submitted without waiting.
 _PENDING_STOPS = "_rl_trace_observer_pending_stops"
 ROLLOUT_BATCH_SPAN_NAME = "rollout_batch"
+STOP_PROFILE_SPAN_NAME = "stop_profile"
 # How long the driver waits for pending profiles when fit ends (seconds).
 PROFILE_WAIT_TIMEOUT_ENV = "RL_TRACE_PROFILE_WAIT_TIMEOUT"
 
@@ -95,6 +97,56 @@ def _emit_rollout_batch(start_time_ns: int, global_step: int, requested_in_step:
     RLInsightLogger.trace_span(
         ROLLOUT_BATCH_SPAN_NAME, start_time_ns=start_time_ns, end_time_ns=time.time_ns(), attributes=attributes
     )
+
+
+def _timed_stop_profiling(original, profiling):
+    """Wrap a trainer's ``_stop_profiling`` to record a ``stop_profile`` span when it stops a profile.
+
+    ``profiling(trainer, *args, **kwargs)`` says, before the call, whether it does.
+    """
+
+    @functools.wraps(original)
+    def _stop_profiling(self, *args, **kwargs):
+        stops = profiling(self, *args, **kwargs)
+        start_time_ns = time.time_ns()
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            if stops:
+                try:
+                    _emit_stop_profile(start_time_ns, time.time_ns(), getattr(self, "global_steps", None))
+                except Exception:
+                    logger.exception("Failed to record the stop_profile span")
+
+    setattr(_stop_profiling, _PATCHED, True)
+    return _stop_profiling
+
+
+def _emit_stop_profile(start_time_ns: int, end_time_ns: int, global_step) -> None:
+    """The driver waiting for every training worker to stop its profiler."""
+    from verl.utils.tracking import RLInsightLogger
+
+    if not RLInsightLogger.enabled():
+        return
+    attributes = {"state_lane_id": "trainer/profiler"}
+    if global_step is not None:
+        attributes["global_step"] = int(global_step)
+    RLInsightLogger.trace_span(
+        STOP_PROFILE_SPAN_NAME, start_time_ns=start_time_ns, end_time_ns=end_time_ns, attributes=attributes
+    )
+
+
+def patch_ray_trainer(module: ModuleType) -> bool:
+    """Wrap ``module.RayPPOTrainer._stop_profiling(do_profile, ...)`` (also the one-step-off trainer's)."""
+    require(module, "RayPPOTrainer")
+    trainer_class = module.RayPPOTrainer
+    require(trainer_class, "_stop_profiling")
+    if getattr(trainer_class._stop_profiling, _PATCHED, False):
+        return False
+    trainer_class._stop_profiling = _timed_stop_profiling(
+        trainer_class._stop_profiling, lambda trainer, do_profile=False, *args, **kwargs: bool(do_profile)
+    )
+    return True
 
 
 def _wait_for_exports(_actor) -> None:
@@ -160,7 +212,7 @@ def _wait_after(original):
 def patch_trainer(module: ModuleType) -> bool:
     """Wrap ``module.PPOTrainer.step``; returns ``False`` if already wrapped."""
     trainer_class = module.PPOTrainer
-    require(trainer_class, "step", "fit", "_start_rollout_profiling", "_rollout_server_managers")
+    require(trainer_class, "step", "fit", "_start_rollout_profiling", "_rollout_server_managers", "_stop_profiling")
     original = trainer_class.step
     if getattr(original, _PATCHED, False):
         return False
@@ -188,6 +240,10 @@ def patch_trainer(module: ModuleType) -> bool:
     setattr(step, _PATCHED, True)
     trainer_class.step = step
     trainer_class._start_rollout_profiling = _start_rollout_profiling
+    # It stops a profile when the step it ends was profiled.
+    trainer_class._stop_profiling = _timed_stop_profiling(
+        trainer_class._stop_profiling, lambda trainer: bool(getattr(trainer, "curr_step_profile", False))
+    )
     trainer_class.fit = _wait_after(trainer_class.fit)
     return True
 
@@ -270,3 +326,4 @@ def patch_one_step_off_trainer(module: ModuleType) -> bool:
 def install() -> None:
     when_imported(TRAINER_MODULE, patch_trainer)
     when_imported(ONE_STEP_OFF_MODULE, patch_one_step_off_trainer)
+    when_imported(RAY_TRAINER_MODULE, patch_ray_trainer)
