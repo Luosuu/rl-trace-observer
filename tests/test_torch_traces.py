@@ -239,3 +239,37 @@ def test_a_cupti_monitor_export_is_finished_off_the_training_thread(tmp_path, mo
     assert joined == [("rl-trace-torch-export", False)]
     record = json.loads(record_path(tmp_path / "out").read_text())
     assert [(a["file"], a["global_step"]) for a in record["artifacts"]] == [("../trace.json.gz", 4)]
+
+
+def test_traces_are_written_by_torchs_python_writer(tmp_path, monkeypatch):
+    """Kineto's save holds the GIL for the whole write; torch's Python writer gives it up as it goes."""
+    import gzip
+
+    import torch
+    import torch.profiler._chrome_trace_export as python_writer
+
+    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path / "out"))
+    written = []
+    write = python_writer.export_chrome_trace
+    monkeypatch.setattr(
+        python_writer,
+        "export_chrome_trace",
+        lambda results, path, *args: (written.append(path), write(results, path, *args)),
+    )
+    module = types.SimpleNamespace(
+        get_torch_profiler=lambda contents, save_path, profile_step=None: torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            on_trace_ready=lambda profiler: profiler.export_chrome_trace(str(tmp_path / "t.json.gz")),
+        )
+    )
+    torch_traces.patch_torch_profile(module)
+    profiler = module.get_torch_profiler([], str(tmp_path), profile_step=1)
+    profiler.start()
+    with torch.profiler.record_function("marker"):
+        torch.ones(8).sum()
+    profiler.stop()
+    torch_traces.wait_for_exports()
+
+    assert written == [str(tmp_path / "t.json.gz")]
+    trace = json.load(gzip.open(tmp_path / "t.json.gz"))
+    assert "baseTimeNanoseconds" in trace and "marker" in {event.get("name") for event in trace["traceEvents"]}

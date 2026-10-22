@@ -12,6 +12,10 @@ Whatever reads the trace must wait for it with :func:`wait_for_exports`: VERL's
 finish hook (relocation or the user's command) does so here, and the trainer
 does so for every worker before training ends (see ``steps``).
 
+The trace is written with torch's Python writer (``use_python_export``):
+Kineto's own ``save`` holds the GIL for the whole write, so the training thread
+stalls for seconds, inside the stop when the export thread takes the GIL first.
+
 Stopping the profiler still holds the worker up: torch synchronizes the device
 and Kineto collects and correlates every GPU activity (seconds for a profiled
 GPU step). Each stop is a ``torch_profiler_stop`` RL-Insight span on the
@@ -129,6 +133,21 @@ def _finish_cupti_export(observer, path: str, global_step: int | None, role: str
     _register(path if path.endswith(".gz") else f"{path}.gz", global_step, role)
 
 
+def _python_export_kwargs(profiler) -> dict:
+    """``use_python_export=True`` where torch has it: Kineto's own writer holds the GIL throughout.
+
+    Kineto's ``save`` keeps the GIL for the whole write (seconds for a GPU
+    step), stalling the training thread, or holding up the stop when the export
+    thread takes the GIL first. torch's Python writer holds it only to list the
+    activities, then gives it up every few milliseconds, writing the same events.
+    """
+    try:
+        parameters = inspect.signature(type(profiler).export_chrome_trace).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {"use_python_export": True} if "use_python_export" in parameters else {}
+
+
 def _backend() -> str:
     return os.environ.get(PROFILER_BACKEND_ENV, "").strip().lower() or "kineto"
 
@@ -212,6 +231,7 @@ def patch_torch_profile(module: ModuleType) -> bool:
         role = "_".join(str(part) for part in (arguments.get("save_file_prefix"), arguments.get("role")) if part)
         export = profiler.export_chrome_trace
         stop = profiler.stop
+        _python_export = _python_export_kwargs(profiler)
         dispatch = {"ns": 0, "copy_ns": 0, "start_ns": 0}
         lane = f"rank_{arguments.get('rank')}/export"
 
@@ -231,7 +251,7 @@ def patch_torch_profile(module: ModuleType) -> bool:
                 # A scheduled profiler starts its next window right after this call
                 # and replaces `profiler.profiler`; export the window being saved.
                 copied = time.perf_counter_ns()
-                window = functools.partial(type(profiler).export_chrome_trace, copy.copy(profiler))
+                window = functools.partial(type(profiler).export_chrome_trace, copy.copy(profiler), **_python_export)
                 dispatch["copy_ns"] += time.perf_counter_ns() - copied
                 dispatch["start_ns"] += _start_export(_export, window, path, step, role or None, lane)
             finally:
