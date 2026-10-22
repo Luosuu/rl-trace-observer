@@ -5,7 +5,8 @@
 Times are ms from the start of the step's ``global_step`` span:
 
 - ``trainer``: when the training workers' last kernel ended, each worker's
-  ``torch_profiler_stop`` (and its parts), and the driver's ``stop_profile``;
+  ``torch_profiler_stop`` (and its parts, with garbage collections meanwhile),
+  its ``torch_trace_export`` in the background, and the driver's ``stop_profile``;
 - ``rollout``: when the servers' last kernel ended, when each agent loop
   worker finished its share of the batch (``agent_loop_batch``) and when the
   trainer picked the batch up (the end of ``rollout_batch``, one-step-off only);
@@ -52,8 +53,19 @@ def main() -> int:
         extracted = "".join(f", extract_arg(arg_set_id, 'args.{arg}') as {arg}" for arg in args)
         return query(f"select ts, dur{extracted} from slice where name = '{name}' order by ts")
 
-    stops = spans("torch_profiler_stop", "backend", "total_ms", "disable_ms", "export_dispatch_ms", "other_ms")
+    stops = spans(
+        "torch_profiler_stop",
+        "backend",
+        "total_ms",
+        "disable_ms",
+        "export_dispatch_ms",
+        "export_copy_ms",
+        "export_thread_start_ms",
+        "gc_ms",
+        "other_ms",
+    )
     driver_stops = spans("stop_profile")
+    exports = spans("torch_trace_export")
     batches = spans("agent_loop_batch", "samples", "batch_step")
     pickups = spans("rollout_batch", "batch_step", "consumed_by_step")
     trainer_last = last_kernel("Torch · stream *")
@@ -68,11 +80,23 @@ def main() -> int:
                     "backend": s.backend,
                     **{
                         key: getattr(s, key)
-                        for key in ("total_ms", "disable_ms", "export_dispatch_ms", "other_ms")
+                        for key in (
+                            "total_ms",
+                            "disable_ms",
+                            "export_dispatch_ms",
+                            "export_copy_ms",
+                            "export_thread_start_ms",
+                            "gc_ms",
+                            "other_ms",
+                        )
                         if getattr(s, key) == getattr(s, key)
                     },
                 }
                 for s in stops.itertuples()
+            ],
+            "torch_trace_exports": [
+                {"start_ms": ms(e.ts), "end_ms": ms(e.ts + e.dur), "dur_ms": round(e.dur / 1e6, 1)}
+                for e in exports.itertuples()
             ],
             "driver_stop_profile": [
                 {"start_ms": ms(s.ts), "end_ms": ms(s.ts + s.dur), "dur_ms": round(s.dur / 1e6, 1)}

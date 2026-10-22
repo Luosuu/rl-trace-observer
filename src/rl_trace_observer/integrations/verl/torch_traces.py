@@ -28,6 +28,7 @@ merged into the trace on the export thread.
 
 import copy
 import functools
+import gc
 import inspect
 import json
 import logging
@@ -47,6 +48,7 @@ _PATCHED = "_rl_trace_observer_registers_traces"
 PROFILER_BACKEND_ENV = "RL_TRACE_TORCH_PROFILER_BACKEND"
 CUPTI_MONITOR = "cupti_monitor"
 STOP_SPAN_NAME = "torch_profiler_stop"
+EXPORT_SPAN_NAME = "torch_trace_export"
 # Only one profiler is built with a patched torch.profiler.profile at a time.
 _construct_lock = threading.Lock()
 
@@ -64,21 +66,56 @@ def _register(path: str, global_step: int | None, role: str | None) -> None:
         logger.exception("Failed to register the Torch trace %s", path)
 
 
-def _export(export, path: str, global_step: int | None, role: str | None) -> None:
+def _export(export, path: str, global_step: int | None, role: str | None, lane: str | None = None) -> None:
+    start_time_ns = time.time_ns()
     try:
         export(path)
     except Exception:
         logger.exception("Failed to export the Torch trace %s", path)
         return
     _register(path, global_step, role)
+    if lane is not None:
+        try:
+            _emit_export(start_time_ns, lane, path)
+        except Exception:
+            logger.exception("Failed to record the Torch trace export")
 
 
-def _start_export(target, *args) -> None:
+def _emit_export(start_time_ns: int, lane: str, path: str) -> None:
+    from verl.utils.tracking import RLInsightLogger
+
+    if RLInsightLogger.enabled():
+        attributes = {"state_lane_id": lane, "file": Path(path).name}
+        RLInsightLogger.trace_span(
+            EXPORT_SPAN_NAME, start_time_ns=start_time_ns, end_time_ns=time.time_ns(), attributes=attributes
+        )
+
+
+class _GcPauses:
+    """Garbage collections, in any thread, while the profiler stops: they hold the GIL."""
+
+    def __init__(self):
+        self.ns = 0
+        self.by_generation = [0, 0, 0]
+        self._started: dict[int, int] = {}
+
+    def __call__(self, phase: str, info: dict) -> None:
+        if phase == "start":
+            self._started[threading.get_ident()] = time.perf_counter_ns()
+        elif (started := self._started.pop(threading.get_ident(), None)) is not None:
+            self.ns += time.perf_counter_ns() - started
+            self.by_generation[info.get("generation", 2)] += 1
+
+
+def _start_export(target, *args) -> int:
+    """Start ``target(*args)`` on an export thread; returns how long starting it took (ns)."""
+    start = time.perf_counter_ns()
     # Not a daemon: a normal interpreter exit still finishes the file.
     thread = threading.Thread(target=target, args=args, name="rl-trace-torch-export")
     with _exports_lock:
         _exports.append(thread)
     thread.start()
+    return time.perf_counter_ns() - start
 
 
 def _finish_cupti_export(observer, path: str, global_step: int | None, role: str | None) -> None:
@@ -116,17 +153,22 @@ def _build(original, args, kwargs):
             torch.profiler.profile = profile
 
 
-def _emit_stop(start_time_ns: int, end_time_ns: int, profiler, rank, step, dispatch_ns: int) -> None:
+def _emit_stop(start_time_ns: int, end_time_ns: int, profiler, rank, step, dispatch: dict, pauses: _GcPauses) -> None:
     from verl.utils.tracking import RLInsightLogger
 
     if not RLInsightLogger.enabled():
         return
-    total_ns = end_time_ns - start_time_ns
+    total_ns, dispatch_ns = end_time_ns - start_time_ns, dispatch["ns"]
     attributes = {
         "state_lane_id": f"rank_{rank}/profiler",
         "backend": CUPTI_MONITOR if getattr(profiler, "_use_cupti_monitor", False) else "kineto",
         "total_ms": round(total_ns / 1e6, 3),
         "export_dispatch_ms": round(dispatch_ns / 1e6, 3),
+        # Parts of the hand-off, and garbage collections in any thread meanwhile.
+        "export_copy_ms": round(dispatch["copy_ns"] / 1e6, 3),
+        "export_thread_start_ms": round(dispatch["start_ns"] / 1e6, 3),
+        "gc_ms": round(pauses.ns / 1e6, 3),
+        "gc_collections": list(pauses.by_generation),
     }
     stats = getattr(getattr(profiler, "profiler", None), "_stats", None)
     disable_us = getattr(stats, "profiler_disable_call_duration_us", None)
@@ -170,7 +212,8 @@ def patch_torch_profile(module: ModuleType) -> bool:
         role = "_".join(str(part) for part in (arguments.get("save_file_prefix"), arguments.get("role")) if part)
         export = profiler.export_chrome_trace
         stop = profiler.stop
-        dispatch = {"ns": 0}
+        dispatch = {"ns": 0, "copy_ns": 0, "start_ns": 0}
+        lane = f"rank_{arguments.get('rank')}/export"
 
         def export_chrome_trace(path):
             start = time.perf_counter_ns()
@@ -183,23 +226,29 @@ def patch_torch_profile(module: ModuleType) -> bool:
                     if observer is None:  # torch wrote it already
                         _register(path, step, role or None)
                     else:
-                        _start_export(_finish_cupti_export, observer, path, step, role or None)
+                        dispatch["start_ns"] += _start_export(_finish_cupti_export, observer, path, step, role or None)
                     return
                 # A scheduled profiler starts its next window right after this call
                 # and replaces `profiler.profiler`; export the window being saved.
+                copied = time.perf_counter_ns()
                 window = functools.partial(type(profiler).export_chrome_trace, copy.copy(profiler))
-                _start_export(_export, window, path, step, role or None)
+                dispatch["copy_ns"] += time.perf_counter_ns() - copied
+                dispatch["start_ns"] += _start_export(_export, window, path, step, role or None, lane)
             finally:
                 dispatch["ns"] += time.perf_counter_ns() - start
 
         def timed_stop(*stop_args, **stop_kwargs):
-            dispatch["ns"] = 0
+            dispatch.update(ns=0, copy_ns=0, start_ns=0)
+            pauses = _GcPauses()
+            gc.callbacks.append(pauses)
             start_time_ns = time.time_ns()
             try:
                 return stop(*stop_args, **stop_kwargs)
             finally:
+                end_time_ns = time.time_ns()
+                gc.callbacks.remove(pauses)
                 try:
-                    _emit_stop(start_time_ns, time.time_ns(), profiler, arguments.get("rank"), step, dispatch["ns"])
+                    _emit_stop(start_time_ns, end_time_ns, profiler, arguments.get("rank"), step, dispatch, pauses)
                 except Exception:
                     logger.exception("Failed to record the Torch profiler stop")
 

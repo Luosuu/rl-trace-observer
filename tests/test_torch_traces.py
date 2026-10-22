@@ -156,15 +156,41 @@ def test_each_stop_is_a_span_with_its_parts(tmp_path, monkeypatch):
     profiler.stop()
     torch_traces.wait_for_exports()
 
-    [(name, span)] = spans
-    attributes = span["attributes"]
-    assert name == "torch_profiler_stop" and attributes["state_lane_id"] == "rank_2/profiler"
+    by_name = {name: span for name, span in spans}
+    assert set(by_name) == {"torch_profiler_stop", "torch_trace_export"}
+    attributes = by_name["torch_profiler_stop"]["attributes"]
+    assert attributes["state_lane_id"] == "rank_2/profiler"
     assert (attributes["backend"], attributes["profile_step"]) == ("kineto", 3)
     # Kineto's disable call, handing off the export, and the rest add up to the stop.
     parts = attributes["disable_ms"] + attributes["export_dispatch_ms"] + attributes["other_ms"]
     assert abs(parts - attributes["total_ms"]) < 0.01
-    assert attributes["export_dispatch_ms"] > 0
+    hand_off = attributes["export_copy_ms"] + attributes["export_thread_start_ms"]
+    assert 0 < hand_off <= attributes["export_dispatch_ms"]
+    assert attributes["gc_ms"] >= 0 and len(attributes["gc_collections"]) == 3
+    # The export thread's own span, on a lane of its own: it overlaps whatever the worker does next.
+    export = by_name["torch_trace_export"]
+    assert export["attributes"] == {"state_lane_id": "rank_2/export", "file": "t.json.gz"}
+    assert export["start_time_ns"] >= by_name["torch_profiler_stop"]["start_time_ns"]
     assert (tmp_path / "t.json.gz").exists()
+
+
+def test_garbage_collections_during_the_stop_are_counted(tmp_path, monkeypatch):
+    import gc
+
+    spans = _recorded_spans(monkeypatch)
+
+    class Collecting(_Profiler):
+        def stop(self):
+            gc.collect()
+
+    module = types.SimpleNamespace(get_torch_profiler=lambda contents, save_path, rank=0: Collecting())
+    torch_traces.patch_torch_profile(module)
+    module.get_torch_profiler([], str(tmp_path)).stop()
+
+    [(_, span)] = spans
+    assert span["attributes"]["gc_collections"] == [0, 0, 1]
+    assert span["attributes"]["gc_ms"] > 0
+    assert torch_traces._GcPauses not in {type(callback) for callback in gc.callbacks}
 
 
 def test_the_cupti_monitor_backend_is_requested_from_torch(tmp_path, monkeypatch):
