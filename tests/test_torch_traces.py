@@ -13,6 +13,9 @@ class _Profiler:
     def export_chrome_trace(self, path):
         self.exported.append(path)
 
+    def start(self):
+        pass
+
     def stop(self):
         pass
 
@@ -273,3 +276,75 @@ def test_traces_are_written_by_torchs_python_writer(tmp_path, monkeypatch):
     assert written == [str(tmp_path / "t.json.gz")]
     trace = json.load(gzip.open(tmp_path / "t.json.gz"))
     assert "baseTimeNanoseconds" in trace and "marker" in {event.get("name") for event in trace["traceEvents"]}
+
+
+def _profile_ops(tmp_path, monkeypatch, *, cpu_ops: bool, schedule=None):
+    """Profile a marker around a few ops with a patched VERL-shaped profiler; returns the trace's names by category."""
+    import collections
+    import gzip
+
+    import torch
+
+    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path / "out"))
+    if cpu_ops:
+        monkeypatch.setenv(torch_traces.CPU_OPS_ENV, "1")
+    else:
+        monkeypatch.delenv(torch_traces.CPU_OPS_ENV, raising=False)
+    windows = []
+
+    def on_trace_ready(profiler):
+        windows.append(tmp_path / f"w{len(windows)}.json.gz")
+        profiler.export_chrome_trace(str(windows[-1]))
+
+    module = types.SimpleNamespace(
+        get_torch_profiler=lambda contents, save_path, profile_step=None: torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU], schedule=schedule, on_trace_ready=on_trace_ready
+        )
+    )
+    torch_traces.patch_torch_profile(module)
+    profiler = module.get_torch_profiler([], str(tmp_path), profile_step=1)
+    profiler.start()
+    for window in range(2):
+        with torch.profiler.record_function(f"mini_batch{window}"):
+            (torch.ones(4, 4) @ torch.ones(4, 4)).sum()
+        if schedule:
+            profiler.step()
+    profiler.stop()
+    torch_traces.wait_for_exports()
+    names = collections.defaultdict(set)
+    for path in windows:
+        for event in json.load(gzip.open(path))["traceEvents"]:
+            if event.get("ph") == "X":
+                names[event.get("cat")].add(event["name"])
+    return names
+
+
+def test_only_markers_are_recorded_by_default(tmp_path, monkeypatch):
+    names = _profile_ops(tmp_path, monkeypatch, cpu_ops=False)
+    assert names["user_annotation"] == {"mini_batch0", "mini_batch1"}
+    assert not names.get("cpu_op"), "aten ops are not recorded"
+
+
+def test_a_scheduled_profiler_records_only_markers_in_every_window(tmp_path, monkeypatch):
+    import torch
+
+    schedule = torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=2)
+    names = _profile_ops(tmp_path, monkeypatch, cpu_ops=False, schedule=schedule)
+    # torch labels each window with a ProfilerStep#<n> scope too (VERL turns that off).
+    assert {"mini_batch0", "mini_batch1"} <= names["user_annotation"]
+    assert not names.get("cpu_op")
+
+
+def test_cpu_ops_can_be_recorded(tmp_path, monkeypatch):
+    names = _profile_ops(tmp_path, monkeypatch, cpu_ops=True)
+    assert names["user_annotation"] == {"mini_batch0", "mini_batch1"}
+    assert "aten::mm" in names["cpu_op"]
+
+
+def test_other_profilers_in_the_process_still_record_ops(tmp_path, monkeypatch):
+    import torch
+
+    _profile_ops(tmp_path, monkeypatch, cpu_ops=False)  # installs the filter
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profiler:
+        (torch.ones(4, 4) @ torch.ones(4, 4)).sum()
+    assert "aten::mm" in {event.key for event in profiler.key_averages()}

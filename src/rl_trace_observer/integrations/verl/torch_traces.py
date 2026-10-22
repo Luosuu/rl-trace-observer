@@ -12,6 +12,14 @@ Whatever reads the trace must wait for it with :func:`wait_for_exports`: VERL's
 finish hook (relocation or the user's command) does so here, and the trainer
 does so for every worker before training ends (see ``steps``).
 
+By default the profilers record only RecordFunction user scopes: VERL's
+``record_function`` markers (``actor_update``, ``mini_batch…``), not every
+aten op and autograd function. Those ops are most of the CPU events (hundreds
+of thousands per profiled GPU step), and torch keeps and processes each one,
+so they cost seconds in every stop and slow the profiled step itself; kernels
+still link to the CUDA launches that issued them. ``RL_TRACE_TORCH_CPU_OPS=1``
+records the ops too.
+
 The trace is written with torch's Python writer (``use_python_export``):
 Kineto's own ``save`` holds the GIL for the whole write, so the training thread
 stalls for seconds, inside the stop when the export thread takes the GIL first.
@@ -50,11 +58,14 @@ TORCH_PROFILE_MODULE = "verl.utils.profiler.torch_profile"
 PROFILE_MODULE = "verl.utils.profiler.profile"
 _PATCHED = "_rl_trace_observer_registers_traces"
 PROFILER_BACKEND_ENV = "RL_TRACE_TORCH_PROFILER_BACKEND"
+CPU_OPS_ENV = "RL_TRACE_TORCH_CPU_OPS"
 CUPTI_MONITOR = "cupti_monitor"
 STOP_SPAN_NAME = "torch_profiler_stop"
 EXPORT_SPAN_NAME = "torch_trace_export"
 # Only one profiler is built with a patched torch.profiler.profile at a time.
 _construct_lock = threading.Lock()
+# Set while one of our profilers enables recording (start, or a scheduled step).
+_markers_only = threading.local()
 
 _exports: list[threading.Thread] = []
 _exports_lock = threading.Lock()
@@ -146,6 +157,47 @@ def _python_export_kwargs(profiler) -> dict:
     except (TypeError, ValueError):
         return {}
     return {"use_python_export": True} if "use_python_export" in parameters else {}
+
+
+def _records_cpu_ops() -> bool:
+    return os.environ.get(CPU_OPS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _install_scope_filter() -> None:
+    """Make torch enable recording for user scopes only while ``_markers_only.active`` is set.
+
+    torch enables RecordFunction recording in ``torch.autograd.profiler``'s
+    ``_start_trace`` with every scope; its ``_enable_profiler`` takes the scopes to record.
+    """
+    import torch.autograd.profiler as autograd_profiler
+
+    enable = autograd_profiler._enable_profiler
+    if getattr(enable, _PATCHED, False):
+        return
+    from torch._C._profiler import RecordScope
+
+    @functools.wraps(enable)
+    def _enable_profiler(config, activities, scopes=None):
+        if not scopes and getattr(_markers_only, "active", False):
+            scopes = {RecordScope.USER_SCOPE}
+        return enable(config, activities, scopes or set())
+
+    setattr(_enable_profiler, _PATCHED, True)
+    autograd_profiler._enable_profiler = _enable_profiler
+
+
+def _markers_only_while(method):
+    """Run ``method`` (a profiler's start or step) recording only user scopes."""
+
+    @functools.wraps(method)
+    def call(*args, **kwargs):
+        _markers_only.active = True
+        try:
+            return method(*args, **kwargs)
+        finally:
+            _markers_only.active = False
+
+    return call
 
 
 def _backend() -> str:
@@ -274,6 +326,12 @@ def patch_torch_profile(module: ModuleType) -> bool:
 
         profiler.export_chrome_trace = export_chrome_trace
         profiler.stop = timed_stop
+        if not _records_cpu_ops():
+            _install_scope_filter()
+            # A scheduled profiler starts recording again in step(), at each window.
+            profiler.start = _markers_only_while(profiler.start)
+            if hasattr(profiler, "step"):
+                profiler.step = _markers_only_while(profiler.step)
         return profiler
 
     setattr(get_torch_profiler, _PATCHED, True)

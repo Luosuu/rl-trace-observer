@@ -106,6 +106,28 @@ Incremental JSONL output avoids relying on graceful Ray worker shutdown. The
 final merger can combine these absolute-time state events with actor Torch
 Profiler traces and TokenSpeed VizTracer/Proton traces.
 
+### Torch Profiler traces
+
+The plugin wraps the Torch profilers VERL builds (`global_profiler.tool=torch`):
+
+- They record VERL's `record_function` markers (`actor_update`, `mini_batch…`),
+  the CUDA launches and the GPU work, but not every aten op and autograd
+  function: those are hundreds of thousands of CPU events per profiled GPU step,
+  which torch processes when the profiler stops (seconds per step) and which
+  slow the profiled step itself. Kernels still link to the launches that issued
+  them. Set `RL_TRACE_TORCH_CPU_OPS=1` to record the ops too.
+- The trace is written on a background thread with torch's Python writer, which
+  does not hold the GIL for the whole write as Kineto's does.
+- Each stop is a `torch_profiler_stop` span on the worker's `rank_<r>/profiler`
+  lane, with its parts (`disable_ms`: Kineto's disable call; `export_dispatch_ms`:
+  handing the write off; `gc_ms`: garbage collections meanwhile), and each write a
+  `torch_trace_export` span on `rank_<r>/export`. The driver's wait for the stops
+  is a `stop_profile` span on `trainer/profiler`.
+- `RL_TRACE_TORCH_PROFILER_BACKEND=cupti_monitor` (with `cupti-python`
+  installed) uses torch's CUPTI-monitor backend: Kineto records only CPU events,
+  and GPU records are merged into the trace on the export thread, so stopping
+  does not process the GPU activity.
+
 ## TokenSpeed rollout
 
 `actor_rollout_ref.rollout.name=tokenspeed` runs VERL's rollout on
