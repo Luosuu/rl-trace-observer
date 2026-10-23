@@ -13,6 +13,12 @@ class _Profiler:
     def export_chrome_trace(self, path):
         self.exported.append(path)
 
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
 
 def _module():
     def get_torch_profiler(contents, save_path, role=None, save_file_prefix=None, rank=0, profile_step=None):
@@ -115,3 +121,230 @@ def test_a_scheduled_profiler_exports_each_window_even_when_the_thread_starts_la
     for window in range(2):
         names = {event.get("name") for event in json.load(gzip.open(traces / f"window{window}.json.gz"))["traceEvents"]}
         assert f"window{window}_marker" in names and f"window{1 - window}_marker" not in names
+
+
+def _recorded_spans(monkeypatch):
+    import sys
+
+    recorded = []
+
+    class Logger:
+        @staticmethod
+        def enabled():
+            return True
+
+        @staticmethod
+        def trace_span(name, **kwargs):
+            recorded.append((name, kwargs))
+
+    monkeypatch.setitem(sys.modules, "verl.utils.tracking", types.SimpleNamespace(RLInsightLogger=Logger))
+    return recorded
+
+
+def test_each_stop_is_a_span_with_its_parts(tmp_path, monkeypatch):
+    import torch
+
+    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path / "out"))
+    spans = _recorded_spans(monkeypatch)
+    module = types.SimpleNamespace(
+        get_torch_profiler=lambda contents, save_path, rank=0, profile_step=None: torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            on_trace_ready=lambda profiler: profiler.export_chrome_trace(str(tmp_path / "t.json.gz")),
+        )
+    )
+    torch_traces.patch_torch_profile(module)
+    profiler = module.get_torch_profiler([], str(tmp_path), rank=2, profile_step=3)
+    profiler.start()
+    torch.ones(8).sum()
+    profiler.stop()
+    torch_traces.wait_for_exports()
+
+    by_name = {name: span for name, span in spans}
+    assert set(by_name) == {"torch_profiler_stop", "torch_trace_export"}
+    attributes = by_name["torch_profiler_stop"]["attributes"]
+    assert attributes["state_lane_id"] == "rank_2/profiler"
+    assert (attributes["backend"], attributes["profile_step"]) == ("kineto", 3)
+    # Kineto's disable call, handing off the export, and the rest add up to the stop.
+    parts = attributes["disable_ms"] + attributes["export_dispatch_ms"] + attributes["other_ms"]
+    assert abs(parts - attributes["total_ms"]) < 0.01
+    hand_off = attributes["export_copy_ms"] + attributes["export_thread_start_ms"]
+    assert 0 < hand_off <= attributes["export_dispatch_ms"]
+    assert attributes["gc_ms"] >= 0 and len(attributes["gc_collections"]) == 3
+    # The export thread's own span, on a lane of its own: it overlaps whatever the worker does next.
+    export = by_name["torch_trace_export"]
+    assert export["attributes"] == {"state_lane_id": "rank_2/export", "file": "t.json.gz"}
+    assert export["start_time_ns"] >= by_name["torch_profiler_stop"]["start_time_ns"]
+    assert (tmp_path / "t.json.gz").exists()
+
+
+def test_garbage_collections_during_the_stop_are_counted(tmp_path, monkeypatch):
+    import gc
+
+    spans = _recorded_spans(monkeypatch)
+
+    class Collecting(_Profiler):
+        def stop(self):
+            gc.collect()
+
+    module = types.SimpleNamespace(get_torch_profiler=lambda contents, save_path, rank=0: Collecting())
+    torch_traces.patch_torch_profile(module)
+    module.get_torch_profiler([], str(tmp_path)).stop()
+
+    [(_, span)] = spans
+    assert span["attributes"]["gc_collections"] == [0, 0, 1]
+    assert span["attributes"]["gc_ms"] > 0
+    assert torch_traces._GcPauses not in {type(callback) for callback in gc.callbacks}
+
+
+def test_the_cupti_monitor_backend_is_requested_from_torch(tmp_path, monkeypatch):
+    import torch
+
+    monkeypatch.setenv(torch_traces.PROFILER_BACKEND_ENV, "cupti_monitor")
+    module = types.SimpleNamespace(
+        # VERL's shape: torch.profiler.profile(**kwargs), with no experimental_config.
+        get_torch_profiler=lambda contents, save_path, profile_step=None: torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU]
+        )
+    )
+    torch_traces.patch_torch_profile(module)
+
+    profiler = module.get_torch_profiler([], str(tmp_path), profile_step=1)
+
+    assert profiler._use_cupti_monitor and profiler._cupti_async_export
+    assert torch.profiler.profile is torch.profiler.profiler.profile, "torch is left as it was"
+    monkeypatch.delenv(torch_traces.PROFILER_BACKEND_ENV)
+    assert not module.get_torch_profiler([], str(tmp_path))._use_cupti_monitor
+
+
+def test_a_cupti_monitor_export_is_finished_off_the_training_thread(tmp_path, monkeypatch):
+    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path / "out"))
+    joined = []
+
+    class Observer:
+        def join(self, *, force=True):
+            joined.append((threading.current_thread().name, force))
+            (tmp_path / "trace.json.gz").write_text("{}")
+
+    class CuptiProfiler(_Profiler):
+        _use_cupti_monitor = True
+
+        def take_pending_cupti_export(self):
+            return Observer()
+
+    module = types.SimpleNamespace(get_torch_profiler=lambda contents, save_path, profile_step=None: CuptiProfiler())
+    torch_traces.patch_torch_profile(module)
+    profiler = module.get_torch_profiler([], str(tmp_path), profile_step=4)
+
+    profiler.export_chrome_trace(str(tmp_path / "trace.json.gz"))
+    torch_traces.wait_for_exports()
+
+    assert profiler.exported == [str(tmp_path / "trace.json.gz")]
+    assert joined == [("rl-trace-torch-export", False)]
+    record = json.loads(record_path(tmp_path / "out").read_text())
+    assert [(a["file"], a["global_step"]) for a in record["artifacts"]] == [("../trace.json.gz", 4)]
+
+
+def test_traces_are_written_by_torchs_python_writer(tmp_path, monkeypatch):
+    """Kineto's save holds the GIL for the whole write; torch's Python writer gives it up as it goes."""
+    import gzip
+
+    import torch
+    import torch.profiler._chrome_trace_export as python_writer
+
+    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path / "out"))
+    written = []
+    write = python_writer.export_chrome_trace
+    monkeypatch.setattr(
+        python_writer,
+        "export_chrome_trace",
+        lambda results, path, *args: (written.append(path), write(results, path, *args)),
+    )
+    module = types.SimpleNamespace(
+        get_torch_profiler=lambda contents, save_path, profile_step=None: torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            on_trace_ready=lambda profiler: profiler.export_chrome_trace(str(tmp_path / "t.json.gz")),
+        )
+    )
+    torch_traces.patch_torch_profile(module)
+    profiler = module.get_torch_profiler([], str(tmp_path), profile_step=1)
+    profiler.start()
+    with torch.profiler.record_function("marker"):
+        torch.ones(8).sum()
+    profiler.stop()
+    torch_traces.wait_for_exports()
+
+    assert written == [str(tmp_path / "t.json.gz")]
+    trace = json.load(gzip.open(tmp_path / "t.json.gz"))
+    assert "baseTimeNanoseconds" in trace and "marker" in {event.get("name") for event in trace["traceEvents"]}
+
+
+def _profile_ops(tmp_path, monkeypatch, *, cpu_ops: bool, schedule=None):
+    """Profile a marker around a few ops with a patched VERL-shaped profiler; returns the trace's names by category."""
+    import collections
+    import gzip
+
+    import torch
+
+    monkeypatch.setenv("RL_TRACE_OUTPUT_DIR", str(tmp_path / "out"))
+    if cpu_ops:
+        monkeypatch.setenv(torch_traces.CPU_OPS_ENV, "1")
+    else:
+        monkeypatch.delenv(torch_traces.CPU_OPS_ENV, raising=False)
+    windows = []
+
+    def on_trace_ready(profiler):
+        windows.append(tmp_path / f"w{len(windows)}.json.gz")
+        profiler.export_chrome_trace(str(windows[-1]))
+
+    module = types.SimpleNamespace(
+        get_torch_profiler=lambda contents, save_path, profile_step=None: torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU], schedule=schedule, on_trace_ready=on_trace_ready
+        )
+    )
+    torch_traces.patch_torch_profile(module)
+    profiler = module.get_torch_profiler([], str(tmp_path), profile_step=1)
+    profiler.start()
+    for window in range(2):
+        with torch.profiler.record_function(f"mini_batch{window}"):
+            (torch.ones(4, 4) @ torch.ones(4, 4)).sum()
+        if schedule:
+            profiler.step()
+    profiler.stop()
+    torch_traces.wait_for_exports()
+    names = collections.defaultdict(set)
+    for path in windows:
+        for event in json.load(gzip.open(path))["traceEvents"]:
+            if event.get("ph") == "X":
+                names[event.get("cat")].add(event["name"])
+    return names
+
+
+def test_only_markers_are_recorded_by_default(tmp_path, monkeypatch):
+    names = _profile_ops(tmp_path, monkeypatch, cpu_ops=False)
+    assert names["user_annotation"] == {"mini_batch0", "mini_batch1"}
+    assert not names.get("cpu_op"), "aten ops are not recorded"
+
+
+def test_a_scheduled_profiler_records_only_markers_in_every_window(tmp_path, monkeypatch):
+    import torch
+
+    schedule = torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=2)
+    names = _profile_ops(tmp_path, monkeypatch, cpu_ops=False, schedule=schedule)
+    # torch labels each window with a ProfilerStep#<n> scope too (VERL turns that off).
+    assert {"mini_batch0", "mini_batch1"} <= names["user_annotation"]
+    assert not names.get("cpu_op")
+
+
+def test_cpu_ops_can_be_recorded(tmp_path, monkeypatch):
+    names = _profile_ops(tmp_path, monkeypatch, cpu_ops=True)
+    assert names["user_annotation"] == {"mini_batch0", "mini_batch1"}
+    assert "aten::mm" in names["cpu_op"]
+
+
+def test_other_profilers_in_the_process_still_record_ops(tmp_path, monkeypatch):
+    import torch
+
+    _profile_ops(tmp_path, monkeypatch, cpu_ops=False)  # installs the filter
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profiler:
+        (torch.ones(4, 4) @ torch.ones(4, 4)).sum()
+    assert "aten::mm" in {event.key for event in profiler.key_averages()}

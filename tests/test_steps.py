@@ -30,6 +30,9 @@ def trainer_module(tmp_path, monkeypatch):
         "    def _start_rollout_profiling(self):\n"
         "        for manager in self.managers:\n"
         "            manager.start_profile()\n"
+        "    curr_step_profile = False\n"
+        "    def _stop_profiling(self):\n"
+        "        self.curr_step_profile = False\n"
         "class Config:\n"
         "    def __init__(self, rollout):\n"
         "        self.actor_rollout_ref = type('R', (), {'rollout': type('N', (), {'name': rollout})})\n"
@@ -201,3 +204,83 @@ def test_one_step_off_starts_a_profile_only_after_the_previous_stop(spans, monke
 
     # Step 3's start waits for step 2's stop, which was not awaited.
     assert gets == [[], [("start", 2)], [("stop", None)], [("start", 3)]]
+
+
+def test_one_step_off_batches_say_which_step_trains_on_them(spans, monkeypatch):
+    import asyncio
+
+    class Trainer:
+        """VERL's flow: fit asks for the first batch, each step trains on one and asks for the next."""
+
+        def __init__(self):
+            self.global_steps = 1
+            self.config = types.SimpleNamespace(
+                actor_rollout_ref=types.SimpleNamespace(rollout=types.SimpleNamespace(name="vllm")),
+                global_profiler={"steps": []},
+            )
+
+        async def fit(self):
+            # The first batch's task runs only once step 1 waits for it.
+            future = asyncio.create_task(self._async_gen_next_batch())
+            for _ in range(3):
+                future = await self.fit_step(future)
+
+        async def fit_step(self, future):
+            await future
+            following = asyncio.create_task(self._async_gen_next_batch())
+            await asyncio.sleep(0)
+            self.global_steps += 1
+            return following
+
+        async def _async_gen_next_batch(self):
+            return "batch"
+
+    module = types.ModuleType("fake_one_step_off_batches")
+    module.OneStepOffRayTrainer = Trainer
+    steps.patch_one_step_off_trainer(module)
+    monkeypatch.setattr(steps, "_wait_for_profiles", lambda trainer: None)
+
+    asyncio.run(Trainer().fit())
+
+    batches = [kwargs["attributes"] for name, kwargs in spans if name == "rollout_batch"]
+    assert [(b["batch_step"], b.get("requested_during_step"), b["consumed_by_step"]) for b in batches] == [
+        (1, None, 1),
+        (1, 1, 2),
+        (2, 2, 3),
+        (3, 3, 4),
+    ]
+
+
+def test_stopping_a_profile_is_a_span_on_the_trainer(trainer_module, spans):
+    module = importlib.import_module(trainer_module)
+    steps.patch_trainer(module)
+    trainer = module.PPOTrainer()
+
+    trainer._stop_profiling()  # the step was not profiled
+    trainer.curr_step_profile = True
+    trainer._stop_profiling()
+
+    stops = [kwargs for name, kwargs in spans if name == "stop_profile"]
+    assert [(s["attributes"]["state_lane_id"], s["attributes"]["global_step"]) for s in stops] == [
+        ("trainer/profiler", 3)
+    ]
+
+
+def test_the_ray_trainer_records_the_profiles_it_stops(spans):
+    calls = []
+
+    class RayPPOTrainer:
+        global_steps = 2
+
+        def _stop_profiling(self, do_profile, run_command=False):
+            calls.append((do_profile, run_command))
+
+    module = types.SimpleNamespace(RayPPOTrainer=RayPPOTrainer)
+    assert steps.patch_ray_trainer(module) is True
+    assert steps.patch_ray_trainer(module) is False
+
+    RayPPOTrainer()._stop_profiling(False)
+    RayPPOTrainer()._stop_profiling(True, run_command=True)
+
+    assert calls == [(False, False), (True, True)]
+    assert [kwargs["attributes"]["global_step"] for name, kwargs in spans if name == "stop_profile"] == [2]

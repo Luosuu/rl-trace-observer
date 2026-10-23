@@ -52,6 +52,11 @@ uv sync --locked --extra tokenspeed || exit 1
 # JIT builds (flashinfer) run the venv's ninja.
 export PATH=$UV_PROJECT_ENVIRONMENT/bin:$PATH
 PY=$UV_PROJECT_ENVIRONMENT/bin/python
+if [ "${RL_TRACE_TORCH_PROFILER_BACKEND:-}" = cupti_monitor ]; then
+  # torch's CUPTI-monitor profiler backend needs NVIDIA's CUPTI bindings.
+  uv pip install --python "$PY" cupti-python || exit 1
+  $PY -c "import cupti; print('cupti-python', getattr(cupti, '__version__', '?'))"
+fi
 $PY -c "import torch, tokenspeed; print('torch', torch.__version__, 'cuda', torch.version.cuda, torch.cuda.device_count(), 'gpus')"
 $PY -m tokenspeed.cli env > "$WORK_DIR/out/tokenspeed_env.txt" 2>&1 || true
 
@@ -62,7 +67,7 @@ if [ "$RUN_TOKENSPEED_TESTS" = 1 ]; then
   [ -d "$TS_SRC" ] || git clone -q --filter=blob:none https://github.com/Luosuu/tokenspeed "$TS_SRC"
   git -C "$TS_SRC" fetch -q origin "$TS_COMMIT" && git -C "$TS_SRC" checkout -q "$TS_COMMIT"
   (cd "$TS_SRC" && $PY -m pytest -q test/runtime/test_request_handler_profile.py \
-    test/runtime/test_proton_session.py test/runtime/test_weights_update_group.py) \
+    test/runtime/test_proton_session.py test/runtime/test_weights_update_group.py test/runtime/test_forward_trace.py) \
     > "$WORK_DIR/out/tokenspeed_tests.txt" 2>&1
   echo "TokenSpeed tests at $TS_COMMIT exit $?"
   tail -3 "$WORK_DIR/out/tokenspeed_tests.txt"
@@ -154,6 +159,12 @@ echo "=== merge"
 for step in $(echo "$PROFILE_STEPS" | tr -d '[] ' | tr , ' '); do
   $PY -m rl_trace_observer.merger.cli "$RL_TRACE_OUTPUT_DIR" -o "$E2/step$step.json.gz" --strict --step "$step"
   echo "merge step $step exit $?"
+  # P6-c: follow each request of the step down to the GPU kernels.
+  $PY scripts/gpu/check_request_flows.py "$E2/step$step.json.gz" --out "$E2/step$step.request_flows.json"
+  echo "request flows step $step exit $?"
+  # Where the step's time goes after its last GPU work: profiler stops and rollout pickup.
+  $PY scripts/gpu/summarize_step_gaps.py "$E2/step$step.json.gz" --out "$E2/step$step.gaps.json"
+  echo "step gaps step $step exit $?"
 done
 $PY -m rl_trace_observer.merger.cli "$RL_TRACE_OUTPUT_DIR" -o "$E2/all_steps.json.gz"
 exit $status

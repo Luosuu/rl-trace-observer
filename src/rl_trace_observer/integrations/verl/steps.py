@@ -10,7 +10,13 @@ starts rollout profiling without naming the step, and the one-step-off-policy
 trainer does not profile its rollout at all. There, step ``n`` trains on the
 batch generated during step ``n - 1`` while it generates the batch of step
 ``n + 1``; the generation that runs during a profiled step is profiled as part
-of that step, so its trace shows rollout and training side by side.
+of that step, so its trace shows rollout and training side by side. Each of
+that trainer's generations is also one ``rollout_batch`` span on the trainer
+timeline, saying which step asked for it (``requested_during_step``, none for
+the batch asked for before the first step) and which step trains on it
+(``consumed_by_step``); VERL tags the batch's samples with ``batch_step``, the
+trainer's ``global_steps`` when it asked for them. In VERL's synchronous
+trainer a step trains on the batch it generates.
 
 Profiles are written in the background (``torch_traces`` in the training
 workers, our TokenSpeed fork in its schedulers), so no step waits for
@@ -34,12 +40,15 @@ from rl_trace_observer.integrations.verl.import_hook import require, when_import
 logger = logging.getLogger(__name__)
 
 TRAINER_MODULE = "verl.trainer.ppo.v1.trainer_base"
+RAY_TRAINER_MODULE = "verl.trainer.ppo.ray_trainer"
 ONE_STEP_OFF_MODULE = "verl.experimental.one_step_off_policy.ray_trainer"
 _PATCHED = "_rl_trace_observer_step_marker"
 # Set on a one-step-off-policy trainer while a step runs.
 _IN_STEP = "_rl_trace_observer_in_step"
 # The TokenSpeed stops a one-step-off-policy trainer submitted without waiting.
 _PENDING_STOPS = "_rl_trace_observer_pending_stops"
+ROLLOUT_BATCH_SPAN_NAME = "rollout_batch"
+STOP_PROFILE_SPAN_NAME = "stop_profile"
 # How long the driver waits for pending profiles when fit ends (seconds).
 PROFILE_WAIT_TIMEOUT_ENV = "RL_TRACE_PROFILE_WAIT_TIMEOUT"
 
@@ -66,6 +75,78 @@ def _emit_step_span(trainer: object, start_time_ns: int, end_time_ns: int, globa
         set_process_role(trace_output_dir(), "trainer")
     except Exception:
         logger.exception("Failed to record the trainer role")
+
+
+def _emit_rollout_batch(start_time_ns: int, global_step: int, requested_in_step: bool) -> None:
+    """One one-step-off generation: the step that asked for it and the step that trains on it."""
+    from verl.utils.tracking import RLInsightLogger
+
+    if not RLInsightLogger.enabled():
+        return
+    attributes = {
+        "state_lane_id": "trainer/rollout",
+        # VERL's tag on the batch's samples (gen_batch.meta_info["global_steps"]).
+        "batch_step": int(global_step),
+        # The batch asked for before the first step trains in it; later batches, in the next step.
+        "consumed_by_step": int(global_step) + 1 if requested_in_step else int(global_step),
+    }
+    if requested_in_step:
+        attributes["requested_during_step"] = int(global_step)
+    if run_id := current_run_id():
+        attributes["run_id"] = run_id
+    RLInsightLogger.trace_span(
+        ROLLOUT_BATCH_SPAN_NAME, start_time_ns=start_time_ns, end_time_ns=time.time_ns(), attributes=attributes
+    )
+
+
+def _timed_stop_profiling(original, profiling):
+    """Wrap a trainer's ``_stop_profiling`` to record a ``stop_profile`` span when it stops a profile.
+
+    ``profiling(trainer, *args, **kwargs)`` says, before the call, whether it does.
+    """
+
+    @functools.wraps(original)
+    def _stop_profiling(self, *args, **kwargs):
+        stops = profiling(self, *args, **kwargs)
+        start_time_ns = time.time_ns()
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            if stops:
+                try:
+                    _emit_stop_profile(start_time_ns, time.time_ns(), getattr(self, "global_steps", None))
+                except Exception:
+                    logger.exception("Failed to record the stop_profile span")
+
+    setattr(_stop_profiling, _PATCHED, True)
+    return _stop_profiling
+
+
+def _emit_stop_profile(start_time_ns: int, end_time_ns: int, global_step) -> None:
+    """The driver waiting for every training worker to stop its profiler."""
+    from verl.utils.tracking import RLInsightLogger
+
+    if not RLInsightLogger.enabled():
+        return
+    attributes = {"state_lane_id": "trainer/profiler"}
+    if global_step is not None:
+        attributes["global_step"] = int(global_step)
+    RLInsightLogger.trace_span(
+        STOP_PROFILE_SPAN_NAME, start_time_ns=start_time_ns, end_time_ns=end_time_ns, attributes=attributes
+    )
+
+
+def patch_ray_trainer(module: ModuleType) -> bool:
+    """Wrap ``module.RayPPOTrainer._stop_profiling(do_profile, ...)`` (also the one-step-off trainer's)."""
+    require(module, "RayPPOTrainer")
+    trainer_class = module.RayPPOTrainer
+    require(trainer_class, "_stop_profiling")
+    if getattr(trainer_class._stop_profiling, _PATCHED, False):
+        return False
+    trainer_class._stop_profiling = _timed_stop_profiling(
+        trainer_class._stop_profiling, lambda trainer, do_profile=False, *args, **kwargs: bool(do_profile)
+    )
+    return True
 
 
 def _wait_for_exports(_actor) -> None:
@@ -131,7 +212,7 @@ def _wait_after(original):
 def patch_trainer(module: ModuleType) -> bool:
     """Wrap ``module.PPOTrainer.step``; returns ``False`` if already wrapped."""
     trainer_class = module.PPOTrainer
-    require(trainer_class, "step", "fit", "_start_rollout_profiling", "_rollout_server_managers")
+    require(trainer_class, "step", "fit", "_start_rollout_profiling", "_rollout_server_managers", "_stop_profiling")
     original = trainer_class.step
     if getattr(original, _PATCHED, False):
         return False
@@ -159,6 +240,10 @@ def patch_trainer(module: ModuleType) -> bool:
     setattr(step, _PATCHED, True)
     trainer_class.step = step
     trainer_class._start_rollout_profiling = _start_rollout_profiling
+    # It stops a profile when the step it ends was profiled.
+    trainer_class._stop_profiling = _timed_stop_profiling(
+        trainer_class._stop_profiling, lambda trainer: bool(getattr(trainer, "curr_step_profile", False))
+    )
     trainer_class.fit = _wait_after(trainer_class.fit)
     return True
 
@@ -194,9 +279,16 @@ def patch_one_step_off_trainer(module: ModuleType) -> bool:
     original_generate = trainer_class._async_gen_next_batch
 
     @functools.wraps(original_generate)
-    async def _async_gen_next_batch(self, *args, **kwargs):
-        # Runs as a task the step starts; read the step before the first await.
-        global_step = self.global_steps
+    def _async_gen_next_batch(self, *args, **kwargs):
+        # Called when the trainer asks for the batch: before the first step,
+        # or inside a step. It runs later, as a task, once the event loop
+        # gets to it (the first batch only once step 1 is waiting for it).
+        requested_in_step = getattr(self, _IN_STEP, False)
+        return _generate(self, requested_in_step, *args, **kwargs)
+
+    async def _generate(self, requested_in_step, *args, **kwargs):
+        # Read the step before the first await.
+        global_step, start_time_ns = self.global_steps, time.time_ns()
         profile = getattr(self, _IN_STEP, False) and _profiles_rollout(self, global_step)
         if profile:
             # Synchronously: the step blocks the event loop between its
@@ -209,9 +301,16 @@ def patch_one_step_off_trainer(module: ModuleType) -> bool:
             # profile's stop must be done before this start.
             ray.get(getattr(self, _PENDING_STOPS, []))
             ray.get([server.start_profile.remote(global_step=global_step) for server in servers])
+        generated = None
         try:
-            return await original_generate(self, *args, **kwargs)
+            generated = await original_generate(self, *args, **kwargs)
+            return generated
         finally:
+            if generated is not None:  # None: the data ran out
+                try:
+                    _emit_rollout_batch(start_time_ns, global_step, requested_in_step)
+                except Exception:
+                    logger.exception("Failed to record the rollout_batch span")
             if profile:
                 # Not awaited, so the batch goes to training now; the next start
                 # waits for these, and the servers save in the background.
@@ -227,3 +326,4 @@ def patch_one_step_off_trainer(module: ModuleType) -> bool:
 def install() -> None:
     when_imported(TRAINER_MODULE, patch_trainer)
     when_imported(ONE_STEP_OFF_MODULE, patch_one_step_off_trainer)
+    when_imported(RAY_TRAINER_MODULE, patch_ray_trainer)

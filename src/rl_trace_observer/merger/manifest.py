@@ -41,7 +41,16 @@ from typing import Any
 from rl_trace_observer.context import STEP_MARKER_ATTRIBUTE, STEP_SPAN_NAME, profile_session_id
 from rl_trace_observer.process_record import SCHEMA_VERSION as RECORD_SCHEMA_VERSION
 
-from .sources import PROCESS_RECORD, RL_INSIGHT, ArtifactError, TraceSource, discover, read_source
+from .sources import (
+    CARRIED_WEIGHT_UPDATE,
+    PROCESS_RECORD,
+    RL_INSIGHT,
+    ArtifactError,
+    TraceSource,
+    discover,
+    read_source,
+    weight_update_version,
+)
 
 # 2: processes[].artifacts maps paths to record entries; artifacts[] carry no os_pid or rank.
 SCHEMA_VERSION = 2
@@ -349,8 +358,15 @@ def _sessions(windows: dict[tuple, tuple[int, int]], artifacts: list[Artifact]) 
 
 
 def _cut_to_windows(source: TraceSource, windows: list[tuple[int, int]], problems: list[Problem]) -> TraceSource:
-    """A copy of ``source`` with the events that overlap ``windows``; the original stays whole."""
+    """A copy of ``source`` with the events that overlap ``windows``; the original stays whole.
+
+    The last weight update that ends before a window starts is carried into it
+    as a zero-length copy at the window's start, so the window's weight version
+    counter starts at the weights the servers held then.
+    """
     events, malformed = [], 0
+    # Per window: (end, update) of the last weight update that ends before it.
+    carried: dict[tuple[int, int], tuple[int, dict[str, Any]]] = {}
     for event in source.events:
         if event.get("ph") == "M" or "ts" not in event:
             events.append(event)
@@ -358,8 +374,16 @@ def _cut_to_windows(source: TraceSource, windows: list[tuple[int, int]], problem
         try:
             if _overlaps(source, event, windows):
                 events.append(event)
+            elif weight_update_version(event) is not None:
+                end = source.base_ns + round((float(event["ts"]) + float(event.get("dur", 0))) * 1000)
+                for window in windows:
+                    if end < window[0] and end > carried.get(window, (-1, None))[0]:
+                        carried[window] = (end, event)
         except (TypeError, ValueError, OverflowError):
             malformed += 1
+    for (window_start, _), (_, update) in sorted(carried.items()):
+        ts = (window_start - source.base_ns) / 1000
+        events.append({**update, "ts": ts, "dur": 0, "args": {**update["args"], CARRIED_WEIGHT_UPDATE: True}})
     if malformed:
         problems.append(Problem("incomplete", str(source.path), f"{malformed} events with a malformed time"))
     return replace(source, events=events)

@@ -19,6 +19,23 @@ Kineto also emits device indices and strings such as ``"Spans"`` as pids.
   two files: its VizTracer report starts a flow at every Python scope whose id
   is the Proton CPU scope's ``scope_id``, and the merger ends it on that scope,
   as ``tokenspeed merge-traces`` does.
+* Request flows cross processes on purpose: every span marked as a point on a
+  rollout request's path (``REQUEST_FLOW_ATTRIBUTE``, e.g. the agent loop's
+  call and the server's handling of it) is linked into one flow per request
+  id, in time order, and so are the TokenSpeed forwards that served it
+  (``forward_batch`` slices listing their requests): by default its first
+  (prefill) and last forward, on one scheduler rank. Their ids form a
+  namespace of their own.
+* Kernels on one GPU stream (Proton's or Kineto's) can overlap by a few microseconds (a
+  kernel launched with programmatic dependent launch starts while the
+  previous one finishes), and overlapping slices cannot nest on one track.
+  A kernel that starts inside a slice on its lane and ends after it moves to
+  an overlap lane of its stream (``GPU Stream 7 · overlap``), with the flows
+  that end on it; fully nested slices stay put, and timestamps are unchanged.
+* Each weight update of the rollout servers (a span marked with
+  ``WEIGHT_UPDATE_ATTRIBUTE``) also sets the ``rollout weight_version``
+  counter of its process when it ends; a copy carried into a step window (see
+  ``manifest.select``) only sets the counter.
 """
 
 import itertools
@@ -27,8 +44,19 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from rl_trace_observer.context import REQUEST_FLOW_ATTRIBUTE, REQUEST_ID_ATTRIBUTE
+
 from .manifest import Process
-from .sources import RL_INSIGHT, TOKENSPEED_PROTON, TOKENSPEED_VIZTRACER, TORCH, VIZTRACER, TraceSource
+from .sources import (
+    CARRIED_WEIGHT_UPDATE,
+    RL_INSIGHT,
+    TOKENSPEED_PROTON,
+    TOKENSPEED_VIZTRACER,
+    TORCH,
+    VIZTRACER,
+    TraceSource,
+    weight_update_version,
+)
 
 _KIND_ORDER = {RL_INSIGHT: 0, TORCH: 1, VIZTRACER: 2, TOKENSPEED_VIZTRACER: 3, TOKENSPEED_PROTON: 4}
 _KIND_LABEL = {
@@ -48,6 +76,17 @@ _SCOPE_ID_ARG = "scope_id"
 # links events; ids are only unique within the file that produced them.
 _ID_PHASES = frozenset("stfbneSTF")
 _FLOW_PHASES = frozenset("stf")
+_REQUEST_FLOW_NAME = "rollout request"
+_REQUEST_FLOW_CATEGORY = "rl_trace_observer.request"
+# The slice our TokenSpeed fork records around each forward, listing its requests.
+_FORWARD_BATCH_NAME = "forward_batch"
+_FORWARD_BATCH_CATEGORY = "tokenspeed.requests"
+# How profilers name a GPU stream's thread: Proton "GPU Stream <n>", Kineto
+# "stream <n> ". Overlap lanes of a stream get tids of their own.
+_GPU_STREAM_PREFIXES = {TOKENSPEED_PROTON: "GPU Stream", TORCH: "stream "}
+_OVERLAP_LANE_SUFFIX = "~overlap"
+# Perfetto names a JSON counter track "<name> <arg>": "rollout weight_version".
+_WEIGHT_COUNTER_NAME = "rollout"
 
 
 class EmptyTraceError(ValueError):
@@ -172,7 +211,10 @@ class _SourceRemapper:
 
     def flow_id(self, event: dict[str, Any]) -> int:
         original = event["id"]
-        if isinstance(original, tuple):
+        if isinstance(original, tuple) and original[0] == "request":
+            # A request flow from _link_request_flows, across processes.
+            ids, key = self._namespace.shared_flow_ids, original
+        elif isinstance(original, tuple):
             # A scope flow from _link_scope_flows, shared with the partner file.
             ids, key = self._namespace.shared_flow_ids, (self._source.pair, original)
         elif (chain := self._flow_chains.get(id(event))) is not None:
@@ -255,10 +297,171 @@ def _link_scope_flows(sources: list[TraceSource]) -> dict[int, list[dict[str, An
     return ends
 
 
-def merge_sources(sources: Iterable[TraceSource], processes: Mapping[str, Process] | None = None) -> MergeResult:
-    """Merge ``sources``; ``processes`` (from the session manifest) names linked OS processes."""
+def _nests(open_ends: list[float], start: float, end: float) -> bool:
+    """Whether a slice from ``start`` to ``end`` nests in a lane whose open slices end at ``open_ends``.
+
+    Closes the open slices that ended by ``start``.
+    """
+    while open_ends and open_ends[-1] <= start:
+        open_ends.pop()
+    return not open_ends or end <= open_ends[-1]
+
+
+def _split_overlapping_kernels(source: TraceSource) -> TraceSource:
+    """Move each GPU kernel that partially overlaps a slice on its lane to another lane of its stream.
+
+    A slice goes to the first lane of its stream where it nests: after the
+    slices there have ended, or inside the innermost one still running (a
+    Kineto ``gpu_user_annotation`` range around its kernels stays a parent).
+    Lane 0 is the stream itself. The flow events bound to a moved
+    kernel (same thread and start) move with it. Returns ``source`` itself
+    when no kernel overlaps.
+    """
+    prefix = _GPU_STREAM_PREFIXES.get(source.kind)
+    if prefix is None:
+        return source
+    streams = {
+        (str(event.get("pid")), str(event.get("tid"))): event["args"]["name"]
+        for event in source.events
+        if event.get("ph") == "M"
+        and event.get("name") == "thread_name"
+        and str((event.get("args") or {}).get("name", "")).startswith(prefix)
+    }
+    if not streams:
+        return source
+    kernels: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for event in source.events:
+        if event.get("ph") == "X" and "ts" in event and (str(event.get("pid")), str(event.get("tid"))) in streams:
+            kernels[(str(event.get("pid")), str(event.get("tid")))].append(event)
+    moved: dict[int, str] = {}  # id(kernel) -> its overlap lane's tid
+    lanes_used: dict[tuple[str, str], int] = {}
+    for stream, events in kernels.items():
+        # Per lane, the ends of the slices still open, innermost last: a slice
+        # nests in a lane if it ends by the time the innermost open one does.
+        lanes: list[list[float]] = []
+        for event in sorted(events, key=lambda event: (float(event["ts"]), -float(event.get("dur", 0)))):
+            start, end = float(event["ts"]), float(event["ts"]) + float(event.get("dur", 0))
+            lane = next((index for index, open_ends in enumerate(lanes) if _nests(open_ends, start, end)), None)
+            if lane is None:
+                lane = len(lanes)
+                lanes.append([])
+            lanes[lane].append(end)
+            if lane:
+                moved[id(event)] = f"{stream[1]}{_OVERLAP_LANE_SUFFIX}{lane}"
+        if len(lanes) > 1:
+            lanes_used[stream] = len(lanes)
+    if not moved:
+        return source
+    # Flow events bind to the slice that starts at their timestamp on their thread.
+    starts: dict[tuple[str, str, float], set[str]] = defaultdict(set)
+    for stream, events in kernels.items():
+        for event in events:
+            starts[(*stream, float(event["ts"]))].add(moved.get(id(event), stream[1]))
+    events = []
+    for event in source.events:
+        if id(event) in moved:
+            event = {**event, "tid": moved[id(event)]}
+        elif event.get("ph") in _FLOW_PHASES and "ts" in event:
+            lanes = starts.get((str(event.get("pid")), str(event.get("tid")), float(event["ts"])))
+            if lanes is not None and len(lanes) == 1 and (lane_tid := next(iter(lanes))) != str(event.get("tid")):
+                event = {**event, "tid": lane_tid}
+        events.append(event)
+    for (pid, tid), count in lanes_used.items():
+        for lane in range(1, count):
+            name = f"{streams[(pid, tid)].rstrip()} · overlap" + (f" {lane}" if lane > 1 else "")
+            events.append(
+                {
+                    "ph": "M",
+                    "name": "thread_name",
+                    "pid": pid,
+                    "tid": f"{tid}{_OVERLAP_LANE_SUFFIX}{lane}",
+                    "args": {"name": name},
+                }
+            )
+    return replace(source, events=events)
+
+
+def _request_point(event: dict[str, Any]) -> str | None:
+    """The request id of a span marked as a point on a request's path, else ``None``."""
+    args = event.get("args")
+    if event.get("ph") != "X" or not isinstance(args, dict) or "ts" not in event:
+        return None
+    marker = args.get(REQUEST_FLOW_ATTRIBUTE)
+    request_id = args.get(REQUEST_ID_ATTRIBUTE)
+    if marker not in (True, 1, "1", "true", "True") or request_id in (None, ""):
+        return None
+    return str(request_id)
+
+
+def _forward_requests(event: dict[str, Any]) -> list[str]:
+    """The request ids a TokenSpeed ``forward_batch`` slice served, else ``[]``."""
+    args = event.get("args")
+    if (
+        event.get("ph") != "X"
+        or event.get("name") != _FORWARD_BATCH_NAME
+        or event.get("cat") != _FORWARD_BATCH_CATEGORY
+        or not isinstance(args, dict)
+        or "ts" not in event
+    ):
+        return []
+    return [str(request_id) for request_id in args.get("request_ids") or []]
+
+
+def _link_request_flows(sources: list[TraceSource], every_forward: bool = False) -> dict[int, list[dict[str, Any]]]:
+    """One flow per rollout request through every point on its path.
+
+    The points are the spans marked as points on the request's path and the
+    TokenSpeed forwards that served it: those of one scheduler rank (the
+    lowest ``rank_tag``; the other TP ranks run the same forwards), its first
+    (prefill) and last unless ``every_forward``.
+
+    Returns, by ``id()`` of the source, the flow events to add to it: the
+    request's points in absolute time order start (``s``), step through
+    (``t``) and end (``f``) the flow, each bound to its slice. A request with a
+    single point gets no flow. The id ``("request", <request id>)`` is shared
+    by all sources and no profiler writes it.
+    """
+    points: dict[str, list[tuple[int, TraceSource, dict[str, Any]]]] = defaultdict(list)
+    forwards: dict[str, dict[str, list[tuple[int, TraceSource, dict[str, Any]]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for source in sources:
+        for event in source.events:
+            if (request_id := _request_point(event)) is not None:
+                points[request_id].append((_event_start_ns(source, event), source, event))
+            elif source.kind == TOKENSPEED_VIZTRACER:
+                for request_id in _forward_requests(event):
+                    forwards[request_id][source.rank_tag or ""].append((_event_start_ns(source, event), source, event))
+    for request_id, by_rank in forwards.items():
+        served = sorted(by_rank[min(by_rank)], key=lambda point: point[0])
+        points[request_id] += served if every_forward else [served[0], served[-1]][: len(served)]
+    flows: dict[int, list[dict[str, Any]]] = {}
+    for request_id, path in points.items():
+        if len(path) < 2:
+            continue
+        path.sort(key=lambda point: point[0])
+        for index, (_, source, event) in enumerate(path):
+            phase = "s" if index == 0 else "f" if index == len(path) - 1 else "t"
+            flow = {"name": _REQUEST_FLOW_NAME, "cat": _REQUEST_FLOW_CATEGORY, "ph": phase, "bp": "e"}
+            flow.update(ts=event["ts"], pid=event.get("pid"), tid=event.get("tid"), id=("request", request_id))
+            flows.setdefault(id(source), []).append(flow)
+    return flows
+
+
+def merge_sources(
+    sources: Iterable[TraceSource],
+    processes: Mapping[str, Process] | None = None,
+    every_forward: bool = False,
+) -> MergeResult:
+    """Merge ``sources``; ``processes`` (from the session manifest) names linked OS processes.
+
+    ``every_forward`` links each request through every TokenSpeed forward that
+    served it instead of its first and last.
+    """
     ordered = sorted(sources, key=lambda source: (_KIND_ORDER.get(source.kind, 99), source.title, str(source.path)))
+    ordered = [_split_overlapping_kernels(source) for source in ordered]
     scope_flow_ends = _link_scope_flows(ordered)
+    request_flows = _link_request_flows(ordered, every_forward)
     starts = [_event_start_ns(source, event) for source in ordered for event in source.events]
     starts = [start for start in starts if start is not None]
     if not starts:
@@ -274,7 +477,8 @@ def merge_sources(sources: Iterable[TraceSource], processes: Mapping[str, Proces
         remapper = _SourceRemapper(source, namespace, ids)
         offset_us = (source.base_ns - global_base_ns) / 1000
         dropped = 0
-        for event in itertools.chain(source.events, scope_flow_ends.get(id(source), [])):
+        added = scope_flow_ends.get(id(source), []) + request_flows.get(id(source), [])
+        for event in itertools.chain(source.events, added):
             if event.get("ph") == "M":
                 continue
             if "ts" not in event or float(event.get("dur", 0)) < 0:
@@ -286,6 +490,12 @@ def merge_sources(sources: Iterable[TraceSource], processes: Mapping[str, Proces
             merged["ts"] = round(offset_us + float(event["ts"]), 3)
             if event.get("ph") in _ID_PHASES and "id" in event:
                 merged["id"] = remapper.flow_id(event)
+            if (version := weight_update_version(event)) is not None:
+                counter = {"name": _WEIGHT_COUNTER_NAME, "ph": "C", "pid": merged["pid"], "tid": merged["tid"]}
+                counter.update(ts=round(merged["ts"] + float(event.get("dur", 0)), 3), args={"weight_version": version})
+                events.append(counter)
+                if event["args"].get(CARRIED_WEIGHT_UPDATE):
+                    continue
             events.append(merged)
         if dropped:
             warnings.append(f"{source.path.name}: dropped {dropped} events without a timestamp or with negative dur")

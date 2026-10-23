@@ -59,6 +59,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--strict", action="store_true", help="fail on any manifest problem or dropped event instead of warning"
     )
+    parser.add_argument(
+        "--request-flow-every-forward",
+        action="store_true",
+        help="link each rollout request through every TokenSpeed forward that served it (default: its first and last)",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -85,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("No readable trace artifacts found in %s", ", ".join(map(str, args.inputs)))
     else:
         try:
-            result = merge_sources(sources, manifest.processes)
+            result = merge_sources(sources, manifest.processes, every_forward=args.request_flow_every_forward)
         except EmptyTraceError as error:
             logger.error("%s in %s", error, ", ".join(map(str, args.inputs)))
     if result is not None:

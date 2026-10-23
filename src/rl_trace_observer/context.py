@@ -24,6 +24,16 @@ RUN_ID_ENV = "RL_TRACE_RUN_ID"
 # from any user span of the same name by the marker attribute.
 STEP_SPAN_NAME = "global_step"
 STEP_MARKER_ATTRIBUTE = "rl_trace_observer.step_marker"
+# A span with this attribute is a point on the path of the rollout request named
+# by its ``request_id`` attribute; the merger links a request's points with one
+# flow, in time order across processes.
+REQUEST_FLOW_ATTRIBUTE = "rl_trace_observer.request_flow"
+REQUEST_ID_ATTRIBUTE = "request_id"
+# A span with this attribute is one weight update of the rollout servers, to the
+# version in its ``weight_version`` attribute; the merger turns these spans into
+# a ``rollout weight_version`` counter track that steps up when each one ends.
+WEIGHT_UPDATE_ATTRIBUTE = "rl_trace_observer.weight_update"
+WEIGHT_VERSION_ATTRIBUTE = "weight_version"
 
 
 def current_run_id() -> str | None:
