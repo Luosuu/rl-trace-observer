@@ -37,8 +37,10 @@ def test_overlapping_kernels_get_overlap_lanes_with_their_launch_flows(tmp_path,
     def query(sql):
         return processor.query(sql).as_pandas_dataframe()
 
-    spilled = query("select value from stats where name = 'slice_spill_overlapping_complete_event'")
-    assert spilled.value[0] == 0
+    # Newer trace processors spill overlapping slices (slice_spill_overlapping_complete_event),
+    # older ones drop them; either is an error or data-loss stat.
+    problems = query("select name, value from stats where value > 0 and severity in ('error', 'data_loss')")
+    assert problems.empty, problems.to_dict("records")
     lanes = query(
         """
         select s.name, t.name as thread from slice s join thread_track tt on s.track_id = tt.id
