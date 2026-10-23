@@ -71,3 +71,21 @@ CPU 端到端测试覆盖了完整序列：第 1 步之前请求的 batch 用版
 此前合并的 step trace 在 Perfetto 中有约 5.4 万条 `slice_spill_overlapping_complete_event`：同一 GPU stream 上约 17% 的 kernel 与前一个重叠 1–3 µs（programmatic dependent launch：FlashAttention 的 `prepare_varlen_num_blocks` → 主 kernel、flashinfer 的 lamport all-reduce → RMSNorm、采样 kernel、cuBLAS split-K），另有 3 条是 fork 的 `forward_batch` 与 VizTracer 记录的 `contextmanager.__exit__` 部分重叠。merger 现在把与本 lane 上 slice 部分重叠的 kernel 移到该 stream 的 overlap lane（完全嵌套的保留，例如 Kineto 的 `gpu_user_annotation`），launch flow 随之移动；fork 在 `device._forward` 中用 tracer 的 C `getts` 取时间戳。
 
 job `rl-trace-overlaps-20261016-150754-07cb998`（fork `3314732f`）：第 3、4 步 trace_processor 无 error/data_loss 统计，各约 5.4/5.8 万个 kernel 在 overlap lane 上；请求链路与权重版本检查全部通过。
+
+## Profile 步末尾的空白：Torch profiler 停止
+
+profile 步在 actor 最后一个 kernel 之后约 5.8 s 没有任何记录，VERL 的 `timing_s/stop_profile` 与之相符：driver 在等各训练 worker 停止 Torch profiler。现在每次停止是 worker 上 `rank_<r>/profiler` lane 的 `torch_profiler_stop` span（带各部分耗时），driver 的等待是 `trainer/profiler` lane 的 `stop_profile`，agent loop worker 每批生成是 `agent_loop/batch` lane 的 `agent_loop_batch`（生成在 2.5–3.1 s 完成，one-step-off trainer 要等 actor 训练返回才取走，因此 `rollout_batch` 结束得晚）。`scripts/gpu/summarize_step_gaps.py` 逐步汇总这些时间。
+
+one-step-off E2，第 3、4 步（ms）：
+
+| 配置 | commit | driver `stop_profile` | 其中 Kineto disable | 交给导出线程 | 每个 worker 的 Torch trace |
+|---|---|---|---|---|---|
+| Kineto，记录全部 aten op（此前） | `36dc483` | 5846 / 5969 | 3.9 s | 某个 worker 1.9–2.0 s | 20 MB |
+| `cupti_monitor`，全部 aten op | `36dc483` | 3102 / 3106 | 2.3 s | 0.8 s（同步写 CPU 事件） | 26 MB |
+| Kineto + torch 的 Python writer | `6918797` | 4746 / 4651 | 4.0 s | 0.6–0.7 s | 17 MB |
+| Kineto，只记录 marker | `b4c3b7b` | 1649 / 1579 | 1.5 s | < 1 ms（一次 111 ms） | 3.1 MB |
+| `cupti_monitor`，只记录 marker | `b4c3b7b` | **14.5 / 13.1** | 8 ms | 3 ms | 8.2 MB |
+
+- 交给导出线程的约 2 s 来自 Kineto 的 `save` 全程持有 GIL：导出线程先拿到 GIL 时，训练线程卡在 `thread.start()` 直到写完（本地复现：`thread.start()` 421 ms，与 save 时长相同）。GC 为 0，复制 profiler 约 0.05 ms。改用 torch 的 Python writer 后仍有 0.6–0.7 s（列出 activity 时持有 GIL），但不再是整个写入。
+- 每个 worker 每步约 68 万个 CPU op 事件（其中 `aten::as_strided` 15 万），远多于 10.5 万个 kernel；没有 call stack 和 input shape。只记录 RecordFunction 的 user scope 后，VERL 的 marker、CUDA launch 与 kernel 都保留，Kineto disable 从 3.9 s 降到 1.5 s，`cupti_monitor` 下几乎为 0。`RL_TRACE_TORCH_CPU_OPS=1` 恢复记录 aten op。
+- 所有配置下第 3、4 步 strict 合并无问题，请求链路检查全部通过（128/128 请求连到 kernel），训练 kernel 都在 trace 中。
