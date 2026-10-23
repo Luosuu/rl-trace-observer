@@ -17,6 +17,11 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    env:
+      # The runner's /tmp is a small tmpfs (7.9 GB), and Ray's session
+      # directory with its worker environments outgrows it; keep it on the
+      # root disk, under a short path (Ray's socket paths are length-limited).
+      RAY_TMPDIR: /home/runner/ray
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -36,8 +41,8 @@ jobs:
         if: always()
         run: |
           df -h / /tmp "$RUNNER_TEMP" || true
-          du -sh /tmp/ray "$RUNNER_TEMP/pytest" ~/.cache/uv "$GITHUB_WORKSPACE/.venv" 2>/dev/null || true
-          du -sk "$RUNNER_TEMP"/pytest/* /tmp/ray/session_*/runtime_resources/* 2>/dev/null | sort -rn | head -15 || true
+          du -sh "$RAY_TMPDIR" "$RUNNER_TEMP/pytest" ~/.cache/uv "$GITHUB_WORKSPACE/.venv" 2>/dev/null || true
+          du -sk "$RUNNER_TEMP"/pytest/* "$RAY_TMPDIR"/ray/session_*/runtime_resources/* 2>/dev/null | sort -rn | head -15 || true
       # Keep the full main_ppo and Ray worker logs of a failed run.
       - if: failure()
         uses: actions/upload-artifact@v4
@@ -45,6 +50,6 @@ jobs:
           name: test-logs
           path: |
             ${{ runner.temp }}/pytest/**/*.log
-            /tmp/ray/session_*/logs/
+            /home/runner/ray/ray/session_*/logs/
           if-no-files-found: ignore
           retention-days: 7
